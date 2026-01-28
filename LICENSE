@@ -1,0 +1,42 @@
+# Dual License
+
+This repository contains code under two different licenses:
+
+## 1. concordia_mini/ - Apache License 2.0
+
+The `concordia_mini/` directory contains a minimal subset of Google DeepMind's
+Concordia framework, used under the Apache License 2.0.
+
+See LICENSE-APACHE for the full license text.
+
+Original source: https://github.com/google-deepmind/concordia
+Copyright 2023 DeepMind Technologies Limited.
+
+## 2. negotiation/ and interpretability/ - GNU AGPL v3
+
+The `negotiation/` and `interpretability/` directories contain original work
+by Teanna Sims, licensed under the GNU Affero General Public License v3.0.
+
+See LICENSE-AGPL for the full license text.
+
+Copyright 2025 Teanna Sims.
+
+### What AGPL v3 means for you:
+
+- You CAN use this code for any purpose
+- You CAN modify and distribute this code
+- You MUST keep the source code open
+- You MUST share any modifications under AGPL v3
+- You MUST disclose source even if running as a web service
+- You MUST give appropriate credit
+
+If you use this work in academic research, please cite:
+
+```bibtex
+@software{sims2025deception,
+  author = {Sims, Teanna},
+  title = {Mechanistic Interpretability for Deception Detection in LLM Negotiation Agents},
+  year = {2025},
+  url = {https://github.com/tesims/multiagent-emergent-deception}
+}
+```

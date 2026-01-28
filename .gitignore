@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+.spyproject/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# Results and outputs
+results/
+outputs/
+*.pt
+*.pth
+checkpoints/
+runs/
+wandb/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+.deepeval/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Type checking
+.mypy_cache/
+.pytype/
+
+# Secrets (should never be committed)
+*.env
+.env.*
+secrets.json
+credentials.json
+*_secret*
+*_key*
+
+# Markdown files (documentation generated locally)
+*.md
+**/*.md
+
+# Data files (too large for git)
+*.csv
+*.parquet
+*.h5
+*.hdf5
+data/
+
+# Personal/local files (contain credentials, IPs, etc.)
+docs/RUNPOD_QUICKSTART.md
+docs/EXPERIMENT_GUIDE.md
+*_QUICKSTART.md
+*.local.md
+.deepeval

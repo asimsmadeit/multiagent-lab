@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Mechanistic Interpretability for Deception Detection in LLM Negotiation Agents"
+authors:
+  - family-names: "Sims"
+    given-names: "Teanna"
+repository-code: "https://github.com/tesims/multiagent-emergent-deception"
+license: AGPL-3.0
+version: 1.0.0
+date-released: 2025-01-09
+keywords:
+  - mechanistic-interpretability
+  - deception-detection
+  - multi-agent-systems
+  - llm-agents
+  - negotiation
+  - sparse-autoencoders
+  - transformer-lens
+abstract: >-
+  A framework for detecting emergent deception in LLM-powered negotiation agents
+  using mechanistic interpretability techniques including linear probes,
+  activation patching, and sparse autoencoder analysis.
