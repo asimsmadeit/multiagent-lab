@@ -365,13 +365,13 @@ class TransformerLensWrapper(language_model.LanguageModel):
         with torch.no_grad():
             _, cache = self.model.run_with_cache(
                 tokens,
-                names_filter=lambda n: any(f".{layer}." in n for layer in self._layers_to_capture)
+                names_filter=lambda n: any(f".{layer}." in n for layer in self.layers_to_capture)
                              and "hook_resid_post" in n
             )
 
         # Extract last-token activations
         followup_activations = {}
-        for layer in self._layers_to_capture:
+        for layer in self.layers_to_capture:
             hook_name = f"blocks.{layer}.hook_resid_post"
             if hook_name in cache:
                 followup_activations[hook_name] = cache[hook_name][0, -1, :].cpu()
