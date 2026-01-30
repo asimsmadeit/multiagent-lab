@@ -91,6 +91,7 @@ credentials.json
 *.h5
 *.hdf5
 data/
+!concordia_mini/contrib/data/
 
 # Personal/local files (contain credentials, IPs, etc.)
 docs/RUNPOD_QUICKSTART.md
