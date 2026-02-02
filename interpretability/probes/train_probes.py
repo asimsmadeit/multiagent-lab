@@ -1213,7 +1213,10 @@ def analyze_round_trajectory(
         }
 
     # Fit trajectory (linear regression of AUC over rounds)
-    valid_rounds = [r for r in unique_rounds if per_round_results[r].get("auc", 0.5) != 0.5]
+    # Filter out rounds with invalid AUC (0.5 default or NaN)
+    valid_rounds = [r for r in unique_rounds
+                    if per_round_results[r].get("auc", 0.5) != 0.5
+                    and not np.isnan(per_round_results[r].get("auc", 0.5))]
     if len(valid_rounds) >= 3:
         rounds_arr = np.array(valid_rounds).reshape(-1, 1)
         aucs_arr = np.array([per_round_results[r]["auc"] for r in valid_rounds])
