@@ -1761,7 +1761,7 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     # RQ-MA2: DYADIC PAIR ANALYSIS
     # ==========================================================================
     counterpart_idxs = labels.get("counterpart_idxs", [])
-    if counterpart_idxs and any(idx >= 0 for idx in counterpart_idxs):
+    if counterpart_idxs and any(idx is not None and idx >= 0 for idx in counterpart_idxs):
         print(f"\n{'='*60}")
         print("RQ-MA2: DYADIC PAIR ANALYSIS")
         print(f"{'='*60}")

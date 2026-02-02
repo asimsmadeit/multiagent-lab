@@ -1514,6 +1514,12 @@ Example: yes, yes'''
         trial_samples = []
         deception_count = 0
 
+        # Generate scenario params for ground truth extraction
+        try:
+            scenario_params = generate_scenario_params(scenario_type, self._trial_id)
+        except Exception:
+            scenario_params = {"scenario": scenario_type, "trial_id": self._trial_id}
+
         # Create scenario - use fallback for deception scenarios
         try:
             scenario = create_scenario(scenario_type)
@@ -1620,7 +1626,13 @@ Example: yes, yes'''
                     tom_state = self._extract_tom_state(agent)
 
                     # Extract GM labels (third-person ground truth)
-                    gm_labels = self._extract_gm_labels(gm, agent.name, action, round_num)
+                    dialogue_history = [f"{name}: {act}" for name, act in all_actions]
+                    gm_labels = self._extract_gm_labels(
+                        gm, agent.name, action, round_num,
+                        scenario_type=scenario_type,
+                        scenario_params=scenario_params,
+                        dialogue_history=dialogue_history,
+                    )
 
                     if gm_labels['actual_deception'] > 0.5:
                         deception_count += 1
