@@ -496,6 +496,7 @@ def train_probes_per_layer(
     results = {}
 
     for layer_num, X in sorted(activations_by_layer.items()):
+        layer_key = int(layer_num)
         # Convert to numpy if tensor
         if hasattr(X, 'numpy'):
             X = X.cpu().numpy() if hasattr(X, 'cpu') else X.numpy()
@@ -506,7 +507,7 @@ def train_probes_per_layer(
 
         # Skip if not enough samples
         if len(y) < 10:
-            results[layer_num] = {
+            results[layer_key] = {
                 'auc': 0.5, 'r2': 0.0, 'accuracy': 0.5,
                 'train_r2': 0.0, 'test_r2': 0.0, 'note': 'insufficient samples'
             }
@@ -514,7 +515,7 @@ def train_probes_per_layer(
 
         # Check label variance
         if np.std(y) < 0.01:
-            results[layer_num] = {
+            results[layer_key] = {
                 'auc': 0.5, 'r2': 0.0, 'accuracy': 0.5,
                 'train_r2': 0.0, 'test_r2': 0.0, 'note': 'no label variance'
             }
@@ -524,7 +525,7 @@ def train_probes_per_layer(
             _, probe_result = train_ridge_probe(
                 X, y, alpha=alpha, use_pca=use_pca, n_components=n_components
             )
-            results[layer_num] = {
+            results[layer_key] = {
                 'auc': probe_result.auc,
                 'r2': probe_result.r2_score,
                 'accuracy': probe_result.accuracy,
@@ -532,7 +533,7 @@ def train_probes_per_layer(
                 'test_r2': probe_result.test_r2,
             }
         except Exception as e:
-            results[layer_num] = {
+            results[layer_key] = {
                 'auc': 0.5, 'r2': 0.0, 'accuracy': 0.5,
                 'train_r2': 0.0, 'test_r2': 0.0, 'error': str(e)
             }
@@ -915,7 +916,7 @@ def group_by_round(
     grouped = {}
     for r in unique_rounds:
         mask = round_nums == r
-        grouped[r] = (X[mask], y[mask])
+        grouped[int(r)] = (X[mask], y[mask])
 
     return grouped
 
@@ -1192,12 +1193,13 @@ def analyze_round_trajectory(
     # Train probe on each round
     per_round_results = {}
     for r in unique_rounds:
+        r_key = int(r)
         mask = round_nums == r
         X_r = X[mask]
         y_r = y[mask]
 
         if len(y_r) < 10 or np.std(y_r) < 0.01:
-            per_round_results[r] = {
+            per_round_results[r_key] = {
                 "auc": 0.5, "r2": 0.0, "n_samples": int(mask.sum()),
                 "deception_rate": float(np.mean(y_r)) if len(y_r) > 0 else 0.0,
                 "note": "insufficient samples or variance"
@@ -1205,7 +1207,7 @@ def analyze_round_trajectory(
             continue
 
         _, result = train_ridge_probe(X_r, y_r, alpha=alpha)
-        per_round_results[r] = {
+        per_round_results[r_key] = {
             "auc": float(result.auc),
             "r2": float(result.r2_score),
             "n_samples": int(mask.sum()),

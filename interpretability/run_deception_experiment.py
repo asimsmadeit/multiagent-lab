@@ -47,6 +47,42 @@ from typing import Dict, List, Any, Optional
 import torch
 import numpy as np
 
+
+class NumpyEncoder(json.JSONEncoder):
+    """Handle numpy types in JSON serialization."""
+    def default(self, obj):
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        return super().default(obj)
+
+
+def _sanitize_for_json(obj):
+    """Recursively convert numpy types in dicts/lists to native Python types."""
+    if isinstance(obj, dict):
+        return {
+            (int(k) if isinstance(k, (np.integer,)) else
+             float(k) if isinstance(k, (np.floating,)) else
+             str(k) if not isinstance(k, (str, int, float, bool, type(None))) else k):
+            _sanitize_for_json(v) for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(i) for i in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent.parent))
 
@@ -221,7 +257,7 @@ def train_probes_on_data(
 
         output_path = Path(output_dir) / f"{'_'.join(filename_parts)}.json"
         with open(output_path, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(_sanitize_for_json(results), f, indent=2, cls=NumpyEncoder)
         print(f"Results saved to: {output_path}")
 
     return results
