@@ -145,6 +145,12 @@ from .probes.train_probes import (
     group_by_round,
 )
 
+# Parallel Execution Utilities
+from .merge_parallel_results import (
+    merge_parallel_activations,
+    validate_merge,
+)
+
 # Sanity Checks for Probe Validation
 from .probes.sanity_checks import (
     run_all_sanity_checks,

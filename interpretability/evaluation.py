@@ -129,6 +129,10 @@ class ActivationSample:
     # Negotiation context
     scenario_type: str
     modules_enabled: List[str]
+
+    # === PARALLEL EXECUTION SUPPORT ===
+    pod_id: int = 0  # Identifies source pod for merging parallel results
+
     gm_modules_enabled: List[str] = field(default_factory=list)
 
     # === NEW: Multi-agent enhancements ===
@@ -783,6 +787,7 @@ class InterpretabilityRunner:
         sae_layer: int = 31,
         evaluator_api: str = None,  # 'local', 'deepeval', or None
         evaluator_type: str = "deepeval",  # 'rule', 'deepeval' - which detection method to use
+        trial_id_offset: int = 0,  # For parallel execution: starting trial ID
     ):
         # Store device for later use
         self._device = device
@@ -810,7 +815,12 @@ class InterpretabilityRunner:
         self.use_hybrid = use_hybrid
         self.use_sae = use_sae
         self.activation_samples: List[ActivationSample] = []
-        self._trial_id = 0
+
+        # Parallel execution support
+        self._trial_id_offset = trial_id_offset
+        self._trial_id = trial_id_offset  # Start from offset (default 0 for single-GPU)
+        self._pod_id = trial_id_offset // 1000 if trial_id_offset > 0 else 0  # Pod ID derived from offset
+
         self._gm_modules_used = []
         # Track component access failures for debugging
         self._component_access_failures: Dict[str, int] = defaultdict(int)
@@ -1657,6 +1667,8 @@ Example: yes, yes'''
                         # Context
                         scenario_type=scenario_type,
                         modules_enabled=agent_modules,
+                        # Parallel execution support
+                        pod_id=self._pod_id,
                         gm_modules_enabled=gm_modules if use_gm else [],
                         # Cross-agent pairing
                         counterpart_name=counterpart_name,
@@ -1960,7 +1972,9 @@ Example: yes, yes'''
 
                 # Checkpoint after each trial if directory specified
                 if checkpoint_dir:
-                    checkpoint_path = f"{checkpoint_dir}/checkpoint_{scenario}_{cond_label}_trial{trial+1:03d}.pt"
+                    # Include pod_id in checkpoint name for parallel execution
+                    pod_suffix = f"_pod{self._pod_id}" if self._pod_id > 0 else ""
+                    checkpoint_path = f"{checkpoint_dir}/checkpoint_{scenario}_{cond_label}_trial{trial+1:03d}{pod_suffix}.pt"
                     self.save_dataset(checkpoint_path)
 
                 if (trial + 1) % 10 == 0:
@@ -2126,6 +2140,8 @@ Example: yes, yes'''
                     # Context
                     scenario_type=scenario,
                     modules_enabled=agent_modules,
+                    # Parallel execution support
+                    pod_id=self._pod_id,
                     # EMERGENT-SPECIFIC FIELDS
                     emergent_scenario=scenario,
                     incentive_condition=condition.value,
@@ -2375,6 +2391,7 @@ Example: yes, yes'''
         all_trial_ids = []  # For grouping samples by trial
         all_counterpart_idxs = []  # RQ-MA2: Dyadic analysis
         all_trial_outcomes = []  # RQ-MA3: Outcome prediction
+        all_pod_ids = []  # For parallel execution: identifies source pod
 
         for sample in self.activation_samples:
             # Organize activations by layer
@@ -2411,6 +2428,7 @@ Example: yes, yes'''
             all_trial_ids.append(sample.trial_id)
             all_counterpart_idxs.append(sample.counterpart_idx)
             all_trial_outcomes.append(sample.trial_outcome)
+            all_pod_ids.append(sample.pod_id)
 
             # === EXPANDED METADATA: All fields for full analysis ===
             metadata.append({
@@ -2475,6 +2493,8 @@ Example: yes, yes'''
                     'trial_ids': all_trial_ids,  # List of int (trial ID)
                     'counterpart_idxs': all_counterpart_idxs,  # List of int/None (paired sample)
                     'trial_outcomes': all_trial_outcomes,  # List of str/None (agreement/failure)
+                    # Parallel execution support
+                    'pod_ids': all_pod_ids,  # List of int (source pod ID)
                 },
 
                 # Config info
@@ -2483,6 +2503,14 @@ Example: yes, yes'''
                     'layers': list(stacked_activations.keys()),
                     'n_samples': len(all_gm_deception),
                     'has_sae': len(all_sae_features) > 0,
+                },
+
+                # Parallel execution info (for merging results from multiple pods)
+                'pod_info': {
+                    'pod_id': self._pod_id,
+                    'trial_id_offset': self._trial_id_offset,
+                    'n_samples': len(all_gm_deception),
+                    'trial_id_range': (min(all_trial_ids), max(all_trial_ids)) if all_trial_ids else (0, 0),
                 },
 
                 # Full metadata

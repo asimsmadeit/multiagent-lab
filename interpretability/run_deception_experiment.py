@@ -178,13 +178,22 @@ def run_instructed_experiment(
     return {"samples": all_samples, "mode": "instructed"}
 
 
-def train_probes_on_data(data_path: str, output_dir: str = None) -> Dict[str, Any]:
+def train_probes_on_data(
+    data_path: str,
+    output_dir: str = None,
+    timestamp: str = None,
+    scenario_name: str = None,
+    pod_id: str = None,
+) -> Dict[str, Any]:
     """
     Train probes on captured activation data.
 
     Args:
         data_path: Path to activations.pt file
         output_dir: Directory for output files
+        timestamp: Session timestamp for unique filenames (prevents overwrites)
+        scenario_name: Scenario name for filename (optional)
+        pod_id: Pod ID for parallel execution (optional)
 
     Returns:
         Dict with probe results
@@ -197,9 +206,20 @@ def train_probes_on_data(data_path: str, output_dir: str = None) -> Dict[str, An
     # Run full analysis
     results = run_full_analysis(data_path)
 
-    # Save results
+    # Save results with unique filename
     if output_dir:
-        output_path = Path(output_dir) / "probe_results.json"
+        # Build filename: probe_results_{scenario}_{timestamp}_{pod}.json
+        filename_parts = ["probe_results"]
+        if scenario_name:
+            filename_parts.append(scenario_name)
+        if timestamp:
+            filename_parts.append(timestamp)
+        else:
+            filename_parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
+        if pod_id:
+            filename_parts.append(f"pod{pod_id}")
+
+        output_path = Path(output_dir) / f"{'_'.join(filename_parts)}.json"
         with open(output_path, "w") as f:
             json.dump(results, f, indent=2)
         print(f"Results saved to: {output_path}")
@@ -328,24 +348,82 @@ def main():
         help="Number of samples for causal validation tests (default: 20)"
     )
 
+    # Parallel execution (for multi-GPU clusters)
+    parser.add_argument(
+        "--parallel-pod", type=str, default=None,
+        help="Parallel pod ID: 'POD_NUM/TOTAL_PODS' (e.g., '3/8' = pod 3 of 8). "
+             "Each pod runs a subset of trials with unique trial IDs."
+    )
+    parser.add_argument(
+        "--merge-pods", type=str, nargs='+', default=None,
+        help="Merge activation files from parallel pods: file1.pt file2.pt ... "
+             "Use after all pods complete to combine results for probe training."
+    )
+
     args = parser.parse_args()
+
+    # Create session timestamp for all output files (prevents overwrites between runs)
+    session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Create output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create checkpoint directory if specified
-    checkpoint_dir = None
+    # Handle merge-pods mode (combine results from parallel execution)
+    if args.merge_pods:
+        from interpretability.merge_parallel_results import merge_parallel_activations
+        print(f"\n{'='*60}")
+        print("MERGE MODE: Combining parallel pod results")
+        print(f"{'='*60}")
+        merged_path = merge_parallel_activations(
+            args.merge_pods,
+            output_dir=str(output_dir),
+            timestamp=session_timestamp,
+            verbose=True,
+        )
+        # Auto-train probes on merged data unless --train-only was NOT specified
+        print(f"\nTraining probes on merged data...")
+        train_probes_on_data(
+            merged_path,
+            str(output_dir),
+            timestamp=session_timestamp,
+            scenario_name="merged",  # Merged data contains multiple scenarios/pods
+        )
+        return
+
+    # Calculate trial_id_offset for parallel execution
+    trial_id_offset = 0
+    if args.parallel_pod:
+        try:
+            pod_num, total_pods = map(int, args.parallel_pod.split('/'))
+            if pod_num < 1 or pod_num > total_pods:
+                parser.error(f"Invalid pod number: {pod_num}/{total_pods}. Pod must be between 1 and {total_pods}")
+            # Each pod gets a range of 1000 trial IDs
+            # Pod 1: 0-999, Pod 2: 1000-1999, etc.
+            trial_id_offset = (pod_num - 1) * 1000
+            print(f"\n{'='*60}")
+            print(f"PARALLEL MODE: Pod {pod_num} of {total_pods}")
+            print(f"{'='*60}")
+            print(f"Trial ID offset: {trial_id_offset}")
+            print(f"Trial ID range: {trial_id_offset} - {trial_id_offset + 999}")
+        except ValueError:
+            parser.error(f"Invalid --parallel-pod format: '{args.parallel_pod}'. Use 'POD_NUM/TOTAL_PODS' (e.g., '3/8')")
+
+    # Create checkpoint directory - ALWAYS enabled now (defaults to output_dir/checkpoints)
+    # This ensures data is saved incrementally and survives crashes
     if args.checkpoint_dir:
         checkpoint_dir = Path(args.checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Checkpoints will be saved to: {checkpoint_dir}")
+    else:
+        # Default: create checkpoints subdirectory with session timestamp
+        checkpoint_dir = output_dir / f"checkpoints_{session_timestamp}"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Checkpoints will be saved to: {checkpoint_dir}")
 
     # Training-only mode
     if args.train_only:
         if not args.data:
             parser.error("--data is required when using --train-only")
-        results = train_probes_on_data(args.data, str(output_dir))
+        results = train_probes_on_data(args.data, str(output_dir), timestamp=session_timestamp)
         return
 
     # Get scenarios - support both --scenario-name (single) and --scenarios (count)
@@ -426,6 +504,7 @@ def main():
         sae_layer=args.sae_layer,
         evaluator_api=args.evaluator if args.evaluator != 'none' else None,
         evaluator_type=evaluator_type,
+        trial_id_offset=trial_id_offset,  # For parallel execution
     )
 
     init_time = time.time() - start_time
@@ -454,9 +533,20 @@ def main():
         )
         all_results["instructed"] = results
 
-    # Save activations
+    # Save activations with unique filename including scenario, mode, timestamp, and pod ID
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    activations_path = output_dir / f"activations_{args.mode}_{timestamp}.pt"
+
+    # Build filename: activations_{scenario}_{mode}_{timestamp}_{pod}.pt
+    filename_parts = ["activations"]
+    if args.scenario_name:
+        filename_parts.append(args.scenario_name)
+    filename_parts.append(args.mode)
+    filename_parts.append(timestamp)
+    if args.parallel_pod:
+        pod_num = args.parallel_pod.split('/')[0]
+        filename_parts.append(f"pod{pod_num}")
+
+    activations_path = output_dir / f"{'_'.join(filename_parts)}.pt"
     runner.save_dataset(str(activations_path))
     print(f"\nActivations saved to: {activations_path}")
 
@@ -465,7 +555,18 @@ def main():
     print("POST-EXPERIMENT ANALYSIS")
     print(f"{'='*60}")
 
-    probe_results = train_probes_on_data(str(activations_path), str(output_dir))
+    # Get pod_id if in parallel mode
+    pod_id = None
+    if args.parallel_pod:
+        pod_id = args.parallel_pod.split('/')[0]
+
+    probe_results = train_probes_on_data(
+        str(activations_path),
+        str(output_dir),
+        timestamp=session_timestamp,
+        scenario_name=args.scenario_name,
+        pod_id=pod_id,
+    )
 
     # Causal validation (if enabled)
     causal_validated = False
@@ -542,7 +643,14 @@ def main():
                         return [convert_numpy(v) for v in obj]
                     return obj
 
-                causal_results_path = output_dir / "causal_validation_results.json"
+                # Build filename with scenario and pod info
+                causal_filename_parts = ["causal_validation_results"]
+                if args.scenario_name:
+                    causal_filename_parts.append(args.scenario_name)
+                causal_filename_parts.append(session_timestamp)
+                if pod_id:
+                    causal_filename_parts.append(f"pod{pod_id}")
+                causal_results_path = output_dir / f"{'_'.join(causal_filename_parts)}.json"
                 with open(causal_results_path, "w") as f:
                     json.dump(convert_numpy(causal_results), f, indent=2)
                 print(f"\nCausal validation results saved to: {causal_results_path}")

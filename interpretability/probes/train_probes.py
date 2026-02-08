@@ -1379,7 +1379,13 @@ def analyze_outcome_prediction(
         Dict with outcome prediction metrics
     """
     round_nums = np.array(round_nums)
-    trial_outcomes = np.array(trial_outcomes).astype(float)
+    # Convert string outcomes to numeric (1=success, 0=failure)
+    SUCCESS_OUTCOMES = {"agreement", "deal", "success", "accepted", "true", "True"}
+    trial_outcomes_raw = trial_outcomes
+    trial_outcomes = np.array([
+        1.0 if (str(o) in SUCCESS_OUTCOMES or o is True or o == 1) else 0.0
+        for o in trial_outcomes_raw
+    ])
 
     # Filter to early rounds (1-2)
     early_mask = round_nums <= 2

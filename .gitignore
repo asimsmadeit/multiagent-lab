@@ -97,5 +97,8 @@ data/
 docs/RUNPOD_QUICKSTART.md
 docs/EXPERIMENT_GUIDE.md
 *_QUICKSTART.md
+*_GUIDE.py
+*_GUIDE.md
 *.local.md
 .deepeval
+QUICKSTART.txt
