@@ -277,8 +277,8 @@ def main():
 
     # Model configuration
     parser.add_argument(
-        "--model", type=str, default="google/gemma-2-27b-it",
-        help="HuggingFace model name (default: gemma-2-27b-it)"
+        "--model", type=str, default="google/gemma-7b-it",
+        help="HuggingFace model name (default: gemma-7b-it)"
     )
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",

@@ -1566,6 +1566,8 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
             best_layer = layer
 
     results["layer_analysis"] = layer_results
+    if best_layer is None:
+        best_layer = layers[len(layers) // 2]
     results["best_probe"] = {"layer": int(best_layer), "r2": float(best_r2)}
 
     print(f"\nBest layer: {best_layer} (R² = {best_r2:.3f})")

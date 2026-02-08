@@ -1034,9 +1034,9 @@ class InterpretabilityRunner:
                     emotion_intensities.append(model_state.get('emotion_intensity', 0.0))
                     trust_levels.append(model_state.get('trust_level', 0.5))
 
-                labels['perceived_deception'] = np.mean(deception_risks)
-                labels['emotion_intensity'] = np.mean(emotion_intensities)
-                labels['trust_level'] = np.mean(trust_levels)
+                labels['perceived_deception'] = float(np.mean(deception_risks))
+                labels['emotion_intensity'] = float(np.mean(emotion_intensities))
+                labels['trust_level'] = float(np.mean(trust_levels))
                 labels['cooperation_intent'] = state.get('empathy_level', 0.5)
         except (AttributeError, KeyError, TypeError) as e:
             self._component_access_failures['TheoryOfMind'] += 1
@@ -1220,7 +1220,6 @@ Example: yes, yes'''
                 result = self.model.sample_text(
                     prompt=extraction_prompt,
                     max_tokens=30,
-                    capture_activations=False,  # Don't need activations for ground truth
                 )
             result = result.strip().lower()
             # Treat empty result as extraction failure
@@ -1636,7 +1635,7 @@ Example: yes, yes'''
                     tom_state = self._extract_tom_state(agent)
 
                     # Extract GM labels (third-person ground truth)
-                    dialogue_history = [f"{name}: {act}" for name, act in all_actions]
+                    dialogue_history = [f"{name}: {act}" for round_actions in all_actions for name, act in round_actions]
                     gm_labels = self._extract_gm_labels(
                         gm, agent.name, action, round_num,
                         scenario_type=scenario_type,
