@@ -401,8 +401,10 @@ def main():
     # Create session timestamp for all output files (prevents overwrites between runs)
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Create output directory
+    # Create output directory (organized by scenario if specified)
     output_dir = Path(args.output)
+    if args.scenario_name:
+        output_dir = output_dir / args.scenario_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Handle merge-pods mode (combine results from parallel execution)
