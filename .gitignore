@@ -103,6 +103,10 @@ docs/EXPERIMENT_GUIDE.md
 .deepeval
 QUICKSTART.txt
 
+# Paper and submission files
+latex_paper/
+hackathon_submission.txt
+
 # Experiment data and figures
 experiment_results/
 figures/
