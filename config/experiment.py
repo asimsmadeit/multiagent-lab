@@ -166,6 +166,28 @@ def get_model_preset(model_name: str) -> Optional[Dict[str, Any]]:
     return MODEL_PRESETS.get(model_name)
 
 
+def get_dense_layers(model_name: str, stride: int = 2) -> List[int]:
+    """Get dense layer list for a model (every `stride`-th layer).
+
+    E12: Dense layer capture for tracking where deception representations
+    emerge and transform through the network.
+
+    Args:
+        model_name: HuggingFace model name
+        stride: Capture every N-th layer (default: 2 = every other layer)
+
+    Returns:
+        List of layer indices
+    """
+    preset = MODEL_PRESETS.get(model_name)
+    if preset:
+        n_layers = preset["n_layers"]
+    else:
+        # Fallback for unknown models
+        n_layers = 28  # Gemma 7B default
+    return list(range(0, n_layers, stride))
+
+
 class ModelConfig(BaseModel):
     """LLM and interpretability model configuration.
 

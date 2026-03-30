@@ -11,6 +11,7 @@
 # Usage:
 #   from causal_validation import (
 #       activation_patching_test,
+#       cross_sample_patching_test,
 #       ablation_test,
 #       steering_vector_test,
 #       run_full_causal_validation,
@@ -420,6 +421,282 @@ def activation_patching_test(
         if random_changes:
             print(f"  Random baseline: {np.mean(random_changes):.3f}")
             print(f"  Effect ratio: {effect_ratio:.2f}x")
+        print(f"  PASSED: {passed}")
+
+    return result
+
+
+# =============================================================================
+# CROSS-SAMPLE ACTIVATION PATCHING (D11)
+# =============================================================================
+
+def cross_sample_patching_test(
+    model,  # TransformerLens HookedTransformer
+    activations: Dict[int, np.ndarray],
+    labels: np.ndarray,
+    layer: int,
+    test_prompts: List[str],
+    metadata: List[Dict[str, Any]] = None,
+    n_pairs: int = 10,
+    verbose: bool = True,
+) -> CausalValidationResult:
+    """
+    Cross-Sample Activation Patching (D11): Swap actual activations between
+    honest and deceptive samples and measure behavioral change.
+
+    Unlike direction-based patching (which adds/subtracts a mass-mean vector),
+    this test uses REAL activations from matched samples:
+    1. Take honest sample A and deceptive sample B
+    2. Run A's prompt through the model
+    3. At layer L, replace A's activation with B's stored activation
+    4. Continue the forward pass from L onward
+    5. If output shifts toward deception, layer L is causally relevant
+
+    Also tests reverse: patch honest activation into deceptive prompt.
+
+    Args:
+        model: TransformerLens HookedTransformer
+        activations: Dict mapping layer -> activation array [N, d_model]
+        labels: Deception labels [N]
+        layer: Layer to patch at
+        test_prompts: Corresponding prompts for each sample
+        metadata: Optional list of dicts with 'scenario' key for matched pairing
+        n_pairs: Number of matched pairs to test
+        verbose: Print progress
+
+    Returns:
+        CausalValidationResult with effect size from cross-sample patching
+    """
+    if verbose:
+        print(f"\n{'='*60}")
+        print("CROSS-SAMPLE ACTIVATION PATCHING (D11)")
+        print(f"{'='*60}")
+        print(f"Layer: {layer}")
+        print(f"Requested pairs: {n_pairs}")
+
+    X = activations[layer]
+    if hasattr(X, 'numpy'):
+        X = X.numpy()
+
+    binary_labels = (np.array(labels) > 0.5).astype(bool)
+    honest_idxs = np.where(~binary_labels)[0]
+    deceptive_idxs = np.where(binary_labels)[0]
+
+    if len(honest_idxs) < 2 or len(deceptive_idxs) < 2:
+        return CausalValidationResult(
+            test_name="cross_sample_patching",
+            passed=False,
+            effect_size=0.0,
+            n_samples_tested=0,
+            message=f"Not enough samples: {len(honest_idxs)} honest, {len(deceptive_idxs)} deceptive",
+        )
+
+    # Build matched pairs: prefer same-scenario pairs if metadata available
+    pairs = []
+    if metadata is not None:
+        # Group by scenario for matched pairing
+        scenario_honest = {}
+        scenario_deceptive = {}
+        for idx in honest_idxs:
+            sc = metadata[idx].get('scenario', 'unknown') if idx < len(metadata) else 'unknown'
+            scenario_honest.setdefault(sc, []).append(idx)
+        for idx in deceptive_idxs:
+            sc = metadata[idx].get('scenario', 'unknown') if idx < len(metadata) else 'unknown'
+            scenario_deceptive.setdefault(sc, []).append(idx)
+        # Pair within scenarios first
+        for sc in scenario_honest:
+            if sc in scenario_deceptive:
+                h_list = scenario_honest[sc]
+                d_list = scenario_deceptive[sc]
+                for h, d in zip(h_list, d_list):
+                    pairs.append((h, d))
+                    if len(pairs) >= n_pairs:
+                        break
+            if len(pairs) >= n_pairs:
+                break
+
+    # Fill remaining pairs with random matching
+    while len(pairs) < n_pairs and len(honest_idxs) > 0 and len(deceptive_idxs) > 0:
+        h_idx = np.random.choice(honest_idxs)
+        d_idx = np.random.choice(deceptive_idxs)
+        pairs.append((int(h_idx), int(d_idx)))
+
+    if verbose:
+        print(f"Testing {len(pairs)} pairs")
+
+    hook_name = f"blocks.{layer}.hook_resid_post"
+
+    # Measure: for each pair, compute KL divergence between patched and baseline
+    # Direction 1: Patch deceptive activation INTO honest prompt
+    d_into_h_kl = []
+    # Direction 2: Patch honest activation INTO deceptive prompt
+    h_into_d_kl = []
+    # Control: Patch same-class activation (honest into honest)
+    control_kl = []
+
+    for pair_idx, (h_idx, d_idx) in enumerate(pairs):
+        if verbose and pair_idx % 5 == 0:
+            print(f"  Pair {pair_idx+1}/{len(pairs)}...", flush=True)
+
+        h_prompt = test_prompts[h_idx] if h_idx < len(test_prompts) else test_prompts[0]
+        d_prompt = test_prompts[d_idx] if d_idx < len(test_prompts) else test_prompts[0]
+
+        # Stored activations from the dataset
+        h_activation = torch.tensor(X[h_idx], dtype=torch.float32)
+        d_activation = torch.tensor(X[d_idx], dtype=torch.float32)
+
+        try:
+            max_ctx = getattr(model.cfg, 'n_ctx', 8192)
+
+            # --- Direction 1: Patch deceptive into honest ---
+            h_tokens = model.to_tokens(h_prompt, truncate=True)
+            if h_tokens.shape[1] > max_ctx:
+                h_tokens = h_tokens[:, -max_ctx:]
+
+            with torch.no_grad():
+                h_baseline_logits = model(h_tokens)
+                h_baseline_probs = torch.softmax(h_baseline_logits[:, -1, :], dim=-1)
+
+            def patch_d_into_h(activation, hook):
+                # Replace last-token activation with deceptive sample's stored activation
+                activation[:, -1, :] = d_activation.to(activation.device)
+                return activation
+
+            with torch.no_grad():
+                patched_logits = model.run_with_hooks(
+                    h_tokens, fwd_hooks=[(hook_name, patch_d_into_h)]
+                )
+                patched_probs = torch.softmax(patched_logits[:, -1, :], dim=-1)
+
+            kl = torch.nn.functional.kl_div(
+                patched_probs.log().clamp(min=-100),
+                h_baseline_probs,
+                reduction='batchmean'
+            ).item()
+            if not np.isnan(kl):
+                d_into_h_kl.append(kl)
+
+            # --- Direction 2: Patch honest into deceptive ---
+            d_tokens = model.to_tokens(d_prompt, truncate=True)
+            if d_tokens.shape[1] > max_ctx:
+                d_tokens = d_tokens[:, -max_ctx:]
+
+            with torch.no_grad():
+                d_baseline_logits = model(d_tokens)
+                d_baseline_probs = torch.softmax(d_baseline_logits[:, -1, :], dim=-1)
+
+            def patch_h_into_d(activation, hook):
+                activation[:, -1, :] = h_activation.to(activation.device)
+                return activation
+
+            with torch.no_grad():
+                patched_d_logits = model.run_with_hooks(
+                    d_tokens, fwd_hooks=[(hook_name, patch_h_into_d)]
+                )
+                patched_d_probs = torch.softmax(patched_d_logits[:, -1, :], dim=-1)
+
+            kl_rev = torch.nn.functional.kl_div(
+                patched_d_probs.log().clamp(min=-100),
+                d_baseline_probs,
+                reduction='batchmean'
+            ).item()
+            if not np.isnan(kl_rev):
+                h_into_d_kl.append(kl_rev)
+
+            # --- Control: Patch honest into honest (should cause less change) ---
+            # Use a different honest sample
+            other_h_idxs = [i for i in honest_idxs if i != h_idx]
+            if other_h_idxs:
+                ctrl_idx = np.random.choice(other_h_idxs)
+                ctrl_activation = torch.tensor(X[ctrl_idx], dtype=torch.float32)
+
+                def patch_ctrl(activation, hook):
+                    activation[:, -1, :] = ctrl_activation.to(activation.device)
+                    return activation
+
+                with torch.no_grad():
+                    ctrl_logits = model.run_with_hooks(
+                        h_tokens, fwd_hooks=[(hook_name, patch_ctrl)]
+                    )
+                    ctrl_probs = torch.softmax(ctrl_logits[:, -1, :], dim=-1)
+
+                kl_ctrl = torch.nn.functional.kl_div(
+                    ctrl_probs.log().clamp(min=-100),
+                    h_baseline_probs,
+                    reduction='batchmean'
+                ).item()
+                if not np.isnan(kl_ctrl):
+                    control_kl.append(kl_ctrl)
+
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: Pair {pair_idx} failed: {e}")
+            continue
+
+    if not d_into_h_kl:
+        return CausalValidationResult(
+            test_name="cross_sample_patching",
+            passed=False,
+            effect_size=0.0,
+            n_samples_tested=0,
+            message="All pairs failed",
+        )
+
+    # Compute effect sizes
+    mean_d_into_h = np.mean(d_into_h_kl)
+    mean_h_into_d = np.mean(h_into_d_kl) if h_into_d_kl else 0.0
+    mean_control = np.mean(control_kl) if control_kl else 0.0
+    cross_class_effect = (mean_d_into_h + mean_h_into_d) / 2
+
+    # The test passes if cross-class patching causes significantly MORE change
+    # than same-class patching (control)
+    if mean_control > 0:
+        effect_ratio = cross_class_effect / (mean_control + 1e-8)
+        passed = effect_ratio > 1.5
+    else:
+        effect_ratio = float('inf') if cross_class_effect > 0 else 0.0
+        passed = cross_class_effect > 0.1
+
+    # Statistical significance
+    p_value = None
+    if control_kl and d_into_h_kl and len(control_kl) >= 3 and len(d_into_h_kl) >= 3:
+        try:
+            from scipy import stats
+            _, p_value = stats.mannwhitneyu(
+                d_into_h_kl, control_kl, alternative='greater'
+            )
+        except Exception:
+            pass
+
+    result = CausalValidationResult(
+        test_name="cross_sample_patching",
+        passed=passed,
+        effect_size=cross_class_effect,
+        p_value=p_value,
+        n_samples_tested=len(pairs),
+        details={
+            "mean_deceptive_into_honest_kl": float(mean_d_into_h),
+            "mean_honest_into_deceptive_kl": float(mean_h_into_d),
+            "mean_control_kl": float(mean_control),
+            "effect_ratio_vs_control": float(effect_ratio) if effect_ratio != float('inf') else None,
+            "n_pairs_tested": len(d_into_h_kl),
+            "n_control_tested": len(control_kl),
+        },
+        message=(
+            f"Cross-class KL: {cross_class_effect:.3f}, "
+            f"Control KL: {mean_control:.3f}, "
+            f"Ratio: {effect_ratio:.2f}x"
+        ),
+    )
+
+    if verbose:
+        print(f"\nResults:")
+        print(f"  Deceptive→Honest KL: {mean_d_into_h:.3f} ({len(d_into_h_kl)} pairs)")
+        print(f"  Honest→Deceptive KL: {mean_h_into_d:.3f} ({len(h_into_d_kl)} pairs)")
+        print(f"  Control (same-class) KL: {mean_control:.3f} ({len(control_kl)} pairs)")
+        print(f"  Effect ratio vs control: {effect_ratio:.2f}x")
+        if p_value is not None:
+            print(f"  p-value: {p_value:.4f}")
         print(f"  PASSED: {passed}")
 
     return result
@@ -947,6 +1224,7 @@ def run_full_causal_validation(
     labels: np.ndarray,
     best_layer: int,
     test_prompts: List[str] = None,
+    metadata: List[Dict[str, Any]] = None,
     verbose: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -960,6 +1238,7 @@ def run_full_causal_validation(
         labels: Deception labels (GM ground truth)
         best_layer: Best layer from probe training
         test_prompts: Prompts for intervention tests
+        metadata: Per-sample metadata dicts (for matched pairing in cross-sample patching)
         verbose: Print progress
 
     Returns:
@@ -1043,6 +1322,28 @@ def run_full_causal_validation(
                 print(f"Steering test failed: {e}")
             results["tests"]["steering_vector"] = {
                 "test_name": "steering_vector",
+                "passed": False,
+                "message": str(e),
+            }
+            results["n_tests_total"] += 1
+
+        # Test 6: Cross-sample activation patching (D11)
+        if verbose:
+            print("\n" + "-" * 60)
+        try:
+            cross_patch_result = cross_sample_patching_test(
+                model, activations, labels, best_layer, test_prompts,
+                metadata=metadata, verbose=verbose,
+            )
+            results["tests"]["cross_sample_patching"] = cross_patch_result.to_dict()
+            results["n_tests_total"] += 1
+            if cross_patch_result.passed:
+                results["n_tests_passed"] += 1
+        except Exception as e:
+            if verbose:
+                print(f"Cross-sample patching test failed: {e}")
+            results["tests"]["cross_sample_patching"] = {
+                "test_name": "cross_sample_patching",
                 "passed": False,
                 "message": str(e),
             }

@@ -306,7 +306,6 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
         deception_indicators = {
             'linguistic_complexity': 0.0,
             'evasiveness': 0.0,
-            'inconsistency': 0.0,
             'over_certainty': 0.0,
             'defensive_language': 0.0,
             'negative_emotion': 0.0,
@@ -545,6 +544,21 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
         our_emotional_tone = self._detect_emotions(action_attempt)
         self._emotion_history.append(our_emotional_tone)
 
+        # Detect deception in our OWN output (not just counterpart's)
+        self_deception = self._detect_deception(action_attempt, self._baseline_patterns)
+        self._mental_models.setdefault("self", MentalModel(
+            counterpart_id="self",
+            goals={},
+            personality_traits={},
+            emotional_state=our_emotional_tone,
+            strategies={},
+            constraints=[],
+            deception_indicators=self_deception,
+            last_updated="current",
+        ))
+        self._mental_models["self"].deception_indicators = self_deception
+        self._mental_models["self"].emotional_state = our_emotional_tone
+
         return ""
 
     def pre_observe(self, observation: str) -> str:
@@ -589,7 +603,7 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
                 'valence': model.emotional_state.valence,
                 'top_goals': sorted(model.goals.items(), key=lambda x: x[1], reverse=True)[:3],
                 'personality_summary': {k: v for k, v in model.personality_traits.items() if v > 0.6},
-                'deception_risk': sum(model.deception_indicators.values()) / len(model.deception_indicators) if model.deception_indicators else 0.0
+                'deception_risk': max(model.deception_indicators.values()) if model.deception_indicators else 0.0
             }
 
         return {

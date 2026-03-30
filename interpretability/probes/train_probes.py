@@ -168,6 +168,7 @@ def train_ridge_probe(
     use_pca: bool = True,
     n_components: int = 50,
     random_state: int = 42,
+    normalize: bool = True,
 ) -> Tuple[Ridge, ProbeResult]:
     """Train a Ridge regression probe.
 
@@ -178,6 +179,7 @@ def train_ridge_probe(
         use_pca: Whether to apply PCA for dimensionality reduction
         n_components: Number of PCA components
         random_state: Random seed for reproducibility (default 42)
+        normalize: Whether to apply StandardScaler (fitted on train only)
 
     Returns:
         Tuple of (trained Ridge probe, ProbeResult with metrics)
@@ -188,6 +190,12 @@ def train_ridge_probe(
         X, y, test_size=0.2, random_state=random_state
     )
 
+    # Normalize: fit on train only to prevent data leakage
+    if normalize:
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
+
     # Optional PCA to reduce overfitting
     if use_pca:
         n_comp = min(n_components, X_train.shape[0] - 1, X_train.shape[1])
@@ -195,9 +203,15 @@ def train_ridge_probe(
         X_train = pca.fit_transform(X_train)
         X_test = pca.transform(X_test)
         # Use already-fitted PCA to transform full X (no data leakage)
-        X_pca = pca.transform(X)
+        if normalize:
+            X_pca = pca.transform(scaler.transform(X))
+        else:
+            X_pca = pca.transform(X)
     else:
-        X_pca = X
+        if normalize:
+            X_pca = scaler.transform(X)
+        else:
+            X_pca = X
 
     # Train probe
     probe = Ridge(alpha=alpha)
@@ -214,17 +228,6 @@ def train_ridge_probe(
     cv_scores = cross_val_score(Ridge(alpha=alpha), X_pca, y, cv=5, scoring='r2')
 
     # Binary metrics
-    # =========================================================================
-    # BINARIZATION THRESHOLD: 0.5 is used as the default threshold because:
-    # 1. Labels are normalized to [0, 1] range where 0.5 is the natural midpoint
-    # 2. For probabilistic labels (e.g., "50% deceptive"), 0.5 is the decision boundary
-    # 3. This matches standard binary classification convention
-    #
-    # LIMITATION: Binary metrics (accuracy, AUC) lose information from continuous
-    # labels. Always report R² alongside binary metrics for continuous ground truth.
-    #
-    # For threshold sensitivity analysis, see threshold_sensitivity_analysis().
-    # =========================================================================
     binary_pred = (test_pred > 0.5).astype(int)
     binary_true = (y_test > 0.5).astype(int)
 
@@ -249,11 +252,221 @@ def train_ridge_probe(
     return probe, result
 
 
+def train_logistic_probe(
+    X: np.ndarray,
+    y: np.ndarray,
+    C: float = 1.0,
+    random_state: int = 42,
+    normalize: bool = True,
+    tune_C: bool = False,
+    val_fraction: float = 0.25,
+    use_pca: bool = True,
+    n_components: int = 100,
+) -> Tuple[LogisticRegression, ProbeResult]:
+    """Train a Logistic Regression probe for binary deception classification.
+
+    This is the recommended probe type for binary deception detection per
+    RAPTOR (2026), Apollo Research (2025), and Anthropic (2024).
+
+    Args:
+        X: Feature matrix [N, d_model]
+        y: Labels [N] (continuous, will be binarized at 0.5)
+        C: Inverse regularization strength (lower = more regularization)
+        random_state: Random seed for reproducibility
+        normalize: Whether to apply StandardScaler (fitted on train only)
+        tune_C: If True, sweep C values on a validation set
+        val_fraction: Fraction of train to use for validation when tune_C=True
+        use_pca: Whether to apply PCA for dimensionality reduction (speeds up training)
+        n_components: Number of PCA components
+
+    Returns:
+        Tuple of (trained LogisticRegression probe, ProbeResult with metrics)
+    """
+    # Binarize labels
+    y_binary = (np.array(y) > 0.5).astype(int)
+
+    # Check we have both classes
+    if len(np.unique(y_binary)) < 2:
+        return LogisticRegression(), ProbeResult(
+            layer=-1, label_type="", r2_score=0.0, accuracy=0.5,
+            auc=0.5, train_r2=0.0, test_r2=0.0, cross_val_scores=[]
+        )
+
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y_binary, test_size=0.2, random_state=random_state, stratify=y_binary
+    )
+
+    # Normalize: fit on train only
+    scaler = None
+    if normalize:
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
+
+    # PCA for dimensionality reduction (speeds up logistic on high-dim data)
+    pca = None
+    if use_pca:
+        n_comp = min(n_components, X_train.shape[0] - 1, X_train.shape[1])
+        pca = PCA(n_components=n_comp)
+        X_train = pca.fit_transform(X_train)
+        X_test = pca.transform(X_test)
+
+    # Tune C on validation set if requested
+    if tune_C:
+        X_tr, X_val, y_tr, y_val = train_test_split(
+            X_train, y_train, test_size=val_fraction,
+            random_state=random_state, stratify=y_train
+        )
+        best_C, best_val_auc = C, 0.0
+        for c_candidate in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
+            clf = LogisticRegression(
+                C=c_candidate, penalty='l2', max_iter=5000,
+                random_state=random_state, solver='lbfgs'
+            )
+            clf.fit(X_tr, y_tr)
+            try:
+                val_auc = roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1])
+            except ValueError:
+                val_auc = 0.5
+            if val_auc > best_val_auc:
+                best_C, best_val_auc = c_candidate, val_auc
+        C = best_C
+
+    # Train probe
+    probe = LogisticRegression(
+        C=C, penalty='l2', max_iter=5000,
+        random_state=random_state, solver='lbfgs'
+    )
+    probe.fit(X_train, y_train)
+
+    # Evaluate
+    train_proba = probe.predict_proba(X_train)[:, 1]
+    test_proba = probe.predict_proba(X_test)[:, 1]
+    test_pred = probe.predict(X_test)
+
+    train_acc = accuracy_score(y_train, probe.predict(X_train))
+    test_acc = accuracy_score(y_test, test_pred)
+
+    try:
+        auc = roc_auc_score(y_test, test_proba)
+    except ValueError:
+        auc = 0.5
+
+    try:
+        train_auc = roc_auc_score(y_train, train_proba)
+    except ValueError:
+        train_auc = 0.5
+
+    # Cross-validation for stability estimate
+    # Transform full X using train-fitted scaler and PCA
+    X_cv = X.copy()
+    if scaler is not None:
+        X_cv = scaler.transform(X_cv)
+    if pca is not None:
+        X_cv = pca.transform(X_cv)
+    y_all_binary = (np.array(y) > 0.5).astype(int)
+    try:
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+        cv_scores = cross_val_score(
+            LogisticRegression(C=C, penalty='l2', max_iter=5000, solver='lbfgs'),
+            X_cv, y_all_binary, cv=cv, scoring='roc_auc'
+        )
+    except ValueError:
+        cv_scores = np.array([0.5])
+
+    result = ProbeResult(
+        layer=-1,
+        label_type="",
+        r2_score=float(auc),  # Use AUC as primary metric for logistic
+        accuracy=test_acc,
+        auc=auc,
+        train_r2=float(train_auc),
+        test_r2=float(auc),
+        cross_val_scores=cv_scores.tolist(),
+    )
+
+    return probe, result
+
+
+def train_probe_multi_seed(
+    X: np.ndarray,
+    y: np.ndarray,
+    probe_type: str = "logistic",
+    seeds: List[int] = None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Train probes across multiple random seeds and aggregate results.
+
+    This provides robust performance estimates with confidence intervals,
+    following best practices from RAPTOR (2026) and Truth is Universal (NeurIPS 2024).
+
+    Args:
+        X: Feature matrix [N, d_model]
+        y: Labels [N]
+        probe_type: "logistic", "ridge", or "mass_mean"
+        seeds: List of random seeds (default: [42, 123, 456, 789, 1024])
+        **kwargs: Additional arguments passed to the probe training function
+
+    Returns:
+        Dict with per-seed results, mean/std metrics, and 95% CI
+    """
+    if seeds is None:
+        seeds = [42, 123, 456, 789, 1024]
+
+    per_seed = []
+    for seed in seeds:
+        if probe_type == "logistic":
+            _, result = train_logistic_probe(X, y, random_state=seed, **kwargs)
+        elif probe_type == "ridge":
+            _, result = train_ridge_probe(X, y, random_state=seed, **kwargs)
+        elif probe_type == "mass_mean":
+            _, result = train_mass_mean_probe(X, y, random_state=seed, **kwargs)
+        else:
+            raise ValueError(f"Unknown probe_type: {probe_type}")
+
+        per_seed.append({
+            "seed": seed,
+            "auc": result.auc,
+            "accuracy": result.accuracy,
+            "r2": result.r2_score,
+            "train_r2": result.train_r2,
+            "test_r2": result.test_r2,
+        })
+
+    aucs = [r["auc"] for r in per_seed]
+    accs = [r["accuracy"] for r in per_seed]
+
+    # 95% CI (using t-distribution for small n)
+    from scipy import stats
+    n = len(aucs)
+    auc_mean = np.mean(aucs)
+    auc_std = np.std(aucs, ddof=1) if n > 1 else 0.0
+    if n > 1:
+        t_val = stats.t.ppf(0.975, df=n - 1)
+        auc_ci = (auc_mean - t_val * auc_std / np.sqrt(n),
+                  auc_mean + t_val * auc_std / np.sqrt(n))
+    else:
+        auc_ci = (auc_mean, auc_mean)
+
+    return {
+        "per_seed": per_seed,
+        "auc_mean": float(auc_mean),
+        "auc_std": float(auc_std),
+        "auc_ci_95": (float(auc_ci[0]), float(auc_ci[1])),
+        "accuracy_mean": float(np.mean(accs)),
+        "accuracy_std": float(np.std(accs, ddof=1)) if n > 1 else 0.0,
+        "n_seeds": n,
+        "probe_type": probe_type,
+    }
+
+
 def train_mass_mean_probe(
     X: np.ndarray,
     y: np.ndarray,
     threshold: float = 0.5,
     random_state: int = 42,
+    normalize: bool = True,
 ) -> Tuple[np.ndarray, ProbeResult]:
     """
     Train a mass-mean direction probe (Marks & Tegmark method).
@@ -264,6 +477,7 @@ def train_mass_mean_probe(
         y: Labels [N]
         threshold: Threshold for binary classification (default 0.5)
         random_state: Random seed for train/test split (default 42)
+        normalize: Whether to center activations (subtract training mean)
 
     Returns:
         Tuple of (direction vector, ProbeResult with metrics)
@@ -278,6 +492,11 @@ def train_mass_mean_probe(
             layer=-1, label_type="", r2_score=0.0, accuracy=0.5,
             auc=0.5, train_r2=0.0, test_r2=0.0, cross_val_scores=[]
         )
+
+    # Center activations by subtracting mean (Marks & Tegmark method)
+    if normalize:
+        X_mean = X.mean(axis=0)
+        X = X - X_mean
 
     # Compute means
     honest_mean = X[~binary_y].mean(axis=0)
@@ -731,11 +950,16 @@ def compute_generalization_auc(
             }
             continue
 
+        # Normalize: fit on train only
+        scaler = StandardScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
+
         # Apply PCA
-        n_comp = min(50, X_train.shape[0] - 1, X_train.shape[1])
+        n_comp = min(50, X_train_s.shape[0] - 1, X_train_s.shape[1])
         pca = PCA(n_components=n_comp)
-        X_train_pca = pca.fit_transform(X_train)
-        X_test_pca = pca.transform(X_test)
+        X_train_pca = pca.fit_transform(X_train_s)
+        X_test_pca = pca.transform(X_test_s)
 
         # Train Ridge probe
         probe = Ridge(alpha=alpha)

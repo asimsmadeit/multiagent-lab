@@ -123,6 +123,7 @@ def run_emergent_experiment(
     agent_modules: List[str] = None,
     ultrafast: bool = False,
     checkpoint_dir: str = None,
+    counterpart_type: str = None,
 ) -> Dict[str, Any]:
     """
     Run emergent deception experiment through Concordia framework.
@@ -135,6 +136,7 @@ def run_emergent_experiment(
         max_rounds: Max negotiation rounds per trial
         agent_modules: List of agent modules to enable (default: ['theory_of_mind'])
         ultrafast: Use minimal agents for ~5x speedup (default: False)
+        counterpart_type: Counterpart behavior variant for A1 analysis
 
     Returns:
         Dict with all results
@@ -164,6 +166,7 @@ def run_emergent_experiment(
         agent_modules=agent_modules,
         ultrafast=ultrafast,
         checkpoint_dir=checkpoint_dir,
+        counterpart_type=counterpart_type,
     )
 
     return results
@@ -318,6 +321,16 @@ def main():
         help="Comma-separated list of layers to capture (default: auto)"
     )
     parser.add_argument(
+        "--dense-layers", type=int, default=None, metavar="STRIDE",
+        help="E12: Capture every N-th layer for dense analysis (e.g., --dense-layers 2 = every other layer). "
+             "Overrides --layers. Increases storage ~5-7x but reveals where deception emerges."
+    )
+    parser.add_argument(
+        "--capture-mean", action="store_true",
+        help="E13: Also capture mean-pooled activations (averaged over all token positions). "
+             "Doubles storage but enables comparison of last-token vs context-level representations."
+    )
+    parser.add_argument(
         "--fast", action="store_true",
         help="Fast mode: disable ToM module for ~3x speedup (less rich agent labels)"
     )
@@ -382,6 +395,15 @@ def main():
     parser.add_argument(
         "--causal-samples", type=int, default=20,
         help="Number of samples for causal validation tests (default: 20)"
+    )
+
+    # Counterpart behavior variant (A1: conditioned vs complex deception test)
+    parser.add_argument(
+        "--counterpart-type", type=str, default=None,
+        choices=["default", "skeptical", "credulous", "informed", "absent"],
+        help="Counterpart behavior variant for A1 analysis. "
+             "Tests whether agent adapts deception strategy to counterpart type "
+             "(evidence for complex vs conditioned deception)."
     )
 
     # Parallel execution (for multi-GPU clusters)
@@ -487,7 +509,12 @@ def main():
 
     # Parse layers
     layers = None
-    if args.layers:
+    if args.dense_layers is not None:
+        # E12: Dense layer capture — every N-th layer
+        from config.experiment import get_dense_layers
+        layers = get_dense_layers(args.model, stride=args.dense_layers)
+        print(f"Dense layer capture (stride={args.dense_layers}): {layers}", flush=True)
+    elif args.layers:
         layers = [int(l.strip()) for l in args.layers.split(",")]
 
     # Parse dtype
@@ -543,6 +570,7 @@ def main():
         evaluator_api=args.evaluator if args.evaluator != 'none' else None,
         evaluator_type=evaluator_type,
         trial_id_offset=trial_id_offset,  # For parallel execution
+        capture_mean_pooled=args.capture_mean,  # E13: mean-pooled activations
     )
 
     init_time = time.time() - start_time
@@ -560,6 +588,7 @@ def main():
             agent_modules=agent_modules,
             ultrafast=args.ultrafast,
             checkpoint_dir=str(checkpoint_dir) if checkpoint_dir else None,
+            counterpart_type=args.counterpart_type,
         )
         all_results["emergent"] = results
 

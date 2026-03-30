@@ -102,3 +102,7 @@ docs/EXPERIMENT_GUIDE.md
 *.local.md
 .deepeval
 QUICKSTART.txt
+
+# Experiment data and figures
+experiment_results/
+figures/
