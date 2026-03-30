@@ -24,6 +24,49 @@ import random
 import time
 from pathlib import Path
 
+# ── Preflight checks ──
+def _preflight():
+    missing = []
+    try:
+        import torch
+    except ImportError:
+        missing.append("torch (pip install torch --index-url https://download.pytorch.org/whl/cu128)")
+    try:
+        import numpy
+    except ImportError:
+        missing.append("numpy (pip install numpy)")
+    try:
+        import sklearn
+    except ImportError:
+        missing.append("scikit-learn (pip install scikit-learn)")
+    try:
+        import transformer_lens
+    except ImportError:
+        missing.append("transformer-lens (pip install transformer-lens)")
+    try:
+        import huggingface_hub
+    except ImportError:
+        missing.append("huggingface-hub (pip install huggingface-hub)")
+    if missing:
+        print("ERROR: Missing required packages:")
+        for m in missing:
+            print(f"  - {m}")
+        print("\nQuick install:")
+        print("  pip install torch --index-url https://download.pytorch.org/whl/cu128")
+        print("  pip install transformer-lens scikit-learn huggingface-hub numpy")
+        print("\nOr run: bash setup_lambda.sh")
+        sys.exit(1)
+    if not os.environ.get("HF_TOKEN") and not os.path.exists(os.path.expanduser("~/.cache/huggingface/token")):
+        print("WARNING: HF_TOKEN not set and no cached HuggingFace login found.")
+        print("Gemma-7B-IT is a gated model — you need to authenticate:")
+        print("  export HF_TOKEN='hf_your_token'")
+        print("  huggingface-cli login --token $HF_TOKEN")
+        print("Get a token at: https://huggingface.co/settings/tokens")
+        print("(You also need to accept the Gemma license at https://huggingface.co/google/gemma-7b-it)")
+        sys.exit(1)
+
+_preflight()
+
 import numpy as np
 import torch
 
