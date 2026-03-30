@@ -196,6 +196,12 @@ def create_steering_vector(
 
     direction, metadata = extract_deception_direction(X, labels, method=method)
 
+    # Normalize to unit vector for consistent scaling across tests
+    norm = np.linalg.norm(direction)
+    if norm > 0:
+        direction = direction / norm
+    metadata["direction_norm_before_normalization"] = float(norm)
+
     return SteeringVector(
         direction=direction,
         layer=layer,
@@ -269,7 +275,10 @@ def activation_patching_test(
             message=f"Failed to extract direction: {e}",
         )
 
-    # Convert to tensor
+    # Normalize direction to unit vector (so it's comparable to random directions)
+    direction_norm = np.linalg.norm(direction)
+    if direction_norm > 0:
+        direction = direction / direction_norm
     direction_tensor = torch.tensor(direction, dtype=torch.float32)
 
     # Compute activation statistics for scaling
