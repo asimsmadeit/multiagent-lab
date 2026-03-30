@@ -751,11 +751,12 @@ def ablation_test(
     if hasattr(X, 'numpy'):
         X = X.numpy()
 
-    # Compute ablation values
+    # Compute ablation values (match model dtype to avoid bfloat16 issues)
+    model_dtype = next(model.parameters()).dtype
     if ablation_method == "zero":
-        ablation_value = torch.zeros(X.shape[1])
+        ablation_value = torch.zeros(X.shape[1], dtype=model_dtype)
     elif ablation_method == "mean":
-        ablation_value = torch.tensor(X.mean(axis=0), dtype=torch.float32)
+        ablation_value = torch.tensor(X.mean(axis=0), dtype=model_dtype)
     elif ablation_method == "noise":
         ablation_value = None  # Will generate fresh noise each time
         noise_mean = X.mean(axis=0)
@@ -780,16 +781,16 @@ def ablation_test(
             if tokens.shape[1] > max_ctx:
                 tokens = tokens[:, -max_ctx:]
 
-            # Baseline
+            # Baseline (cast to float32 for numerical stability in softmax/log)
             with torch.no_grad():
                 baseline_logits = model(tokens)
-                baseline_probs = torch.softmax(baseline_logits[:, -1, :], dim=-1)
+                baseline_probs = torch.softmax(baseline_logits[:, -1, :].float(), dim=-1)
 
             # Ablated
             if ablation_method == "noise":
                 noise = torch.tensor(
                     np.random.randn(X.shape[1]) * noise_std + noise_mean,
-                    dtype=torch.float32
+                    dtype=model_dtype
                 )
 
                 def ablate_hook(activation, hook):
@@ -804,14 +805,18 @@ def ablation_test(
                 ablated_logits = model.run_with_hooks(
                     tokens, fwd_hooks=[(hook_name, ablate_hook)]
                 )
-                ablated_probs = torch.softmax(ablated_logits[:, -1, :], dim=-1)
+                ablated_probs = torch.softmax(ablated_logits[:, -1, :].float(), dim=-1)
 
-            # KL divergence
+            # KL divergence (clamp log to avoid -inf from zero probs in bfloat16)
             kl = torch.nn.functional.kl_div(
-                ablated_probs.log(),
-                baseline_probs,
+                ablated_probs.float().log().clamp(min=-100),
+                baseline_probs.float(),
                 reduction='batchmean'
             ).item()
+
+            # Guard against NaN
+            if np.isnan(kl) or np.isinf(kl):
+                continue
 
             kl_divergences.append(kl)
 
