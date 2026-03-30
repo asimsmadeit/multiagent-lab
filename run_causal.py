@@ -363,6 +363,24 @@ def save_results(results: dict, scenario: str):
     return out_path
 
 
+def upload_to_huggingface(file_path: str):
+    """Upload results file to HuggingFace dataset."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        filename = os.path.basename(file_path)
+        api.upload_file(
+            path_or_fileobj=file_path,
+            path_in_repo=filename,
+            repo_id=HF_REPO,
+            repo_type="dataset",
+        )
+        print(f"Uploaded {filename} to HuggingFace ({HF_REPO})")
+    except Exception as e:
+        print(f"WARNING: HuggingFace upload failed: {e}")
+        print("Results are still saved locally.")
+
+
 def print_summary(results: dict, scenario: str):
     """Print a clear human-readable summary."""
     print("\n" + "=" * 60)
@@ -452,6 +470,9 @@ def main():
 
     # ── Step 6: Save results ──
     out_path = save_results(results, args.scenario)
+
+    # ── Step 6b: Upload to HuggingFace ──
+    upload_to_huggingface(out_path)
 
     # ── Step 7: Print summary ──
     print_summary(results, args.scenario)
