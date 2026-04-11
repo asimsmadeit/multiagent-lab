@@ -18,14 +18,21 @@ import abc
 from collections.abc import Mapping, Sequence
 import dataclasses
 import enum
+import sys
 from typing import ClassVar
 
 from concordia_mini.associative_memory import basic_associative_memory
 from concordia_mini.language_model import language_model
 from concordia_mini.typing import entity_component
 
+if sys.version_info >= (3, 11):
+    _StrEnum = enum.StrEnum
+else:
+    class _StrEnum(str, enum.Enum):
+        pass
 
-class Role(enum.StrEnum):
+
+class Role(_StrEnum):
   ENTITY = 'entity'
   GAME_MASTER = 'game_master'
   INITIALIZER = 'initializer'
