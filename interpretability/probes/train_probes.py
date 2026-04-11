@@ -231,7 +231,9 @@ def train_ridge_probe(
     if normalize:
         cv_steps.append(('scaler', StandardScaler()))
     if use_pca:
-        cv_steps.append(('pca', PCA(n_components=min(n_components, X.shape[0] - 1, X.shape[1]))))
+        # Account for CV fold size: each fold trains on (cv-1)/cv of the data
+        max_pca = int(X.shape[0] * 4 / 5) - 1  # 5-fold CV → 80% training
+        cv_steps.append(('pca', PCA(n_components=min(n_components, max_pca, X.shape[1]))))
     cv_steps.append(('ridge', Ridge(alpha=alpha)))
     cv_scores = cross_val_score(Pipeline(cv_steps), X, y, cv=5, scoring='r2')
 
@@ -375,7 +377,9 @@ def train_logistic_probe(
         if scaler is not None:
             cv_steps.append(('scaler', StandardScaler()))
         if pca is not None:
-            cv_steps.append(('pca', PCA(n_components=pca.n_components_)))
+            # Account for CV fold size: each fold trains on (cv-1)/cv of the data
+            max_pca = int(X.shape[0] * 4 / 5) - 1
+            cv_steps.append(('pca', PCA(n_components=min(pca.n_components_, max_pca))))
         cv_steps.append(('lr', LogisticRegression(C=C, penalty='l2', max_iter=5000, solver='lbfgs')))
         cv_scores = cross_val_score(
             Pipeline(cv_steps), X, y_all_binary, cv=cv, scoring='roc_auc'
