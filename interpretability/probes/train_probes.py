@@ -187,7 +187,8 @@ def train_ridge_probe(
 
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state
+        X, y, test_size=0.2, random_state=random_state,
+        stratify=(y > 0.5).astype(int)
     )
 
     # Normalize: fit on train only to prevent data leakage
@@ -224,8 +225,15 @@ def train_ridge_probe(
     train_r2 = r2_score(y_train, train_pred)
     test_r2 = r2_score(y_test, test_pred)
 
-    # Cross-validation
-    cv_scores = cross_val_score(Ridge(alpha=alpha), X_pca, y, cv=5, scoring='r2')
+    # Cross-validation (Pipeline ensures scaler/PCA are re-fit per fold, no leakage)
+    from sklearn.pipeline import Pipeline
+    cv_steps = []
+    if normalize:
+        cv_steps.append(('scaler', StandardScaler()))
+    if use_pca:
+        cv_steps.append(('pca', PCA(n_components=min(n_components, X.shape[0] - 1, X.shape[1]))))
+    cv_steps.append(('ridge', Ridge(alpha=alpha)))
+    cv_scores = cross_val_score(Pipeline(cv_steps), X, y, cv=5, scoring='r2')
 
     # Binary metrics
     binary_pred = (test_pred > 0.5).astype(int)
@@ -358,19 +366,19 @@ def train_logistic_probe(
     except ValueError:
         train_auc = 0.5
 
-    # Cross-validation for stability estimate
-    # Transform full X using train-fitted scaler and PCA
-    X_cv = X.copy()
-    if scaler is not None:
-        X_cv = scaler.transform(X_cv)
-    if pca is not None:
-        X_cv = pca.transform(X_cv)
+    # Cross-validation (Pipeline ensures scaler/PCA are re-fit per fold, no leakage)
+    from sklearn.pipeline import Pipeline
     y_all_binary = (np.array(y) > 0.5).astype(int)
     try:
         cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+        cv_steps = []
+        if scaler is not None:
+            cv_steps.append(('scaler', StandardScaler()))
+        if pca is not None:
+            cv_steps.append(('pca', PCA(n_components=pca.n_components_)))
+        cv_steps.append(('lr', LogisticRegression(C=C, penalty='l2', max_iter=5000, solver='lbfgs')))
         cv_scores = cross_val_score(
-            LogisticRegression(C=C, penalty='l2', max_iter=5000, solver='lbfgs'),
-            X_cv, y_all_binary, cv=cv, scoring='roc_auc'
+            Pipeline(cv_steps), X, y_all_binary, cv=cv, scoring='roc_auc'
         )
     except ValueError:
         cv_scores = np.array([0.5])
@@ -493,14 +501,23 @@ def train_mass_mean_probe(
             auc=0.5, train_r2=0.0, test_r2=0.0, cross_val_scores=[]
         )
 
-    # Center activations by subtracting mean (Marks & Tegmark method)
-    if normalize:
-        X_mean = X.mean(axis=0)
-        X = X - X_mean
+    # Split FIRST to prevent data leakage in direction computation
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=random_state,
+        stratify=binary_y
+    )
+    binary_y_train = (y_train > 0.5).astype(bool)
 
-    # Compute means
-    honest_mean = X[~binary_y].mean(axis=0)
-    deceptive_mean = X[binary_y].mean(axis=0)
+    # Center activations by subtracting mean (Marks & Tegmark method)
+    # Fit on train only
+    if normalize:
+        X_mean = X_train.mean(axis=0)
+        X_train = X_train - X_mean
+        X_test = X_test - X_mean
+
+    # Compute means on TRAIN set only (prevents test leakage)
+    honest_mean = X_train[~binary_y_train].mean(axis=0)
+    deceptive_mean = X_train[binary_y_train].mean(axis=0)
 
     # Direction vector
     direction = deceptive_mean - honest_mean
@@ -510,19 +527,12 @@ def train_mass_mean_probe(
     else:
         direction = direction / norm
 
-    # Project all points onto direction
-    projections = X @ direction
-
-    # Evaluate
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state
-    )
-
-    test_proj = X_test @ direction
+    # Project onto direction
     train_proj = X_train @ direction
+    test_proj = X_test @ direction
 
-    # Normalize projections
-    proj_min, proj_max = projections.min(), projections.max()
+    # Normalize projections using train statistics only
+    proj_min, proj_max = train_proj.min(), train_proj.max()
     if proj_max - proj_min < 1e-8:
         test_pred = np.full_like(test_proj, 0.5)
         train_pred = np.full_like(train_proj, 0.5)

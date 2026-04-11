@@ -2,13 +2,16 @@
 """
 Run causal validation suite for deception probes on Lambda Labs GH200.
 
-Loads Gemma-7B-IT in TransformerLens, loads pre-collected activation data,
+Loads a TransformerLens-compatible model, loads pre-collected activation data,
 generates test prompts from scenario templates, and runs the full causal
 validation suite (activation patching, ablation, steering vectors, probe
 faithfulness, selectivity).
 
+Supports: Gemma-7B-IT, Llama-3.1-8B-Instruct, Mistral-7B-Instruct-v0.1
+
 Usage:
     python run_causal.py --scenario ultimatum_bluff
+    python run_causal.py --scenario ultimatum_bluff --model meta-llama/Llama-3.1-8B-Instruct --layer 16
     python run_causal.py --scenario alliance_betrayal --n-prompts 100 --layer 14
     python run_causal.py --scenario info_withholding --device cuda
 """
@@ -25,7 +28,8 @@ import time
 from pathlib import Path
 
 # ── Preflight checks ──
-def _preflight():
+def _check_packages():
+    """Check required packages are installed (run at import time)."""
     missing = []
     try:
         import torch
@@ -56,16 +60,20 @@ def _preflight():
         print("  pip install transformer-lens scikit-learn huggingface-hub numpy")
         print("\nOr run: bash setup_lambda.sh")
         sys.exit(1)
+
+def _check_hf_token(model_name: str):
+    """Check HF_TOKEN for gated models (Gemma, Llama). Mistral is open."""
+    if "mistral" in model_name.lower():
+        return  # Mistral is open-download
     if not os.environ.get("HF_TOKEN") and not os.path.exists(os.path.expanduser("~/.cache/huggingface/token")):
         print("WARNING: HF_TOKEN not set and no cached HuggingFace login found.")
-        print("Gemma-7B-IT is a gated model — you need to authenticate:")
+        print("Gated models (Gemma, Llama) require authentication:")
         print("  export HF_TOKEN='hf_your_token'")
         print("  huggingface-cli login --token $HF_TOKEN")
         print("Get a token at: https://huggingface.co/settings/tokens")
-        print("(You also need to accept the Gemma license at https://huggingface.co/google/gemma-7b-it)")
         sys.exit(1)
 
-_preflight()
+_check_packages()
 
 import numpy as np
 import torch
@@ -102,7 +110,18 @@ IncentiveCondition = _prompts_mod.IncentiveCondition
 get_emergent_prompt = _prompts_mod.get_emergent_prompt
 
 
-# ── Mapping from CLI scenario names to local .pt file paths ──
+# ── Model short names for file paths (centralized in config) ──
+from config.experiment import MODEL_SHORT_NAMES, get_model_short_name
+
+# ── Default best probe layer per model (can be overridden with --layer) ──
+MODEL_DEFAULT_LAYERS = {
+    "google/gemma-7b-it": 14,
+    "meta-llama/Llama-3.1-8B-Instruct": 16,
+    "mistralai/Mistral-7B-Instruct-v0.1": 16,
+    "google/gemma-2b-it": 9,
+}
+
+# ── Mapping from CLI scenario names to local .pt file paths (Gemma originals) ──
 ACTIVATION_FILES = {
     "ultimatum_bluff": "ultimatum_bluff/activations_merged_merged_ub.pt",
     "alliance_betrayal": "alliance_betrayal/activations_merged_20260210_220117.pt",
@@ -118,24 +137,63 @@ HF_FILES = {
 }
 
 
-def ensure_activation_file(data_dir: str, scenario: str) -> str:
-    """Return path to activation file, downloading from HuggingFace if needed."""
-    local_path = os.path.join(data_dir, ACTIVATION_FILES[scenario])
-    if os.path.exists(local_path):
-        return local_path
+def ensure_activation_file(data_dir: str, scenario: str, model_name: str = "google/gemma-7b-it") -> str:
+    """Return path to activation file, downloading from HuggingFace if needed.
 
-    # Try HuggingFace
-    print(f"Local file not found: {local_path}")
-    print(f"Downloading from HuggingFace ({HF_REPO})...")
-    from huggingface_hub import hf_hub_download
+    Tries model-specific file first (e.g., activations_llama31_8b_ultimatum_bluff.pt),
+    then falls back to Gemma originals, then HuggingFace.
+    """
+    short = MODEL_SHORT_NAMES.get(model_name, "")
 
-    hf_path = hf_hub_download(
-        repo_id=HF_REPO,
-        filename=HF_FILES[scenario],
-        repo_type="dataset",
+    # 1. Try model-specific file: {scenario}/activations_{model_short}_{scenario}.pt
+    if short:
+        model_specific = os.path.join(data_dir, scenario, f"activations_{short}_{scenario}.pt")
+        if os.path.exists(model_specific):
+            return model_specific
+        # Also try flat layout: {data_dir}/activations_{model_short}_{scenario}.pt
+        model_specific_flat = os.path.join(data_dir, f"activations_{short}_{scenario}.pt")
+        if os.path.exists(model_specific_flat):
+            return model_specific_flat
+        # Try glob for timestamped files: activations_{model}_{scenario}_*_.pt
+        import glob
+        pattern = os.path.join(data_dir, scenario, f"activations_{short}_{scenario}_*.pt")
+        matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        if matches:
+            return matches[0]  # Most recent
+
+    # 2. For Gemma, try original hardcoded paths
+    if model_name == "google/gemma-7b-it" and scenario in ACTIVATION_FILES:
+        local_path = os.path.join(data_dir, ACTIVATION_FILES[scenario])
+        if os.path.exists(local_path):
+            return local_path
+
+    # 3. Try generic merged file in scenario subdir
+    generic_merged = os.path.join(data_dir, scenario, f"activations_merged_{scenario}.pt")
+    if os.path.exists(generic_merged):
+        return generic_merged
+
+    # 4. HuggingFace fallback (only for Gemma originals)
+    if model_name == "google/gemma-7b-it" and scenario in HF_FILES:
+        print(f"Local file not found for {model_name}/{scenario}")
+        print(f"Downloading from HuggingFace ({HF_REPO})...")
+        from huggingface_hub import hf_hub_download
+
+        hf_path = hf_hub_download(
+            repo_id=HF_REPO,
+            filename=HF_FILES[scenario],
+            repo_type="dataset",
+        )
+        print(f"Downloaded to cache: {hf_path}")
+        return hf_path
+
+    # 5. Nothing found
+    tried = [f"activations_{short}_{scenario}.pt" if short else "(no model-specific name)"]
+    if model_name == "google/gemma-7b-it":
+        tried.append(ACTIVATION_FILES.get(scenario, ""))
+    raise FileNotFoundError(
+        f"No activation file found for model={model_name}, scenario={scenario} "
+        f"in {data_dir}. Tried: {tried}"
     )
-    print(f"Downloaded to cache: {hf_path}")
-    return hf_path
 
 
 def parse_args():
@@ -143,10 +201,19 @@ def parse_args():
         description="Run causal validation for deception probes"
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default="google/gemma-7b-it",
+        help="HuggingFace model name (default: google/gemma-7b-it). "
+             "Supported: google/gemma-7b-it, meta-llama/Llama-3.1-8B-Instruct, "
+             "mistralai/Mistral-7B-Instruct-v0.1",
+    )
+    parser.add_argument(
         "--scenario",
         type=str,
         default="ultimatum_bluff",
-        choices=list(ACTIVATION_FILES.keys()),
+        choices=["ultimatum_bluff", "alliance_betrayal", "info_withholding",
+                 "capability_bluff", "hidden_value", "promise_break"],
         help="Which scenario to validate (default: ultimatum_bluff)",
     )
     parser.add_argument(
@@ -164,8 +231,8 @@ def parse_args():
     parser.add_argument(
         "--layer",
         type=int,
-        default=14,
-        help="Best probe layer to validate (default: 14)",
+        default=None,
+        help="Best probe layer to validate (default: auto from model, e.g. 14 for Gemma, 16 for Llama/Mistral)",
     )
     parser.add_argument(
         "--device",
@@ -176,10 +243,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_model(device: str):
-    """Load Gemma-7B-IT into TransformerLens."""
+def load_model(model_name: str, device: str):
+    """Load a TransformerLens-compatible model."""
     print("\n" + "=" * 60)
-    print("LOADING MODEL: google/gemma-7b-it")
+    print(f"LOADING MODEL: {model_name}")
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Dtype: bfloat16")
@@ -188,7 +255,7 @@ def load_model(device: str):
     from transformer_lens import HookedTransformer
 
     model = HookedTransformer.from_pretrained(
-        "google/gemma-7b-it",
+        model_name,
         device=device,
         dtype=torch.bfloat16,
     )
@@ -200,7 +267,7 @@ def load_model(device: str):
     return model
 
 
-def load_activations(data_dir: str, scenario: str, layer: int):
+def load_activations(data_dir: str, scenario: str, layer: int, model_name: str = "google/gemma-7b-it"):
     """
     Load activation .pt file and extract activations, labels, and metadata.
 
@@ -209,7 +276,7 @@ def load_activations(data_dir: str, scenario: str, layer: int):
         labels: np.ndarray of GM deception scores
         metadata: list of dicts
     """
-    pt_path = ensure_activation_file(data_dir, scenario)
+    pt_path = ensure_activation_file(data_dir, scenario, model_name)
     print(f"\nLoading activations from: {pt_path}")
 
     data = torch.load(pt_path, map_location="cpu", weights_only=False)
@@ -354,9 +421,14 @@ def generate_test_prompts(scenario: str, n_prompts: int) -> list:
     return prompts
 
 
-def save_results(results: dict, scenario: str):
+def save_results(results: dict, scenario: str, model_name: str = "google/gemma-7b-it"):
     """Save causal validation results to JSON."""
-    out_path = f"causal_validation_results_{scenario}.json"
+    short = MODEL_SHORT_NAMES.get(model_name, "unknown")
+    if model_name == "google/gemma-7b-it":
+        # Keep backwards-compatible filename for Gemma
+        out_path = f"causal_validation_results_{scenario}.json"
+    else:
+        out_path = f"causal_validation_results_{short}_{scenario}.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2, default=str)
     print(f"\nResults saved to: {out_path}")
@@ -415,9 +487,17 @@ def print_summary(results: dict, scenario: str):
 def main():
     args = parse_args()
 
+    # Resolve layer default from model if not specified
+    if args.layer is None:
+        args.layer = MODEL_DEFAULT_LAYERS.get(args.model, 14)
+
+    # Check HF_TOKEN for gated models
+    _check_hf_token(args.model)
+
     print("=" * 60)
     print("CAUSAL VALIDATION RUNNER")
     print("=" * 60)
+    print(f"  Model:     {args.model}")
     print(f"  Scenario:  {args.scenario}")
     print(f"  Data dir:  {args.data_dir}")
     print(f"  Layer:     {args.layer}")
@@ -425,11 +505,11 @@ def main():
     print(f"  Device:    {args.device}")
 
     # ── Step 1: Load the TransformerLens model ──
-    model = load_model(args.device)
+    model = load_model(args.model, args.device)
 
     # ── Step 2: Load activation data from .pt file ──
     activations, labels, metadata = load_activations(
-        args.data_dir, args.scenario, args.layer
+        args.data_dir, args.scenario, args.layer, args.model
     )
 
     # ── Step 3: Filter to emergent-mode samples only ──
@@ -464,12 +544,13 @@ def main():
     )
     elapsed = time.time() - t0
     results["wall_time_seconds"] = elapsed
+    results["model"] = args.model
     results["scenario"] = args.scenario
     results["layer"] = args.layer
     results["n_prompts"] = args.n_prompts
 
     # ── Step 6: Save results ──
-    out_path = save_results(results, args.scenario)
+    out_path = save_results(results, args.scenario, args.model)
 
     # ── Step 6b: Upload to HuggingFace ──
     upload_to_huggingface(out_path)

@@ -3248,6 +3248,30 @@ Example: yes, yes'''
 
             torch.save(dataset, filepath)
 
+            # Also save transcripts as .jsonl for easy human inspection (no torch needed)
+            try:
+                import json
+                jsonl_path = filepath.replace('.pt', '_transcripts.jsonl')
+                with open(jsonl_path, 'w') as jf:
+                    for m in metadata:
+                        record = {
+                            'trial_id': m.get('trial_id'),
+                            'round_num': m.get('round_num'),
+                            'agent_name': m.get('agent_name'),
+                            'scenario': m.get('scenario'),
+                            'actual_deception': m.get('actual_deception'),
+                            'prompt': m.get('full_prompt', '')[:2000],  # Truncate for readability
+                            'response': m.get('full_response', ''),
+                            'tom_state': m.get('tom_state'),
+                            'dialogue_history': m.get('dialogue_history'),
+                            'experiment_mode': m.get('experiment_mode'),
+                            'modules_enabled': m.get('modules_enabled'),
+                        }
+                        jf.write(json.dumps(record, default=str) + '\n')
+                logger.info("Saved transcripts to %s", jsonl_path)
+            except Exception as e:
+                logger.warning("Could not save transcripts: %s", e)
+
             # Log summary
             n_samples = len(all_gm_deception)
             layers = sorted(stacked_activations.keys())

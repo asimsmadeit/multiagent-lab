@@ -309,6 +309,12 @@ def main():
         help="Trials per scenario per condition (default: 40)"
     )
     parser.add_argument(
+        "--conditions", type=str, default=None,
+        help="Comma-separated incentive conditions to run (default: high_incentive,low_incentive). "
+             "Options: high_incentive, low_incentive, penalty, minimal. "
+             "Use 'all' to run all 4 conditions."
+    )
+    parser.add_argument(
         "--max-rounds", type=int, default=5,
         help="Max negotiation rounds per trial (default: 5 for temporal analysis)"
     )
@@ -326,6 +332,12 @@ def main():
              "Overrides --layers. Increases storage ~5-7x but reveals where deception emerges."
     )
     parser.add_argument(
+        "--dense-9", action="store_true",
+        help="Use hand-tuned 9-layer config (denser around middle where deception peaks). "
+             "Gemma: [0,4,8,11,14,17,20,24,27], Llama/Mistral: [0,4,8,12,16,20,24,28,31]. "
+             "Overrides --layers and --dense-layers."
+    )
+    parser.add_argument(
         "--capture-mean", action="store_true",
         help="E13: Also capture mean-pooled activations (averaged over all token positions). "
              "Doubles storage but enables comparison of last-token vs context-level representations."
@@ -333,6 +345,10 @@ def main():
     parser.add_argument(
         "--fast", action="store_true",
         help="Fast mode: disable ToM module for ~3x speedup (less rich agent labels)"
+    )
+    parser.add_argument(
+        "--no-tom", action="store_true", dest="no_tom",
+        help="Disable Theory of Mind module (same as --fast but explicit for control experiments)"
     )
     parser.add_argument(
         "--ultrafast", action="store_true",
@@ -509,7 +525,12 @@ def main():
 
     # Parse layers
     layers = None
-    if args.dense_layers is not None:
+    if args.dense_9:
+        # Hand-tuned 9-layer config (denser around middle)
+        from config.experiment import get_dense_9_layers
+        layers = get_dense_9_layers(args.model)
+        print(f"Dense 9-layer config: {layers}", flush=True)
+    elif args.dense_layers is not None:
         # E12: Dense layer capture — every N-th layer
         from config.experiment import get_dense_layers
         layers = get_dense_layers(args.model, stride=args.dense_layers)
@@ -551,8 +572,35 @@ def main():
     print(f"Evaluator type: {evaluator_type}", flush=True)
     print(f"Output directory: {output_dir}", flush=True)
 
-    # Determine agent modules based on --fast flag
-    agent_modules = [] if args.fast else ['theory_of_mind']
+    # Determine agent modules based on --fast / --no-tom flag
+    agent_modules = [] if (args.fast or args.no_tom) else ['theory_of_mind']
+
+    # Parse incentive conditions
+    conditions = None  # None = default (HIGH + LOW)
+    if args.conditions:
+        if args.conditions.lower() == "all":
+            conditions = [
+                IncentiveCondition.HIGH_INCENTIVE,
+                IncentiveCondition.LOW_INCENTIVE,
+                IncentiveCondition.PENALTY,
+                IncentiveCondition.MINIMAL,
+            ]
+        else:
+            condition_map = {
+                "high_incentive": IncentiveCondition.HIGH_INCENTIVE,
+                "low_incentive": IncentiveCondition.LOW_INCENTIVE,
+                "penalty": IncentiveCondition.PENALTY,
+                "minimal": IncentiveCondition.MINIMAL,
+            }
+            conditions = []
+            for c in args.conditions.split(","):
+                c = c.strip().lower()
+                if c not in condition_map:
+                    print(f"WARNING: Unknown condition '{c}', skipping. "
+                          f"Valid: {list(condition_map.keys())}")
+                    continue
+                conditions.append(condition_map[c])
+        print(f"Incentive conditions: {[c.value for c in conditions]}", flush=True)
 
     # Initialize runner
     print(f"\nInitializing InterpretabilityRunner...", flush=True)
@@ -584,6 +632,7 @@ def main():
             runner=runner,
             scenarios=emergent_scenarios,
             trials_per_scenario=args.trials,
+            conditions=conditions,
             max_rounds=args.max_rounds,
             agent_modules=agent_modules,
             ultrafast=args.ultrafast,
@@ -600,11 +649,13 @@ def main():
         )
         all_results["instructed"] = results
 
-    # Save activations with unique filename including scenario, mode, timestamp, and pod ID
+    # Save activations with unique filename including model, scenario, mode, timestamp, and pod ID
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    from config.experiment import get_model_short_name
+    model_short = get_model_short_name(args.model)
 
-    # Build filename: activations_{scenario}_{mode}_{timestamp}_{pod}.pt
-    filename_parts = ["activations"]
+    # Build filename: activations_{model}_{scenario}_{mode}_{timestamp}_{pod}.pt
+    filename_parts = ["activations", model_short]
     if args.scenario_name:
         filename_parts.append(args.scenario_name)
     filename_parts.append(args.mode)
@@ -682,12 +733,15 @@ def main():
                 tl_model = None
 
             if tl_model is not None:
+                # Pass metadata for matched cross-sample patching
+                sample_metadata = data.get("metadata", None)
                 causal_results = run_full_causal_validation(
                     model=tl_model,
                     activations=activations,
                     labels=gm_labels,
                     best_layer=best_layer,
                     test_prompts=test_prompts[:args.causal_samples],
+                    metadata=sample_metadata,
                     verbose=True,
                 )
                 causal_validated = causal_results.get("overall_passed", False)

@@ -1,10 +1,12 @@
-#!/opt/homebrew/bin/python3.11
+#!/usr/bin/env python3
 """
 Confound Control Analyses for Deception Probes
 ===============================================
 Runs two analyses on existing activation data to check whether probes
 detect actual deception vs. correlated task features (round number,
 incentive condition).
+
+Supports multiple models: Gemma-7B-IT, Llama-3.1-8B, Mistral-7B.
 
 Analysis 1: Matched-State Evaluation
   - Balance honest/deceptive counts within each (round, incentive) group
@@ -13,6 +15,10 @@ Analysis 1: Matched-State Evaluation
 Analysis 2: Residualized Probing
   - Regress out confound features (round_num, incentive) from activations
   - Train probe on residuals -> compare AUC to original
+
+Usage:
+    python run_confound_controls.py
+    python run_confound_controls.py --model meta-llama/Llama-3.1-8B-Instruct --layer 16
 """
 
 import argparse
@@ -33,22 +39,34 @@ from sklearn.preprocessing import StandardScaler
 
 # ---------- Configuration ----------
 
-SCENARIOS = {
-    "UB": {
-        "file": "ultimatum_bluff/activations_merged_merged_ub.pt",
-        "original_auc": 0.823,
-    },
-    "AB": {
-        "file": "alliance_betrayal/activations_merged_20260210_220117.pt",
-        "original_auc": 0.818,
-    },
-    "IW": {
-        "file": "info_withholding/activations_merged_merged_iw.pt",
-        "original_auc": 0.831,
-    },
+# Model short names for file path resolution (centralized in config)
+from config.experiment import MODEL_SHORT_NAMES, get_model_short_name
+
+# Default best probe layers per model
+MODEL_DEFAULT_LAYERS = {
+    "google/gemma-7b-it": 14,
+    "meta-llama/Llama-3.1-8B-Instruct": 16,
+    "mistralai/Mistral-7B-Instruct-v0.1": 16,
+    "google/gemma-2b-it": 9,
 }
 
-LAYER = 14
+# Gemma-7B original file paths (backwards compatible)
+GEMMA_FILES = {
+    "UB": "ultimatum_bluff/activations_merged_merged_ub.pt",
+    "AB": "alliance_betrayal/activations_merged_20260210_220117.pt",
+    "IW": "info_withholding/activations_merged_merged_iw.pt",
+}
+
+# Scenario short names to full names
+SCENARIO_FULL_NAMES = {
+    "UB": "ultimatum_bluff",
+    "AB": "alliance_betrayal",
+    "IW": "info_withholding",
+    "CB": "capability_bluff",
+    "HV": "hidden_value",
+    "PB": "promise_break",
+}
+
 SEEDS = [42, 123, 456, 789, 1024]
 PCA_COMPONENTS = 50
 TEST_SIZE = 0.2
@@ -62,29 +80,69 @@ HF_FILES = {
 }
 
 
-def ensure_file(data_dir, scenario_name, local_file):
+def ensure_file(data_dir, scenario_short, model_name="google/gemma-7b-it"):
     """Return path to .pt file, downloading from HuggingFace if needed."""
-    local_path = os.path.join(data_dir, local_file)
-    if os.path.exists(local_path):
-        return local_path
-    if scenario_name in HF_FILES:
-        print(f"  Local file not found: {local_path}")
-        print(f"  Downloading from HuggingFace ({HF_REPO})...")
+    short = MODEL_SHORT_NAMES.get(model_name, "")
+    full_name = SCENARIO_FULL_NAMES.get(scenario_short, scenario_short)
+
+    # 1. Model-specific file: {scenario_full}/activations_{model_short}_{scenario_full}.pt
+    if short:
+        model_specific = os.path.join(data_dir, full_name, f"activations_{short}_{full_name}.pt")
+        if os.path.exists(model_specific):
+            return model_specific
+        # Flat layout
+        model_specific_flat = os.path.join(data_dir, f"activations_{short}_{full_name}.pt")
+        if os.path.exists(model_specific_flat):
+            return model_specific_flat
+        # Glob for timestamped files: activations_{model}_{scenario}_*_.pt
+        import glob
+        pattern = os.path.join(data_dir, full_name, f"activations_{short}_{full_name}_*.pt")
+        matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        if matches:
+            return matches[0]  # Most recent
+
+    # 2. Gemma original paths (backwards compatible)
+    if model_name == "google/gemma-7b-it" and scenario_short in GEMMA_FILES:
+        local_path = os.path.join(data_dir, GEMMA_FILES[scenario_short])
+        if os.path.exists(local_path):
+            return local_path
+
+    # 3. Generic merged
+    generic = os.path.join(data_dir, full_name, f"activations_merged_{full_name}.pt")
+    if os.path.exists(generic):
+        return generic
+
+    # 4. HuggingFace fallback (Gemma only)
+    if model_name == "google/gemma-7b-it" and scenario_short in HF_FILES:
+        print(f"  Local file not found, downloading from HuggingFace ({HF_REPO})...")
         from huggingface_hub import hf_hub_download
         return hf_hub_download(
             repo_id=HF_REPO,
-            filename=HF_FILES[scenario_name],
+            filename=HF_FILES[scenario_short],
             repo_type="dataset",
         )
-    return local_path  # will fail later with file not found
+
+    raise FileNotFoundError(
+        f"No activation file found for model={model_name}, scenario={scenario_short} in {data_dir}"
+    )
 
 
 # ---------- Helpers ----------
 
-def load_data(path):
-    """Load .pt file and return activations (layer 14), labels, metadata."""
+def load_data(path, layer):
+    """Load .pt file and return activations at given layer, labels, metadata."""
     data = torch.load(path, map_location="cpu", weights_only=False)
-    X = data["activations"][LAYER]
+
+    # Find the layer key (may be int or str depending on how it was saved)
+    acts = data["activations"]
+    if layer in acts:
+        X = acts[layer]
+    elif str(layer) in acts:
+        X = acts[str(layer)]
+    else:
+        available = sorted(int(k) if str(k).isdigit() else k for k in acts.keys())
+        raise ValueError(f"Layer {layer} not found in activations. Available: {available}")
+
     if isinstance(X, torch.Tensor):
         X = X.float().numpy()
     gm_labels = np.array(data["labels"]["gm_labels"], dtype=float)
@@ -228,26 +286,65 @@ def main():
     parser = argparse.ArgumentParser(description="Confound control analyses for deception probes")
     parser.add_argument("--data-dir", default="experiment_results",
                         help="Directory containing scenario subdirectories (default: experiment_results)")
+    parser.add_argument("--model", default="google/gemma-7b-it",
+                        help="HuggingFace model name (default: google/gemma-7b-it). "
+                             "Affects activation file lookup and output naming.")
+    parser.add_argument("--layer", type=int, default=None,
+                        help="Layer to analyze (default: auto from model, e.g. 14 for Gemma, 16 for Llama/Mistral)")
+    parser.add_argument("--original-auc", type=str, default=None,
+                        help="Comma-separated original AUC values keyed by scenario short name "
+                             "(e.g. 'UB=0.823,AB=0.818,IW=0.831'). If not provided, uses Gemma-7B defaults.")
+    parser.add_argument("--scenarios", type=str, default=None,
+                        help="Comma-separated scenario short names to run (e.g. 'UB,AB,IW,CB'). "
+                             "Default: all scenarios with available data files.")
     args = parser.parse_args()
 
+    # Resolve layer
+    layer = args.layer if args.layer is not None else MODEL_DEFAULT_LAYERS.get(args.model, 14)
+
+    # Resolve original AUCs (needed for drop calculation)
+    original_aucs = {"UB": 0.823, "AB": 0.818, "IW": 0.831}  # Gemma-7B defaults
+    if args.original_auc:
+        for pair in args.original_auc.split(","):
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                original_aucs[k.strip()] = float(v.strip())
+            else:
+                # Backwards compat: positional UB,AB,IW
+                pass
+
+    # Determine which scenarios to run
+    if args.scenarios:
+        scenario_list = [s.strip() for s in args.scenarios.split(",")]
+    else:
+        # Default: try all known scenarios, skip those without data
+        scenario_list = list(SCENARIO_FULL_NAMES.keys())
+
     results = {}
+    model_short = MODEL_SHORT_NAMES.get(args.model, "unknown")
 
     print("=" * 70)
     print("CONFOUND CONTROL ANALYSES")
     print("=" * 70)
+    print(f"  Model: {args.model} ({model_short})")
+    print(f"  Layer: {layer}")
+    print(f"  Scenarios: {scenario_list}")
 
-    for scenario_name, cfg in SCENARIOS.items():
-        pt_path = ensure_file(args.data_dir, scenario_name, cfg["file"])
-        if not os.path.exists(pt_path):
-            print(f"\n[SKIP] {scenario_name}: file not found at {pt_path}")
+    for scenario_name in scenario_list:
+        try:
+            pt_path = ensure_file(args.data_dir, scenario_name, args.model)
+        except FileNotFoundError as e:
+            print(f"\n[SKIP] {scenario_name}: {e}")
             continue
 
+        orig_auc = original_aucs.get(scenario_name, 0.0)
+
         print(f"\n{'─' * 70}")
-        print(f"Scenario: {scenario_name}  |  Original AUC: {cfg['original_auc']:.3f}")
+        print(f"Scenario: {scenario_name}  |  Original AUC: {orig_auc:.3f}")
         print(f"{'─' * 70}")
 
         # Load and filter to emergent
-        X_all, gm_all, rounds_all, modes_all, meta_all = load_data(pt_path)
+        X_all, gm_all, rounds_all, modes_all, meta_all = load_data(pt_path, layer)
         X, gm, rounds, meta = filter_emergent(X_all, gm_all, rounds_all, modes_all, meta_all)
 
         y = binary_labels(gm)
@@ -259,7 +356,7 @@ def main():
             print(f"  [SKIP] Not enough samples of both classes")
             continue
 
-        scenario_results = {"original_auc": cfg["original_auc"]}
+        scenario_results = {"original_auc": orig_auc}
 
         # --- Analysis 1: Matched-State ---
         print(f"\n  Analysis 1: Matched-State Evaluation")
@@ -272,7 +369,7 @@ def main():
         if aucs_matched:
             mean_auc = np.mean(aucs_matched)
             std_auc = np.std(aucs_matched)
-            drop = cfg["original_auc"] - mean_auc
+            drop = orig_auc - mean_auc
             print(f"    Matched AUC: {mean_auc:.3f} ± {std_auc:.3f}  (n_seeds={len(aucs_matched)})")
             print(f"    Drop from original: {drop:+.3f}")
             if drop < 0.05:
@@ -301,7 +398,7 @@ def main():
         if aucs_resid:
             mean_auc = np.mean(aucs_resid)
             std_auc = np.std(aucs_resid)
-            drop = cfg["original_auc"] - mean_auc
+            drop = orig_auc - mean_auc
             print(f"    Residualized AUC: {mean_auc:.3f} ± {std_auc:.3f}  (n_seeds={len(aucs_resid)})")
             print(f"    Drop from original: {drop:+.3f}")
             if drop < 0.05:
@@ -336,7 +433,10 @@ def main():
         print(f"{sc:<8} {orig:>10} {ms_str:>14} {rs_str:>14}")
 
     # Save results
-    out_path = os.path.join(args.data_dir, "confound_control_results.json")
+    if args.model == "google/gemma-7b-it":
+        out_path = os.path.join(args.data_dir, "confound_control_results.json")
+    else:
+        out_path = os.path.join(args.data_dir, f"confound_control_results_{model_short}.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {out_path}")

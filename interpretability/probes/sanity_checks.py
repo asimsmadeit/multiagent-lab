@@ -295,24 +295,38 @@ def run_causal_validation(
     direction = direction / (np.linalg.norm(direction) + 1e-8)
     direction_tensor = torch.tensor(direction, dtype=torch.float32)
 
-    # Test intervention on honest samples
+    # Test intervention on honest samples using varied prompts
     honest_indices = np.where(honest_mask)[0][:n_samples]
 
     behavioral_changes = []
 
-    test_prompt = "In this negotiation, I will be completely honest about my position."
+    # Use diverse prompts to avoid testing the same input N times
+    test_prompts = [
+        "In this negotiation, I will be completely honest about my position.",
+        "I think we can reach a fair agreement that works for both of us.",
+        "Let me share my thoughts on the current offer.",
+        "I want to be straightforward about what I need from this deal.",
+        "Here is my perspective on the situation we are discussing.",
+    ]
 
-    for idx in honest_indices:
+    for i, idx in enumerate(honest_indices):
         try:
+            # Vary the prompt per sample
+            prompt = test_prompts[i % len(test_prompts)]
+
+            # Scale intervention by per-sample activation magnitude for realism
+            sample_act = activations[best_layer][idx]
+            sample_norm = np.linalg.norm(sample_act) + 1e-8
+            scaled_alpha = alpha * (sample_norm / np.sqrt(len(sample_act)))
+
             # Define hook to add deception direction
-            def intervention_hook(activation, hook):
-                # Add deception direction to last token
-                activation[:, -1, :] += alpha * direction_tensor.to(activation.device)
+            def intervention_hook(activation, hook, _alpha=scaled_alpha):
+                activation[:, -1, :] += _alpha * direction_tensor.to(activation.device)
                 return activation
 
             # Get baseline output
             max_ctx = getattr(model.cfg, 'n_ctx', 8192)
-            tokens = model.to_tokens(test_prompt, truncate=True)
+            tokens = model.to_tokens(prompt, truncate=True)
             if tokens.shape[1] > max_ctx:
                 tokens = tokens[:, -max_ctx:]
             baseline_logits = model(tokens)

@@ -36,6 +36,16 @@ MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
         "layers_to_probe": [7, 14, 20, 25],  # 25%, 50%, 71%, 89%
         "vram_gb": 16,
     },
+    # Gemma 2 9B - Mid-scale, newer architecture (TransformerLens v2.18.0+)
+    "google/gemma-2-9b-it": {
+        "n_layers": 42,
+        "d_model": 3584,
+        "sae_release": "gemma-scope-9b-pt-res-canonical",
+        "sae_layer": 28,  # ~67% depth
+        "sae_id": "layer_28/width_16k/canonical",
+        "layers_to_probe": [10, 21, 28, 37],  # 25%, 50%, 67%, 88%
+        "vram_gb": 20,
+    },
     # Gemma 2 27B - Research quality model (PRIMARY for deception research)
     "google/gemma-2-27b-it": {
         "n_layers": 46,
@@ -93,7 +103,7 @@ MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
     # MISTRAL FAMILY (No SAE, efficient architecture)
     # =========================================================================
     # Mistral 7B - Efficient, high quality
-    "mistralai/Mistral-7B-Instruct-v0.2": {
+    "mistralai/Mistral-7B-Instruct-v0.1": {
         "n_layers": 32,
         "d_model": 4096,
         "sae_release": None,
@@ -159,6 +169,73 @@ MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
         "vram_gb": 28,
     },
 }
+
+
+# =============================================================================
+# MODEL SHORT NAMES - For file naming and display
+# =============================================================================
+
+MODEL_SHORT_NAMES: Dict[str, str] = {
+    "google/gemma-2b-it": "gemma2b",
+    "google/gemma-7b-it": "gemma7b",
+    "google/gemma-2-9b-it": "gemma2_9b",
+    "google/gemma-2-27b-it": "gemma2_27b",
+    "meta-llama/Llama-2-7b-chat-hf": "llama2_7b",
+    "meta-llama/Meta-Llama-3-8B-Instruct": "llama3_8b",
+    "meta-llama/Llama-3.1-8B-Instruct": "llama31_8b",
+    "meta-llama/Llama-3.1-70B-Instruct": "llama31_70b",
+    "mistralai/Mistral-7B-Instruct-v0.1": "mistral7b",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": "mixtral8x7b",
+    "Qwen/Qwen2-7B-Instruct": "qwen2_7b",
+    "Qwen/Qwen2.5-7B-Instruct": "qwen25_7b",
+    "microsoft/Phi-3-mini-4k-instruct": "phi3_mini",
+    "microsoft/phi-4": "phi4",
+}
+
+
+# Dense 9-layer configs for each target model (hand-tuned, denser around middle)
+DENSE_9_LAYERS: Dict[str, List[int]] = {
+    "google/gemma-7b-it": [0, 4, 8, 11, 14, 17, 20, 24, 27],       # 28 layers
+    "google/gemma-2b-it": [0, 2, 4, 6, 8, 10, 12, 15, 17],         # 18 layers
+    "google/gemma-2-9b-it": [0, 5, 10, 15, 20, 25, 30, 36, 41],    # 42 layers
+    "google/gemma-2-27b-it": [0, 6, 11, 17, 23, 29, 34, 40, 45],   # 46 layers
+    "Qwen/Qwen2.5-7B-Instruct": [0, 3, 7, 10, 14, 17, 21, 24, 27],  # 28 layers
+    "microsoft/phi-4": [0, 5, 10, 15, 20, 25, 30, 35, 39],         # 40 layers
+    "meta-llama/Llama-3.1-8B-Instruct": [0, 4, 8, 12, 16, 20, 24, 28, 31],  # 32 layers
+    "mistralai/Mistral-7B-Instruct-v0.1": [0, 4, 8, 12, 16, 20, 24, 28, 31],  # 32 layers
+    "meta-llama/Meta-Llama-3-8B-Instruct": [0, 4, 8, 12, 16, 20, 24, 28, 31],
+    "meta-llama/Llama-2-7b-chat-hf": [0, 4, 8, 12, 16, 20, 24, 28, 31],
+}
+
+
+def get_dense_9_layers(model_name: str) -> List[int]:
+    """Get the hand-tuned 9-layer config for a model.
+
+    These are denser around the middle layers where deception signal peaks.
+    Falls back to evenly-spaced 9 layers if model not in lookup.
+    """
+    if model_name in DENSE_9_LAYERS:
+        return DENSE_9_LAYERS[model_name]
+    # Fallback: evenly spaced 9 layers
+    preset = MODEL_PRESETS.get(model_name)
+    n = preset["n_layers"] if preset else 28
+    step = max(1, (n - 1) // 8)
+    layers = sorted(set(list(range(0, n, step))[:8] + [n - 1]))
+    return layers[:9]
+
+
+def get_model_short_name(model_name: str) -> str:
+    """Get a filesystem-safe short name for a model.
+
+    Used for output file naming, directory organization, and display.
+    Falls back to sanitizing the model name if not in the lookup table.
+    """
+    if model_name in MODEL_SHORT_NAMES:
+        return MODEL_SHORT_NAMES[model_name]
+    # Fallback: take last part, lowercase, replace special chars
+    short = model_name.split("/")[-1].lower()
+    short = short.replace("-", "_").replace(".", "_")
+    return short
 
 
 def get_model_preset(model_name: str) -> Optional[Dict[str, Any]]:

@@ -362,8 +362,10 @@ def activation_patching_test(
     overall_effect = (mean_add_change + mean_sub_change) / 2
 
     # Statistical significance (compare to random direction)
+    # Generate same number of random samples as real test (add + sub combined)
+    n_random = len(logit_changes_add) + len(logit_changes_sub)
     random_changes = []
-    for _ in range(min(10, n_test)):
+    for i in range(n_random):
         try:
             random_dir = np.random.randn(len(direction))
             random_dir = random_dir / np.linalg.norm(random_dir)
@@ -373,7 +375,8 @@ def activation_patching_test(
                 activation[:, -1, :] += scaled_magnitude * random_tensor.to(activation.device)
                 return activation
 
-            prompt = test_prompts[0]
+            # Use diverse prompts, not just test_prompts[0]
+            prompt = test_prompts[i % len(test_prompts)]
             max_ctx = getattr(model.cfg, 'n_ctx', 8192)
             tokens = model.to_tokens(prompt, truncate=True)
             if tokens.shape[1] > max_ctx:
@@ -403,7 +406,7 @@ def activation_patching_test(
     # Compute approximate p-value using permutation test idea
     if random_changes and len(random_changes) >= 5:
         from scipy import stats
-        _, p_value = stats.ttest_ind(logit_changes_add + logit_changes_sub, random_changes * 2)
+        _, p_value = stats.ttest_ind(logit_changes_add + logit_changes_sub, random_changes)
     else:
         p_value = None
 
@@ -535,10 +538,19 @@ def cross_sample_patching_test(
 
     hook_name = f"blocks.{layer}.hook_resid_post"
 
+    # Compute deception direction for direction-only patching
+    honest_mean = X[~binary_labels].mean(axis=0)
+    deceptive_mean = X[binary_labels].mean(axis=0)
+    dec_direction = deceptive_mean - honest_mean
+    dec_dir_norm = np.linalg.norm(dec_direction)
+    if dec_dir_norm > 1e-8:
+        dec_direction = dec_direction / dec_dir_norm
+    dec_dir_tensor = torch.tensor(dec_direction, dtype=torch.float32)
+
     # Measure: for each pair, compute KL divergence between patched and baseline
-    # Direction 1: Patch deceptive activation INTO honest prompt
+    # Direction 1: Patch deceptive direction component INTO honest prompt
     d_into_h_kl = []
-    # Direction 2: Patch honest activation INTO deceptive prompt
+    # Direction 2: Patch honest direction component INTO deceptive prompt
     h_into_d_kl = []
     # Control: Patch same-class activation (honest into honest)
     control_kl = []
@@ -550,9 +562,12 @@ def cross_sample_patching_test(
         h_prompt = test_prompts[h_idx] if h_idx < len(test_prompts) else test_prompts[0]
         d_prompt = test_prompts[d_idx] if d_idx < len(test_prompts) else test_prompts[0]
 
-        # Stored activations from the dataset
+        # Stored activations from the dataset — compute direction-component projections
         h_activation = torch.tensor(X[h_idx], dtype=torch.float32)
         d_activation = torch.tensor(X[d_idx], dtype=torch.float32)
+        # Direction-component difference: what needs to be added/removed
+        h_dir_proj = (h_activation @ dec_dir_tensor).item()
+        d_dir_proj = (d_activation @ dec_dir_tensor).item()
 
         try:
             max_ctx = getattr(model.cfg, 'n_ctx', 8192)
@@ -566,9 +581,13 @@ def cross_sample_patching_test(
                 h_baseline_logits = model(h_tokens)
                 h_baseline_probs = torch.softmax(h_baseline_logits[:, -1, :], dim=-1)
 
-            def patch_d_into_h(activation, hook):
-                # Replace last-token activation with deceptive sample's stored activation
-                activation[:, -1, :] = d_activation.to(activation.device)
+            def patch_d_into_h(activation, hook, _d_proj=d_dir_proj, _h_proj=h_dir_proj, _dir=dec_dir_tensor):
+                # Swap only the deception-direction component (not the full vector)
+                d = _dir.to(activation.device)
+                act = activation[:, -1, :]
+                current_proj = (act @ d).unsqueeze(-1)
+                # Replace current direction component with deceptive sample's component
+                activation[:, -1, :] = act + (_d_proj - current_proj) * d.unsqueeze(0)
                 return activation
 
             with torch.no_grad():
@@ -577,9 +596,10 @@ def cross_sample_patching_test(
                 )
                 patched_probs = torch.softmax(patched_logits[:, -1, :], dim=-1)
 
+            # KL(patched || baseline): measures how patched output diverges from baseline
             kl = torch.nn.functional.kl_div(
-                patched_probs.log().clamp(min=-100),
-                h_baseline_probs,
+                h_baseline_probs.log().clamp(min=-100),
+                patched_probs,
                 reduction='batchmean'
             ).item()
             if not np.isnan(kl):
@@ -594,8 +614,12 @@ def cross_sample_patching_test(
                 d_baseline_logits = model(d_tokens)
                 d_baseline_probs = torch.softmax(d_baseline_logits[:, -1, :], dim=-1)
 
-            def patch_h_into_d(activation, hook):
-                activation[:, -1, :] = h_activation.to(activation.device)
+            def patch_h_into_d(activation, hook, _h_proj=h_dir_proj, _d_proj=d_dir_proj, _dir=dec_dir_tensor):
+                # Swap only the deception-direction component
+                d = _dir.to(activation.device)
+                act = activation[:, -1, :]
+                current_proj = (act @ d).unsqueeze(-1)
+                activation[:, -1, :] = act + (_h_proj - current_proj) * d.unsqueeze(0)
                 return activation
 
             with torch.no_grad():
@@ -604,9 +628,10 @@ def cross_sample_patching_test(
                 )
                 patched_d_probs = torch.softmax(patched_d_logits[:, -1, :], dim=-1)
 
+            # KL(patched || baseline): measures how patched output diverges from baseline
             kl_rev = torch.nn.functional.kl_div(
-                patched_d_probs.log().clamp(min=-100),
-                d_baseline_probs,
+                d_baseline_probs.log().clamp(min=-100),
+                patched_d_probs,
                 reduction='batchmean'
             ).item()
             if not np.isnan(kl_rev):
@@ -618,9 +643,14 @@ def cross_sample_patching_test(
             if other_h_idxs:
                 ctrl_idx = np.random.choice(other_h_idxs)
                 ctrl_activation = torch.tensor(X[ctrl_idx], dtype=torch.float32)
+                ctrl_dir_proj = (ctrl_activation @ dec_dir_tensor).item()
 
-                def patch_ctrl(activation, hook):
-                    activation[:, -1, :] = ctrl_activation.to(activation.device)
+                def patch_ctrl(activation, hook, _ctrl_proj=ctrl_dir_proj, _dir=dec_dir_tensor):
+                    # Swap only the direction component for control too
+                    d = _dir.to(activation.device)
+                    act = activation[:, -1, :]
+                    current_proj = (act @ d).unsqueeze(-1)
+                    activation[:, -1, :] = act + (_ctrl_proj - current_proj) * d.unsqueeze(0)
                     return activation
 
                 with torch.no_grad():
@@ -629,9 +659,10 @@ def cross_sample_patching_test(
                     )
                     ctrl_probs = torch.softmax(ctrl_logits[:, -1, :], dim=-1)
 
+                # KL(ctrl || baseline)
                 kl_ctrl = torch.nn.functional.kl_div(
-                    ctrl_probs.log().clamp(min=-100),
-                    h_baseline_probs,
+                    h_baseline_probs.log().clamp(min=-100),
+                    ctrl_probs,
                     reduction='batchmean'
                 ).item()
                 if not np.isnan(kl_ctrl):
@@ -721,7 +752,7 @@ def ablation_test(
     labels: np.ndarray,
     layer: int,
     test_prompts: List[str],
-    ablation_method: str = "zero",  # "zero", "mean", "noise"
+    ablation_method: str = "directional",  # "zero", "mean", "noise", "directional"
     n_samples: int = 20,
     verbose: bool = True,
 ) -> CausalValidationResult:
@@ -735,6 +766,7 @@ def ablation_test(
     - "zero": Set activations to zero
     - "mean": Replace with mean activation
     - "noise": Replace with Gaussian noise matching activation statistics
+    - "directional": Project out deception direction only (preferred — more targeted)
 
     Args:
         model: TransformerLens HookedTransformer
@@ -762,7 +794,18 @@ def ablation_test(
 
     # Compute ablation values (match model dtype to avoid bfloat16 issues)
     model_dtype = next(model.parameters()).dtype
-    if ablation_method == "zero":
+    if ablation_method == "directional":
+        # Project out deception direction only (targeted ablation)
+        binary_labels = (labels > 0.5).astype(bool)
+        honest_mean = X[~binary_labels].mean(axis=0)
+        deceptive_mean = X[binary_labels].mean(axis=0)
+        direction = deceptive_mean - honest_mean
+        dir_norm = np.linalg.norm(direction)
+        if dir_norm > 1e-8:
+            direction = direction / dir_norm
+        deception_dir = torch.tensor(direction, dtype=model_dtype)
+        ablation_value = None  # Not used for directional
+    elif ablation_method == "zero":
         ablation_value = torch.zeros(X.shape[1], dtype=model_dtype)
     elif ablation_method == "mean":
         ablation_value = torch.tensor(X.mean(axis=0), dtype=model_dtype)
@@ -796,7 +839,16 @@ def ablation_test(
                 baseline_probs = torch.softmax(baseline_logits[:, -1, :].float(), dim=-1)
 
             # Ablated
-            if ablation_method == "noise":
+            if ablation_method == "directional":
+                # Project out deception direction: act -= (act · d) * d
+                _dir = deception_dir  # capture in closure
+                def ablate_hook(activation, hook, _d=_dir):
+                    d = _d.to(activation.device)
+                    act = activation[:, -1, :]
+                    proj = (act @ d).unsqueeze(-1) * d.unsqueeze(0)
+                    activation[:, -1, :] = act - proj
+                    return activation
+            elif ablation_method == "noise":
                 noise = torch.tensor(
                     np.random.randn(X.shape[1]) * noise_std + noise_mean,
                     dtype=model_dtype
@@ -816,10 +868,10 @@ def ablation_test(
                 )
                 ablated_probs = torch.softmax(ablated_logits[:, -1, :].float(), dim=-1)
 
-            # KL divergence (clamp log to avoid -inf from zero probs in bfloat16)
+            # KL(ablated || baseline): measures how ablation changed output
             kl = torch.nn.functional.kl_div(
-                ablated_probs.float().log().clamp(min=-100),
-                baseline_probs.float(),
+                baseline_probs.float().log().clamp(min=-100),
+                ablated_probs.float(),
                 reduction='batchmean'
             ).item()
 
