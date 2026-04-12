@@ -164,9 +164,9 @@ class GeneralizationResult:
 def train_ridge_probe(
     X: np.ndarray,
     y: np.ndarray,
-    alpha: float = 10.0,
+    alpha: float = 100.0,
     use_pca: bool = True,
-    n_components: int = 50,
+    n_components: int = 30,
     random_state: int = 42,
     normalize: bool = True,
 ) -> Tuple[Ridge, ProbeResult]:
@@ -710,9 +710,9 @@ def sanity_check_label_variance(y: np.ndarray) -> Dict[str, float]:
 def train_probes_per_layer(
     activations_by_layer: Dict[int, np.ndarray],
     labels: np.ndarray,
-    alpha: float = 10.0,
+    alpha: float = 100.0,
     use_pca: bool = True,
-    n_components: int = 50,
+    n_components: int = 30,
 ) -> Dict[int, Dict[str, float]]:
     """
     Train separate probes on each layer to find optimal layer for deception detection.
@@ -910,7 +910,7 @@ def compute_generalization_auc(
     X: np.ndarray,
     y: np.ndarray,
     scenarios: List[str],
-    alpha: float = 10.0,
+    alpha: float = 100.0,
     random_state: int = 42,
     verbose: bool = False,
 ) -> Dict[str, Any]:
@@ -978,7 +978,7 @@ def compute_generalization_auc(
         X_test_s = scaler.transform(X_test)
 
         # Apply PCA
-        n_comp = min(50, X_train_s.shape[0] - 1, X_train_s.shape[1])
+        n_comp = min(30, X_train_s.shape[0] - 1, X_train_s.shape[1])
         pca = PCA(n_components=n_comp)
         X_train_pca = pca.fit_transform(X_train_s)
         X_test_pca = pca.transform(X_test_s)
@@ -1195,9 +1195,9 @@ def compute_cross_mode_transfer(
     X: np.ndarray,
     y: np.ndarray,
     mode_labels: List[str],
-    alpha: float = 10.0,
+    alpha: float = 100.0,
     use_pca: bool = True,
-    n_components: int = 50,
+    n_components: int = 30,
 ) -> Dict[str, Any]:
     """RQ1: Compute bidirectional cross-mode transfer between instructed and emergent.
 
@@ -1348,7 +1348,7 @@ def analyze_implicit_encoding(
     X: np.ndarray,
     gm_labels: np.ndarray,
     agent_labels: np.ndarray,
-    alpha: float = 10.0,
+    alpha: float = 100.0,
 ) -> Dict[str, Any]:
     """RQ2: Compare GM vs Agent label predictability to detect implicit encoding.
 
@@ -1404,7 +1404,7 @@ def analyze_round_trajectory(
     activations_by_layer: Dict[int, np.ndarray],
     y: np.ndarray,
     round_nums: List[int],
-    alpha: float = 10.0,
+    alpha: float = 100.0,
 ) -> Dict[str, Any]:
     """RQ-MA1: Analyze how deception encoding changes over negotiation rounds.
 
@@ -1496,7 +1496,7 @@ def analyze_dyadic_pairs(
     X: np.ndarray,
     y: np.ndarray,
     counterpart_idxs: List[int],
-    alpha: float = 10.0,
+    alpha: float = 100.0,
 ) -> Dict[str, Any]:
     """RQ-MA2: Analyze deceiver vs victim activation patterns.
 
@@ -1608,7 +1608,7 @@ def analyze_outcome_prediction(
     round_nums: List[int],
     trial_ids: List[str],
     trial_outcomes: List[bool],
-    alpha: float = 10.0,
+    alpha: float = 100.0,
 ) -> Dict[str, Any]:
     """RQ-MA3: Predict trial outcome from early-round activations.
 
