@@ -245,20 +245,9 @@ def train_probes_on_data(
     # Run full analysis
     results = run_full_analysis(data_path)
 
-    # Save results with unique filename
+    # Save results
     if output_dir:
-        # Build filename: probe_results_{scenario}_{timestamp}_{pod}.json
-        filename_parts = ["probe_results"]
-        if scenario_name:
-            filename_parts.append(scenario_name)
-        if timestamp:
-            filename_parts.append(timestamp)
-        else:
-            filename_parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
-        if pod_id:
-            filename_parts.append(f"pod{pod_id}")
-
-        output_path = Path(output_dir) / f"{'_'.join(filename_parts)}.json"
+        output_path = Path(output_dir) / "probe_results.json"
         with open(output_path, "w") as f:
             json.dump(_sanitize_for_json(results), f, indent=2, cls=NumpyEncoder)
         print(f"Results saved to: {output_path}")
@@ -439,10 +428,17 @@ def main():
     # Create session timestamp for all output files (prevents overwrites between runs)
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Create output directory (organized by scenario if specified)
+    # Build organized output directory: output/{model}/{scenario}/{config}_{timestamp}/
+    from config.experiment import get_model_short_name
+    model_short = get_model_short_name(args.model)
+    tom_label = "no_tom" if (args.fast or args.no_tom) else "tom"
+    run_label = f"{tom_label}_{session_timestamp}"
+
     output_dir = Path(args.output)
     if args.scenario_name:
-        output_dir = output_dir / args.scenario_name
+        output_dir = output_dir / model_short / args.scenario_name / run_label
+    else:
+        output_dir = output_dir / model_short / "all_scenarios" / run_label
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Handle merge-pods mode (combine results from parallel execution)
@@ -490,8 +486,7 @@ def main():
     if args.checkpoint_dir:
         checkpoint_dir = Path(args.checkpoint_dir)
     else:
-        # Default: create checkpoints subdirectory with session timestamp
-        checkpoint_dir = output_dir / f"checkpoints_{session_timestamp}"
+        checkpoint_dir = output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoints will be saved to: {checkpoint_dir}")
 
@@ -649,22 +644,8 @@ def main():
         )
         all_results["instructed"] = results
 
-    # Save activations with unique filename including model, scenario, mode, timestamp, and pod ID
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    from config.experiment import get_model_short_name
-    model_short = get_model_short_name(args.model)
-
-    # Build filename: activations_{model}_{scenario}_{mode}_{timestamp}_{pod}.pt
-    filename_parts = ["activations", model_short]
-    if args.scenario_name:
-        filename_parts.append(args.scenario_name)
-    filename_parts.append(args.mode)
-    filename_parts.append(timestamp)
-    if args.parallel_pod:
-        pod_num = args.parallel_pod.split('/')[0]
-        filename_parts.append(f"pod{pod_num}")
-
-    activations_path = output_dir / f"{'_'.join(filename_parts)}.pt"
+    # Save activations — directory already encodes model/scenario/config/timestamp
+    activations_path = output_dir / "activations.pt"
     runner.save_dataset(str(activations_path))
     print(f"\nActivations saved to: {activations_path}")
 
@@ -764,14 +745,7 @@ def main():
                         return [convert_numpy(v) for v in obj]
                     return obj
 
-                # Build filename with scenario and pod info
-                causal_filename_parts = ["causal_validation_results"]
-                if args.scenario_name:
-                    causal_filename_parts.append(args.scenario_name)
-                causal_filename_parts.append(session_timestamp)
-                if pod_id:
-                    causal_filename_parts.append(f"pod{pod_id}")
-                causal_results_path = output_dir / f"{'_'.join(causal_filename_parts)}.json"
+                causal_results_path = output_dir / "causal_results.json"
                 with open(causal_results_path, "w") as f:
                     json.dump(convert_numpy(causal_results), f, indent=2)
                 print(f"\nCausal validation results saved to: {causal_results_path}")
