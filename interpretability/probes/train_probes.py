@@ -186,9 +186,13 @@ def train_ridge_probe(
     """
 
     # Split data
+    # Stratify by binary label if both classes have enough members, else skip
+    binary_y = (y > 0.5).astype(int)
+    min_class_count = min(np.bincount(binary_y)) if len(np.unique(binary_y)) > 1 else 0
+    stratify_arg = binary_y if min_class_count >= 2 else None
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=random_state,
-        stratify=(y > 0.5).astype(int)
+        stratify=stratify_arg
     )
 
     # Normalize: fit on train only to prevent data leakage
@@ -303,8 +307,10 @@ def train_logistic_probe(
         )
 
     # Split data
+    min_class = min(np.bincount(y_binary)) if len(np.unique(y_binary)) > 1 else 0
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y_binary, test_size=0.2, random_state=random_state, stratify=y_binary
+        X, y_binary, test_size=0.2, random_state=random_state,
+        stratify=y_binary if min_class >= 2 else None
     )
 
     # Normalize: fit on train only
@@ -324,9 +330,10 @@ def train_logistic_probe(
 
     # Tune C on validation set if requested
     if tune_C:
+        min_c = min(np.bincount(y_train)) if len(np.unique(y_train)) > 1 else 0
         X_tr, X_val, y_tr, y_val = train_test_split(
             X_train, y_train, test_size=val_fraction,
-            random_state=random_state, stratify=y_train
+            random_state=random_state, stratify=y_train if min_c >= 2 else None
         )
         best_C, best_val_auc = C, 0.0
         for c_candidate in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
@@ -506,9 +513,10 @@ def train_mass_mean_probe(
         )
 
     # Split FIRST to prevent data leakage in direction computation
+    min_class = min(np.bincount(binary_y)) if len(np.unique(binary_y)) > 1 else 0
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=random_state,
-        stratify=binary_y
+        stratify=binary_y if min_class >= 2 else None
     )
     binary_y_train = (y_train > 0.5).astype(bool)
 
