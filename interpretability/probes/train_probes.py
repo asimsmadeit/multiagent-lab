@@ -1298,8 +1298,15 @@ def compute_cross_mode_transfer(
         reverse_transfer_auc = 0.5
 
     # Also compute within-mode performance for comparison
-    _, instructed_result = train_ridge_probe(X_instructed, y_instructed, alpha=alpha)
-    _, emergent_result = train_ridge_probe(X_emergent, y_emergent, alpha=alpha)
+    # Guard: within-mode datasets may be too small or imbalanced for train/test split
+    try:
+        _, instructed_result = train_ridge_probe(X_instructed, y_instructed, alpha=alpha)
+    except ValueError:
+        instructed_result = None
+    try:
+        _, emergent_result = train_ridge_probe(X_emergent, y_emergent, alpha=alpha)
+    except ValueError:
+        emergent_result = None
 
     # Compute asymmetry
     transfer_asymmetry = abs(forward_transfer_auc - reverse_transfer_auc)
@@ -1336,8 +1343,8 @@ def compute_cross_mode_transfer(
         # Asymmetry analysis
         "transfer_asymmetry": float(transfer_asymmetry),
         # Within-mode baselines
-        "instructed_within_auc": float(instructed_result.auc),
-        "emergent_within_auc": float(emergent_result.auc),
+        "instructed_within_auc": float(instructed_result.auc) if instructed_result else None,
+        "emergent_within_auc": float(emergent_result.auc) if emergent_result else None,
         "instructed_deception_rate": float(np.mean(y_instructed)),
         "emergent_deception_rate": float(np.mean(y_emergent)),
         "interpretation": interpretation,
