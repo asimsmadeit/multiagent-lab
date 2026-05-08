@@ -1255,16 +1255,22 @@ def steering_behavioral_test(
 
                     # Keep hooks active during the autoregressive generate.
                     # model.hooks is TransformerLens's context manager for
-                    # fwd_hooks that persist across the loop.
+                    # fwd_hooks that persist across the loop. freq_penalty=1.0
+                    # discourages repetition loops on Llama-3.1; passed via
+                    # try/except so older TransformerLens versions that do
+                    # not support the kwarg fall back cleanly.
+                    gen_kwargs = dict(
+                        max_new_tokens=max_new_tokens,
+                        temperature=max(temperature, 0.1),
+                        do_sample=True,
+                        stop_at_eos=True,
+                    )
                     with torch.no_grad():
                         with model.hooks(fwd_hooks=[(hook_name, make_hook(magnitude, direction))]):
-                            out = model.generate(
-                                tokens,
-                                max_new_tokens=max_new_tokens,
-                                temperature=max(temperature, 0.1),
-                                do_sample=True,
-                                stop_at_eos=True,
-                            )
+                            try:
+                                out = model.generate(tokens, freq_penalty=1.0, **gen_kwargs)
+                            except TypeError:
+                                out = model.generate(tokens, **gen_kwargs)
                     gen_tokens = out[0, tokens.shape[1]:]
                     tokenizer = getattr(model, 'tokenizer', None)
                     if tokenizer is not None and hasattr(tokenizer, 'decode'):

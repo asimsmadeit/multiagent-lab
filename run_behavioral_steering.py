@@ -168,6 +168,26 @@ def run_cell(cell_id, model_name, scenario, activations_path, best_layer,
 
     test_prompts, scenario_params_list = build_test_prompts(scenario, n_prompts=n_samples)
 
+    # Apply the model's chat template so instruction-tuned models (Llama,
+    # Mistral) behave as conversational assistants rather than text
+    # completers. Without this, Llama-3.1-8B narrates in third person and
+    # Mistral leaks </s> mid-stream, both of which break the rule-based
+    # deception scorer.
+    tokenizer = getattr(model, "tokenizer", None)
+    if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
+        formatted = []
+        for p in test_prompts:
+            try:
+                formatted.append(tokenizer.apply_chat_template(
+                    [{"role": "user", "content": p}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ))
+            except Exception:
+                formatted.append(p)
+        test_prompts = formatted
+        print(f"  applied chat template to {len(test_prompts)} prompts", flush=True)
+
     from interpretability.causal.causal_validation import (
         SteeringVector,
         steering_behavioral_test,
