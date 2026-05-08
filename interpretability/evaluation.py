@@ -203,6 +203,20 @@ class ActivationSample:
     # Post-trial check: does model treat negotiation as real or roleplay?
     plausibility_response: Optional[str] = None  # Model's answer to "was this real?"
 
+    # === SAMPLE TYPE (2026-04-21 audit fix) ===
+    # Explicit tag distinguishing real negotiation turns from verification and
+    # plausibility probes. Previously these were distinguished only by
+    # round_num < 0, which downstream probe-training code silently ignored,
+    # mixing single-shot QA probes into multi-round negotiation training data
+    # (contaminating ~29% of most runs). Values:
+    #   "negotiation"       - real multi-round negotiation turn (round_num >= 0)
+    #   "pre_verification"  - pre-negotiation belief probe (round_num = -1)
+    #   "post_plausibility" - post-negotiation plausibility probe (round_num = -2)
+    # Legacy .pt files that pre-date this field need backfilling via
+    # scripts/backfill_sample_type.py. Without the field, loaders should
+    # default to "negotiation" for round_num >= 0, else infer from round_num.
+    sample_type: str = "negotiation"
+
     # === COUNTERPART TYPE (A1) ===
     # Counterfactual counterpart behavior for conditioned vs complex deception test
     counterpart_type: Optional[str] = None  # "default", "skeptical", "credulous", "informed", "absent"
@@ -422,16 +436,52 @@ class TransformerLensWrapper(language_model.LanguageModel):
         timeout: float = 60,
         seed: int | None = None,
     ) -> str:
-        """Generate text and capture activations. Applies steering if active."""
+        """Generate text and capture activations. Applies steering if active.
+
+        Fixes applied 2026-04-21 to address data-quality failures on Llama
+        and Mistral runs (see DATA_QUALITY_FIX_PLAN.md):
+          - Chat template applied before tokenization (fixes third-person
+            narration on Llama-3.1-8B-Instruct which silently completes
+            rather than responding when the role markers are missing).
+          - freq_penalty added to generate() (TransformerLens equivalent of
+            HF repetition_penalty; fixes repetition loops on Llama/Mistral).
+          - Decode via tokenizer.decode(..., skip_special_tokens=True)
+            instead of model.to_string (which does not strip special
+            tokens and was surfacing </s> and <|eot_id|> in 50-61% of
+            Mistral responses and 8-13% of Llama responses).
+        """
         self._call_count += 1
 
         # Use instance default if not specified
         if max_tokens is None:
             max_tokens = self.default_max_tokens
 
+        # Apply the model's chat template so instruction-tuned models see
+        # the expected role markers. Falls back to the raw prompt if the
+        # tokenizer does not support it.
+        tokenizer = getattr(self.model, 'tokenizer', None)
+        if tokenizer is not None and hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                formatted_prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                # Chat template already adds BOS; avoid double-BOS.
+                prepend_bos = False
+            except (ValueError, TypeError):
+                # Some tokenizers lack a chat_template attribute; fall back.
+                formatted_prompt = prompt
+                prepend_bos = True
+        else:
+            formatted_prompt = prompt
+            prepend_bos = True
+
         # Tokenize with truncation to avoid exceeding max position embeddings
         max_ctx = getattr(self.model.cfg, 'n_ctx', 8192)
-        tokens = self.model.to_tokens(prompt, truncate=True)
+        tokens = self.model.to_tokens(
+            formatted_prompt, truncate=True, prepend_bos=prepend_bos
+        )
         if tokens.shape[1] > max_ctx - 256:
             tokens = tokens[:, -(max_ctx - 256):]  # Leave room for generation
 
@@ -462,20 +512,37 @@ class TransformerLensWrapper(language_model.LanguageModel):
             if seed is not None:
                 torch.manual_seed(seed)
 
-            generated = self.model.generate(
-                tokens,
+            # freq_penalty is TransformerLens's repetition penalty; 1.0 is a
+            # reasonable default for instruction-tuned models. Passed via
+            # kwargs so older TL versions that do not support it fall back
+            # cleanly.
+            gen_kwargs = dict(
                 max_new_tokens=min(max_tokens, 256),
                 temperature=max(temperature, 0.1),
                 stop_at_eos=True,
             )
+            try:
+                generated = self.model.generate(
+                    tokens, freq_penalty=1.0, **gen_kwargs
+                )
+            except TypeError:
+                # TransformerLens version does not support freq_penalty; fall back.
+                generated = self.model.generate(tokens, **gen_kwargs)
         finally:
             # Always clean up hooks after forward+generate
             if self.is_steering:
                 self.model.reset_hooks()
 
-        # Decode
+        # Decode only the newly-generated tokens. Prefer the HF tokenizer's
+        # decode with skip_special_tokens=True so </s>, <|eot_id|>, etc. do
+        # not leak into the response string.
         response_tokens = generated[0, tokens.shape[1]:]
-        response = self.model.to_string(response_tokens)
+        if tokenizer is not None and hasattr(tokenizer, 'decode'):
+            response = tokenizer.decode(
+                response_tokens, skip_special_tokens=True
+            )
+        else:
+            response = self.model.to_string(response_tokens)
 
         # Apply terminators
         for term in terminators:
@@ -654,6 +721,10 @@ class HybridLanguageModel(language_model.LanguageModel):
             "top_p": 0.9,  # Nucleus sampling for stability
             "top_k": 50,   # Limit vocabulary for stability
             "pad_token_id": self.tokenizer.pad_token_id,
+            # repetition_penalty added 2026-04-21 to address looping on
+            # Llama-3.1-8B and Mistral-7B runs. 1.15 is a conservative
+            # default that reduces loops without destroying fluency.
+            "repetition_penalty": 1.15,
         }
 
         if seed is not None:
@@ -689,7 +760,9 @@ class HybridLanguageModel(language_model.LanguageModel):
             except RuntimeError as e:
                 error_str = str(e).lower()
                 if "probability" in error_str or "nan" in error_str or "srcindex" in error_str or "inf" in error_str:
-                    # Fallback to greedy decoding if sampling fails
+                    # Fallback to greedy decoding if sampling fails.
+                    # Keep repetition_penalty in the fallback: greedy without
+                    # it is the worst case for loop formation (2026-04-21 fix).
                     logger.warning(f"Sampling failed ({type(e).__name__}), falling back to greedy")
                     gen_kwargs["do_sample"] = False
                     gen_kwargs.pop("temperature", None)
@@ -1114,7 +1187,14 @@ class InterpretabilityRunner:
         )
 
     def _extract_agent_labels(self, agent) -> Dict[str, float]:
-        """Extract labels from agent's cognitive modules (first-person beliefs)."""
+        """Extract labels from agent's cognitive modules (first-person beliefs).
+
+        Labels describe what the agent believes about its counterpart, not
+        about itself. TheoryOfMind.post_act populates a 'self' entry in
+        mental_models with the agent's own detected output patterns; this
+        entry must be excluded from counterpart-belief aggregations, or the
+        'agent label' is a mixture of perception + self-output heuristics.
+        """
         labels = {
             'perceived_deception': 0.0,
             'emotion_intensity': 0.0,
@@ -1128,14 +1208,25 @@ class InterpretabilityRunner:
             state = tom.get_state()
             mental_models = state.get('mental_models', {})
 
-            if mental_models:
+            # Drop the 'self' mental model before aggregating: it records
+            # the agent's own action, not a belief about the counterpart.
+            counterpart_models = {
+                k: v for k, v in mental_models.items() if k != 'self'
+            }
+
+            if counterpart_models:
                 deception_risks = []
                 emotion_intensities = []
                 trust_levels = []
 
-                for model_state in mental_models.values():
+                for model_state in counterpart_models.values():
                     deception_risks.append(model_state.get('deception_risk', 0.0))
                     emotion_intensities.append(model_state.get('emotion_intensity', 0.0))
+                    # NOTE: TheoryOfMind.get_state does not currently emit a
+                    # trust_level field per mental model, so this always falls
+                    # through to the 0.5 default. trust_level is therefore a
+                    # placeholder on every sample and must not be used as a
+                    # probe label until ToM starts emitting it.
                     trust_levels.append(model_state.get('trust_level', 0.5))
 
                 labels['perceived_deception'] = float(np.mean(deception_risks))
@@ -2101,9 +2192,17 @@ Example: yes, yes'''
             print(f"\n[{cond_label}]", flush=True)
             condition_results = []
             deception_count = 0
+            # === 2026-04-21: continuous quality monitoring ===
+            # Abort a run if three consecutive trials produce <40% clean
+            # dialogue, so a regression in generation config (missing chat
+            # template, missing repetition_penalty, decode leak) does not
+            # quietly burn the rest of the trial budget.
+            consecutive_low_quality = 0
+            low_quality_threshold = 0.40
 
             for trial in range(num_trials):
                 print(f"  Trial {trial+1}/{num_trials}...", end=" ", flush=True)
+                n_before = len(self.activation_samples)
                 trial_result = self._run_emergent_trial(
                     scenario=scenario,
                     condition=condition_enum,
@@ -2121,6 +2220,30 @@ Example: yes, yes'''
                     print("DECEPTION", flush=True)
                 else:
                     print("honest", flush=True)
+
+                # Per-trial QC (2026-04-21)
+                new_samples = self.activation_samples[n_before:]
+                try:
+                    from interpretability.core.qc_filter import qc_report
+                    qc = qc_report(new_samples)
+                    pct_clean = qc.get('pct_clean', 1.0)
+                    top = sorted(qc['flag_counts'].items(), key=lambda x: -x[1])[:2]
+                    top_s = ', '.join(f'{k}={v}' for k, v in top) or 'none'
+                    print(f"    QC: pct_clean={pct_clean:.0%}, flags: {top_s}", flush=True)
+                    if pct_clean < low_quality_threshold:
+                        consecutive_low_quality += 1
+                        print(f"    WARNING: low-quality trial ({consecutive_low_quality} consecutive)", flush=True)
+                    else:
+                        consecutive_low_quality = 0
+                    if consecutive_low_quality >= 3:
+                        raise RuntimeError(
+                            f"Aborting: three consecutive trials below "
+                            f"{low_quality_threshold:.0%} clean dialogue. Inspect "
+                            f"generation config (chat template, repetition_penalty, "
+                            f"skip_special_tokens) before restarting."
+                        )
+                except ImportError:
+                    pass  # QC filter module optional; do not block runs
 
                 # Checkpoint after each trial if directory specified
                 if checkpoint_dir:
@@ -2265,6 +2388,7 @@ Example: yes, yes'''
                 verify_sample = ActivationSample(
                     trial_id=self._trial_id,
                     round_num=-1,  # -1 indicates pre-negotiation
+                    sample_type="pre_verification",  # 2026-04-21 audit fix: tag explicitly so probe training can filter
                     agent_name="Negotiator",
                     activations=verify_activations,
                     prompt=verification_prompt,
@@ -2483,6 +2607,7 @@ Example: yes, yes'''
                 plaus_sample = ActivationSample(
                     trial_id=self._trial_id,
                     round_num=-2,  # -2 indicates post-negotiation plausibility probe
+                    sample_type="post_plausibility",  # 2026-04-21 audit fix: tag explicitly so probe training can filter
                     agent_name="Negotiator",
                     activations=plaus_activations,
                     prompt=plausibility_prompt,
@@ -3123,6 +3248,7 @@ Example: yes, yes'''
                 # Original fields
                 'trial_id': sample.trial_id,
                 'round_num': sample.round_num,
+                'sample_type': getattr(sample, 'sample_type', 'negotiation'),  # 2026-04-21 audit fix
                 'agent_name': sample.agent_name,
                 'scenario': scenario,
                 'incentive_condition': sample.incentive_condition,
