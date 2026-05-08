@@ -165,7 +165,11 @@ from .probes.sanity_checks import (
 from .causal.causal_validation import (
     activation_patching_test,
     ablation_test,
-    steering_vector_test,
+    # steering_vector_test — RENAMED 2026-04-21 to steering_logit_sensitivity_test
+    # to clarify it measures logit shifts, not behavioral change. The new
+    # steering_behavioral_test generates text under steering and scores it.
+    steering_logit_sensitivity_test,
+    steering_behavioral_test,
     probe_faithfulness_test,
     selectivity_test,
     run_full_causal_validation,
@@ -281,7 +285,8 @@ __all__ = [
     # Causal Validation
     'activation_patching_test',
     'ablation_test',
-    'steering_vector_test',
+    'steering_logit_sensitivity_test',
+    'steering_behavioral_test',
     'probe_faithfulness_test',
     'selectivity_test',
     'run_full_causal_validation',

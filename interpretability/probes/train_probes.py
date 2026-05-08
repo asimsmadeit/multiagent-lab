@@ -1248,6 +1248,22 @@ def compute_cross_mode_transfer(
     X_emergent = X[emergent_mask]
     y_emergent = y[emergent_mask]
 
+    # === 2026-04-21 Finding 7 fix: unify label scale before training ===
+    # emergent samples receive binary {0, 1} labels from regex-based
+    # emergent_ground_truth; instructed samples receive continuous GM
+    # severity scores. The previous implementation trained a ridge probe on
+    # continuous instructed labels and evaluated its predictions against
+    # binary emergent labels (and vice versa), so the "cross-mode transfer
+    # fails" null result was confounded with a label-scale mismatch, not a
+    # pure representational distinction. Binarize both y vectors at the 0.5
+    # threshold before training so transfer AUC is an apples-to-apples
+    # comparison. The continuous R² becomes uninformative after binarization
+    # (R² on binary targets is not meaningful) so we report transfer in AUC
+    # only, with the continuous R² preserved in a separate _continuous field
+    # for backward compatibility.
+    y_instructed_binary = (y_instructed > 0.5).astype(float)
+    y_emergent_binary = (y_emergent > 0.5).astype(float)
+
     # Apply PCA on training data (instructed)
     if use_pca:
         n_comp = min(n_components, X_instructed.shape[0] - 1, X_instructed.shape[1])
@@ -1258,18 +1274,26 @@ def compute_cross_mode_transfer(
         X_instructed_pca = X_instructed
         X_emergent_pca = X_emergent
 
-    # Train on instructed
+    # Train on instructed (binary labels for unified scale)
     probe = Ridge(alpha=alpha)
-    probe.fit(X_instructed_pca, y_instructed)
+    probe.fit(X_instructed_pca, y_instructed_binary)
 
     # Test on emergent
     emergent_pred = probe.predict(X_emergent_pca)
-    transfer_r2 = r2_score(y_emergent, emergent_pred)
+    transfer_r2 = r2_score(y_emergent_binary, emergent_pred)
+
+    # Also compute the old (label-scale-mismatched) R² for comparison with
+    # pre-2026-04-21 results. If this is much worse than the binarized R²,
+    # the old "cross-mode transfer fails" null was at least partly a
+    # label-scale artifact.
+    probe_legacy = Ridge(alpha=alpha)
+    probe_legacy.fit(X_instructed_pca, y_instructed)
+    emergent_pred_legacy = probe_legacy.predict(X_emergent_pca)
+    transfer_r2_legacy_mixed = r2_score(y_emergent, emergent_pred_legacy)
 
     # Compute AUC for forward transfer (instructed → emergent)
-    binary_true = (y_emergent > 0.5).astype(int)
     try:
-        forward_transfer_auc = roc_auc_score(binary_true, emergent_pred)
+        forward_transfer_auc = roc_auc_score(y_emergent_binary.astype(int), emergent_pred)
     except ValueError:
         forward_transfer_auc = 0.5
 
@@ -1284,16 +1308,22 @@ def compute_cross_mode_transfer(
         X_emergent_pca_rev = X_emergent
         X_instructed_pca_rev = X_instructed
 
-    # Train on emergent, test on instructed
+    # Train on emergent, test on instructed (both on the unified binary scale
+    # per 2026-04-21 Finding 7 fix; see comments on the forward direction above)
     probe_reverse = Ridge(alpha=alpha)
-    probe_reverse.fit(X_emergent_pca_rev, y_emergent)
+    probe_reverse.fit(X_emergent_pca_rev, y_emergent_binary)
     instructed_pred = probe_reverse.predict(X_instructed_pca_rev)
-    reverse_transfer_r2 = r2_score(y_instructed, instructed_pred)
+    reverse_transfer_r2 = r2_score(y_instructed_binary, instructed_pred)
 
-    # Compute AUC for reverse transfer
-    binary_true_rev = (y_instructed > 0.5).astype(int)
+    # Legacy (mismatched-scale) reverse for back-compat reporting
+    probe_reverse_legacy = Ridge(alpha=alpha)
+    probe_reverse_legacy.fit(X_emergent_pca_rev, y_emergent)
+    instructed_pred_legacy = probe_reverse_legacy.predict(X_instructed_pca_rev)
+    reverse_transfer_r2_legacy_mixed = r2_score(y_instructed, instructed_pred_legacy)
+
+    # Compute AUC for reverse transfer (using unified binary labels)
     try:
-        reverse_transfer_auc = roc_auc_score(binary_true_rev, instructed_pred)
+        reverse_transfer_auc = roc_auc_score(y_instructed_binary.astype(int), instructed_pred)
     except ValueError:
         reverse_transfer_auc = 0.5
 
@@ -1331,12 +1361,19 @@ def compute_cross_mode_transfer(
     return {
         "n_instructed": int(n_instructed),
         "n_emergent": int(n_emergent),
-        # Forward transfer (instructed → emergent)
+        # Forward transfer (instructed → emergent); both sides binarized
         "forward_transfer_r2": float(transfer_r2),
         "forward_transfer_auc": float(forward_transfer_auc),
-        # Reverse transfer (emergent → instructed)
+        # Reverse transfer (emergent → instructed); both sides binarized
         "reverse_transfer_r2": float(reverse_transfer_r2),
         "reverse_transfer_auc": float(reverse_transfer_auc),
+        # === 2026-04-21 Finding 7 diagnostic fields ===
+        # Legacy mixed-scale R²: continuous instructed labels in train,
+        # binary emergent labels in test (and vice versa). Included so the
+        # delta between unified and legacy is visible in the report.
+        "forward_transfer_r2_legacy_mixed": float(transfer_r2_legacy_mixed),
+        "reverse_transfer_r2_legacy_mixed": float(reverse_transfer_r2_legacy_mixed),
+        "label_scale_unified": True,
         # Legacy field for backwards compatibility
         "transfer_auc": float(forward_transfer_auc),
         "transfer_r2": float(transfer_r2),
@@ -1523,17 +1560,23 @@ def analyze_dyadic_pairs(
     counterpart_idxs = np.array(counterpart_idxs)
     n_samples = len(y)
 
-    # Identify valid pairs (both agents have samples)
+    # Identify valid pairs (both agents have samples). Deduplicate reciprocal
+    # links: if sample i has counterpart j and sample j has counterpart i, the
+    # pair is the same dyad and must only be counted once, otherwise downstream
+    # pair-probe AUC is inflated by train/test leakage across the reciprocal.
     valid_pairs = []
+    seen_pairs = set()
     for i in range(n_samples):
         cp_idx = counterpart_idxs[i]
-        # Skip None values (no counterpart recorded for this sample)
         if cp_idx is None or (hasattr(cp_idx, 'item') and np.isnan(cp_idx)):
             continue
-        # Convert numpy types to int for comparison
         if hasattr(cp_idx, 'item'):
             cp_idx = int(cp_idx)
         if 0 <= cp_idx < n_samples and cp_idx != i:
+            pair_key = (min(i, cp_idx), max(i, cp_idx))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
             valid_pairs.append((i, cp_idx))
 
     if len(valid_pairs) < 10:
@@ -1585,28 +1628,109 @@ def analyze_dyadic_pairs(
         np.sqrt(0.5 * (deceiver_proj.var() + victim_proj.var())) + 1e-8
     )
 
-    # Train probe to distinguish deceiver from victim
+    # Train probe to distinguish deceiver from victim.
+    #
+    # 2026-04-22 fix: use a pair-aware train/test split. deceiver_X[k] and
+    # victim_X[k] come from the same dyadic round (same negotiation trial).
+    # A random split stacks them and can put deceiver[k] in train and
+    # victim[k] in test — so the probe memorizes per-trial activation
+    # signatures rather than learning a general deceiver/victim direction.
+    # That is what produced the near-1.000 AUCs in the pre-audit results.
+    # Group by pair index so both members of a pair are always on the same
+    # side of the split.
     pair_X = np.vstack([deceiver_X, victim_X])
     pair_y = np.array([1.0] * len(deceiver_X) + [0.0] * len(victim_X))
+    pair_groups = np.concatenate([np.arange(len(deceiver_X)),
+                                  np.arange(len(victim_X))])
 
-    _, pair_result = train_ridge_probe(pair_X, pair_y, alpha=alpha)
+    pair_auc, pair_r2 = _train_probe_grouped(
+        pair_X, pair_y, pair_groups, alpha=alpha
+    )
+    if pair_auc is None:
+        pair_auc = 0.5
+    if pair_r2 is None:
+        pair_r2 = 0.0
 
-    # Interpretation
-    if pair_result.auc > 0.70:
+    # Also compute the old (leaky) number so the report surfaces how much
+    # of the historic AUC was per-trial memorization vs a real dyadic
+    # direction. Keep it under a _legacy_ field for diagnostic only.
+    _, pair_result_legacy = train_ridge_probe(pair_X, pair_y, alpha=alpha)
+
+    # Interpretation based on the (post-fix) pair-aware AUC
+    if pair_auc > 0.70:
         interpretation = "STRONG dyadic signal - deceiver/victim clearly distinguishable"
-    elif pair_result.auc > 0.60:
+    elif pair_auc > 0.60:
         interpretation = "MODERATE dyadic signal - partial separability"
     else:
         interpretation = "WEAK dyadic signal - deceiver/victim activations similar"
 
     return {
         "n_pairs": len(valid_pairs),
-        "pair_probe_auc": float(pair_result.auc),
-        "pair_probe_r2": float(pair_result.r2_score),
+        "pair_probe_auc": float(pair_auc),
+        "pair_probe_r2": float(pair_r2),
+        "pair_probe_auc_legacy_leaky": float(pair_result_legacy.auc),
+        "pair_probe_r2_legacy_leaky": float(pair_result_legacy.r2_score),
+        "split_method": "group_aware_by_pair_id",
         "d_prime": float(d_prime),
         "mean_asymmetry": float(np.mean(asymmetries)),
         "interpretation": interpretation,
     }
+
+
+def _train_probe_grouped(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    alpha: float = 100.0,
+    n_components: int = 30,
+    random_state: int = 42,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Train a ridge probe with a trial-level train/test split.
+
+    Used when the target is defined per-group (e.g., trial outcome) but
+    samples are per-row (e.g., per round). A standard train_test_split puts
+    the same group in both folds and leaks the backfilled group-level label.
+    GroupShuffleSplit guarantees no group appears on both sides.
+
+    Returns (auc, r2). Either may be None if the split is degenerate.
+    """
+    from sklearn.model_selection import GroupShuffleSplit
+
+    if len(np.unique(groups)) < 2:
+        return None, None
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=random_state)
+    train_idx, test_idx = next(gss.split(X, y, groups=groups))
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_test_s = scaler.transform(X_test)
+
+    n_comp = min(n_components, X_train_s.shape[0] - 1, X_train_s.shape[1])
+    if n_comp >= 1:
+        pca = PCA(n_components=n_comp)
+        X_train_p = pca.fit_transform(X_train_s)
+        X_test_p = pca.transform(X_test_s)
+    else:
+        X_train_p, X_test_p = X_train_s, X_test_s
+
+    probe = Ridge(alpha=alpha)
+    probe.fit(X_train_p, y_train)
+    y_pred = probe.predict(X_test_p)
+
+    binary_test = (y_test > 0.5).astype(int)
+    if len(np.unique(binary_test)) < 2:
+        auc = None
+    else:
+        try:
+            auc = float(roc_auc_score(binary_test, y_pred))
+        except ValueError:
+            auc = None
+    r2 = float(r2_score(y_test, y_pred))
+    return auc, r2
 
 
 def analyze_outcome_prediction(
@@ -1634,6 +1758,7 @@ def analyze_outcome_prediction(
         Dict with outcome prediction metrics
     """
     round_nums = np.array(round_nums)
+    trial_ids_arr = np.array([str(t) for t in trial_ids])
     # Convert string outcomes to numeric (1=success, 0=failure)
     SUCCESS_OUTCOMES = {"agreement", "deal", "success", "accepted", "true", "True"}
     trial_outcomes_raw = trial_outcomes
@@ -1654,6 +1779,7 @@ def analyze_outcome_prediction(
 
     X_early = X[early_mask]
     outcomes_early = trial_outcomes[early_mask]
+    trials_early = trial_ids_arr[early_mask]
 
     # Check outcome variance
     if np.std(outcomes_early) < 0.01:
@@ -1663,32 +1789,42 @@ def analyze_outcome_prediction(
             "outcome_rate": float(np.mean(outcomes_early)),
         }
 
-    # Train probe to predict outcome from early activations
-    _, outcome_result = train_ridge_probe(X_early, outcomes_early, alpha=alpha)
+    # Group-aware split by trial_id: trial_outcome is a trial-level label
+    # backfilled onto every per-round sample. A random per-sample split
+    # therefore places the same trial (same label) in both train and test,
+    # inflating AUC. Split on trial_id instead.
+    early_auc, early_r2 = _train_probe_grouped(
+        X_early, outcomes_early, trials_early, alpha=alpha
+    )
 
     # Also try late rounds for comparison
     late_mask = round_nums >= max(round_nums) - 1
     n_late = late_mask.sum()
-
-    if n_late >= 20 and np.std(trial_outcomes[late_mask]) > 0.01:
-        _, late_result = train_ridge_probe(X[late_mask], trial_outcomes[late_mask], alpha=alpha)
-        late_auc = float(late_result.auc)
+    trials_late = trial_ids_arr[late_mask] if n_late else np.array([])
+    if (
+        n_late >= 20
+        and np.std(trial_outcomes[late_mask]) > 0.01
+        and len(np.unique(trials_late)) >= 2
+    ):
+        late_auc, _ = _train_probe_grouped(
+            X[late_mask], trial_outcomes[late_mask], trials_late, alpha=alpha
+        )
     else:
         late_auc = None
 
     # Interpretation
-    if outcome_result.auc > 0.70:
+    if early_auc is not None and early_auc > 0.70:
         interpretation = "STRONG early prediction - deception outcome predictable from round 1-2"
-    elif outcome_result.auc > 0.60:
+    elif early_auc is not None and early_auc > 0.60:
         interpretation = "MODERATE early prediction - partial signal in early rounds"
     else:
         interpretation = "WEAK early prediction - outcome not predictable from early activations"
 
     return {
         "n_early_samples": int(n_early),
-        "early_rounds_auc": float(outcome_result.auc),
-        "early_rounds_r2": float(outcome_result.r2_score),
-        "late_rounds_auc": late_auc,
+        "early_rounds_auc": float(early_auc) if early_auc is not None else None,
+        "early_rounds_r2": float(early_r2) if early_r2 is not None else None,
+        "late_rounds_auc": float(late_auc) if late_auc is not None else None,
         "outcome_rate": float(np.mean(outcomes_early)),
         "interpretation": interpretation,
     }
@@ -1714,6 +1850,7 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     activations = data["activations"]
     labels = data["labels"]
     config = data.get("config", {})
+    metadata = data.get("metadata", [])
 
     gm_labels = np.array(labels["gm_labels"])
     agent_labels = np.array(labels["agent_labels"])
@@ -1721,6 +1858,55 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
 
     print(f"Loaded {len(gm_labels)} samples")
     print(f"Layers available: {list(activations.keys())}")
+
+    # === 2026-04-21 audit fix: filter out pre_verification and post_plausibility probes ===
+    # These single-shot probe turns were being mixed into probe-training data.
+    # Filter here using sample_type (new field) with a fallback to round_num for
+    # legacy .pt files that pre-date the field.
+    round_nums_meta = [m.get('round_num') for m in metadata] if metadata else None
+    sample_types = [m.get('sample_type') for m in metadata] if metadata else None
+
+    def _is_negotiation(i: int) -> bool:
+        if sample_types and sample_types[i] is not None:
+            return sample_types[i] == 'negotiation'
+        if round_nums_meta and round_nums_meta[i] is not None:
+            return round_nums_meta[i] >= 0
+        return True  # unknown; keep
+
+    n_total = len(gm_labels)
+    keep_mask = np.array([_is_negotiation(i) for i in range(n_total)], dtype=bool)
+    n_probe = int((~keep_mask).sum())
+    if n_probe > 0:
+        print(f"  Filtering out {n_probe} probe-round samples "
+              f"(pre_verification + post_plausibility) — {100*n_probe/n_total:.1f}% of data")
+        # Apply filter to every aligned array
+        for layer_key in list(activations.keys()):
+            activations[layer_key] = activations[layer_key][keep_mask]
+        gm_labels = gm_labels[keep_mask]
+        agent_labels = agent_labels[keep_mask]
+        scenarios = [s for s, k in zip(scenarios, keep_mask) if k]
+        if metadata:
+            metadata = [m for m, k in zip(metadata, keep_mask) if k]
+        # Re-bind labels dict (used by downstream analyses that pull from it).
+        # The save_dataset writer uses plural key names: round_nums, trial_ids,
+        # counterpart_idxs, trial_outcomes, pod_ids, mode_labels. Filter every
+        # aligned array so cross-mode and dyadic analyses do not crash with a
+        # shape mismatch.
+        labels['gm_labels'] = gm_labels.tolist() if hasattr(gm_labels, 'tolist') else gm_labels
+        labels['agent_labels'] = agent_labels.tolist() if hasattr(agent_labels, 'tolist') else agent_labels
+        labels['scenario'] = scenarios
+        for key in ('mode_labels', 'round_nums', 'trial_ids',
+                    'counterpart_idxs', 'trial_outcomes', 'pod_ids',
+                    # Older/alternate singular names kept for safety.
+                    'round_num', 'trial_id', 'counterpart_idx',
+                    'trial_outcome', 'experiment_mode'):
+            if key in labels:
+                arr = labels[key]
+                if arr is None:
+                    continue
+                if hasattr(arr, '__len__') and len(arr) == n_total:
+                    labels[key] = [v for v, k in zip(arr, keep_mask) if k]
+        print(f"  Remaining: {len(gm_labels)} negotiation samples")
 
     results = {
         "sanity_checks": {},
@@ -1790,7 +1976,7 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
 
     layer_results = {}
     best_layer = None
-    best_r2 = -1
+    best_auc = -1.0
 
     for layer in layers:
         X = activations[layer].float().numpy()
@@ -1814,16 +2000,24 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print(f"  GM labels    - R²: {gm_result.r2_score:.3f}, AUC: {gm_result.auc:.3f}")
         print(f"  Agent labels - R²: {agent_result.r2_score:.3f}, AUC: {agent_result.auc:.3f}")
 
-        if gm_result.r2_score > best_r2:
-            best_r2 = gm_result.r2_score
+        # Select best layer by AUC (the primary metric the rest of the pipeline
+        # uses), not R². R² can be negative and noisy on small samples, so
+        # AUC-based selection is more stable and consistent with downstream use.
+        if gm_result.auc > best_auc:
+            best_auc = gm_result.auc
             best_layer = layer
 
     results["layer_analysis"] = layer_results
     if best_layer is None:
         best_layer = layers[len(layers) // 2]
-    results["best_probe"] = {"layer": int(best_layer), "r2": float(best_r2)}
+    best_r2 = layer_results[best_layer]["gm"]["r2_score"] if best_layer in layer_results else 0.0
+    results["best_probe"] = {
+        "layer": int(best_layer),
+        "auc": float(best_auc),
+        "r2": float(best_r2),
+    }
 
-    print(f"\nBest layer: {best_layer} (R² = {best_r2:.3f})")
+    print(f"\nBest layer: {best_layer} (AUC = {best_auc:.3f}, R² = {best_r2:.3f})")
 
     # ==========================================================================
     # GM vs AGENT COMPARISON (Core Metric)

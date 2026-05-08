@@ -263,20 +263,22 @@ def residualized_probing(X, gm_labels, round_nums, metadata, seed):
             col = (incentives == inc).astype(float).reshape(-1, 1)
             C = np.hstack([C, col])
 
-    # Residualize: X_res = X - C @ beta
-    reg = LinearRegression()
-    reg.fit(C, X)
-    X_residual = X - reg.predict(C)
-
-    # Stratified split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_residual, y, test_size=TEST_SIZE, stratify=y, random_state=seed
+    # Split FIRST to prevent test-set leakage. The residualizer must be fit on
+    # train only, otherwise C -> X coefficients are estimated using test data
+    # and any reported residualized AUC is optimistic.
+    X_train, X_test, y_train, y_test, C_train, C_test = train_test_split(
+        X, y, C, test_size=TEST_SIZE, stratify=y, random_state=seed
     )
 
     if len(np.unique(y_test)) < 2:
         return None
 
-    auc = train_probe(X_train, y_train, X_test, y_test, seed)
+    reg = LinearRegression()
+    reg.fit(C_train, X_train)
+    X_train_res = X_train - reg.predict(C_train)
+    X_test_res = X_test - reg.predict(C_test)
+
+    auc = train_probe(X_train_res, y_train, X_test_res, y_test, seed)
     return auc
 
 
