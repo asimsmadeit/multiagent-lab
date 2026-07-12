@@ -19,16 +19,27 @@ import copy
 import dataclasses
 from typing import Any
 
-from concordia_mini.agents import entity_agent_with_logging
-from concordia_mini.associative_memory import basic_associative_memory
-from concordia_mini.components import agent as actor_components
-from concordia_mini.components import game_master as gm_components
+from concordia.agents import entity_agent_with_logging
+from concordia.associative_memory import basic_associative_memory
+from concordia.components import agent as actor_components
+from concordia.components import game_master as gm_components
 from negotiation.game_master.components import gm_state
 from negotiation.game_master.components import gm_validation
 from negotiation.game_master.components import gm_modules as gm_modules_registry
-from concordia_mini.language_model import language_model
-from concordia_mini.thought_chains import thought_chains as thought_chains_lib
-from concordia_mini.typing import prefab as prefab_lib
+from concordia.language_model import language_model
+from concordia.components.game_master import event_resolution as thought_chains_lib
+from concordia.typing import prefab as prefab_lib
+
+
+DEFAULT_NEGOTIATION_INSTRUCTIONS = (
+    'You are a professional negotiation mediator. Your role is to:\n'
+    '1. Facilitate negotiations between parties\n'
+    '2. Ensure all offers are properly communicated\n'
+    '3. Validate agreements for feasibility and fairness\n'
+    '4. Track negotiation progress and deadlines\n'
+    '5. Announce when agreements are reached or negotiations fail\n'
+    '6. Maintain neutrality and professionalism'
+)
 
 
 @dataclasses.dataclass
@@ -53,15 +64,7 @@ class NegotiationGameMaster(prefab_lib.Prefab):
           'enable_deadlines': True,
           'enable_batna_validation': True,
           'enable_fairness_check': True,
-          'instructions': (
-              'You are a professional negotiation mediator. Your role is to:\n'
-              '1. Facilitate negotiations between parties\n'
-              '2. Ensure all offers are properly communicated\n'
-              '3. Validate agreements for feasibility and fairness\n'
-              '4. Track negotiation progress and deadlines\n'
-              '5. Announce when agreements are reached or negotiations fail\n'
-              '6. Maintain neutrality and professionalism'
-          ),
+          'instructions': DEFAULT_NEGOTIATION_INSTRUCTIONS,
           'extra_event_resolution_steps': '',
           'extra_components': {},
           'extra_components_index': {},
@@ -103,16 +106,51 @@ class NegotiationGameMaster(prefab_lib.Prefab):
     name = self.params.get('name')
     negotiation_type = self.params.get('negotiation_type', 'price')
     protocol = self.params.get('protocol', 'alternating')
-    max_rounds = self.params.get('max_rounds', 20)
+    max_rounds = int(self.params.get('max_rounds', 20))
     enable_deadlines = self.params.get('enable_deadlines', True)
     enable_batna_validation = self.params.get('enable_batna_validation', True)
     enable_fairness_check = self.params.get('enable_fairness_check', True)
-    custom_instructions = self.params.get('instructions')
+    custom_instructions = self.params.get(
+        'instructions', DEFAULT_NEGOTIATION_INSTRUCTIONS
+    )
 
     # Module support parameters
-    gm_modules = self.params.get('gm_modules', [])
+    gm_modules_value = self.params.get('gm_modules', [])
+    if isinstance(gm_modules_value, str):
+      gm_modules = [
+          value.strip() for value in gm_modules_value.split(',') if value.strip()
+      ]
+    elif isinstance(gm_modules_value, Sequence):
+      gm_modules = [str(value) for value in gm_modules_value]
+    else:
+      raise TypeError('gm_modules must be a comma-separated string or sequence.')
+    gm_modules = list(dict.fromkeys(gm_modules))
     gm_module_configs = self.params.get('gm_module_configs', {})
+    if not isinstance(gm_module_configs, Mapping):
+      raise TypeError('gm_module_configs must be a mapping.')
     auto_detect_modules = self.params.get('auto_detect_modules', False)
+
+    if auto_detect_modules:
+      agent_modules = gm_modules_registry.detect_agent_modules(self.entities)
+      suggested_modules = gm_modules_registry.suggest_gm_modules(agent_modules)
+      gm_modules.extend([m for m in suggested_modules if m not in gm_modules])
+
+    available_modules = set(
+        gm_modules_registry.NegotiationGMModuleRegistry.list_modules()
+    )
+    unknown_modules = set(gm_modules) - available_modules
+    if unknown_modules:
+      raise ValueError(f'Unknown game-master modules: {sorted(unknown_modules)}')
+    invalid_configs = {
+        module_name
+        for module_name, config in gm_module_configs.items()
+        if not isinstance(config, Mapping)
+    }
+    if invalid_configs:
+      raise ValueError(
+          'Each game-master module configuration must be a mapping: '
+          f'{sorted(invalid_configs)}'
+      )
 
     extra_event_resolution_steps = self.params.get(
         'extra_event_resolution_steps', ''
@@ -138,10 +176,12 @@ class NegotiationGameMaster(prefab_lib.Prefab):
     instructions_key = 'instructions'
     instructions = gm_components.instructions.Instructions()
     if custom_instructions:
-      instructions.set_state(custom_instructions)
+      instructions.set_state({'state': str(custom_instructions)})
 
     # Player setup
     player_names = [entity.name for entity in self.entities]
+    if len(player_names) < 2 or len(set(player_names)) != len(player_names):
+      raise ValueError('A negotiation game master requires two unique entities.')
     player_characters_key = 'player_characters'
     player_characters = gm_components.instructions.PlayerCharacters(
         player_characters=player_names,
@@ -191,7 +231,6 @@ class NegotiationGameMaster(prefab_lib.Prefab):
             model=model,
             components=[
                 display_events_key,
-                negotiation_state_key,
             ],
             num_memories_to_retrieve=5,
             pre_act_label='Relevant negotiation context',
@@ -217,6 +256,7 @@ class NegotiationGameMaster(prefab_lib.Prefab):
         model=model,
         player_names=player_names,
         components=observation_components,
+        allow_llm_fallback=False,
         reformat_observations_in_specified_style=(
             'Format negotiation observations as: '
             '"//Round X//[Negotiation Phase] Current situation and any offers".'
@@ -310,12 +350,6 @@ class NegotiationGameMaster(prefab_lib.Prefab):
 
     # Initialize GM modules
     gm_module_instances = {}
-
-    # Auto-detect modules if requested
-    if auto_detect_modules:
-      agent_modules = gm_modules_registry.detect_agent_modules(self.entities)
-      suggested_modules = gm_modules_registry.suggest_gm_modules(agent_modules)
-      gm_modules.extend([m for m in suggested_modules if m not in gm_modules])
 
     # Create module instances
     for module_name in gm_modules:

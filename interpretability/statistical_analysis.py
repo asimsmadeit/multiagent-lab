@@ -86,29 +86,12 @@ def welchs_t_test(group1: List[float], group2: List[float]) -> Tuple[float, floa
     if n1 < 2 or n2 < 2:
         return (0.0, 1.0)
 
-    mean1 = statistics.mean(group1)
-    mean2 = statistics.mean(group2)
-    var1 = statistics.variance(group1)
-    var2 = statistics.variance(group2)
+    from scipy import stats
 
-    # Standard error of difference
-    se = math.sqrt(var1/n1 + var2/n2)
-    if se == 0:
+    result = stats.ttest_ind(group1, group2, equal_var=False)
+    if math.isnan(result.statistic) or math.isnan(result.pvalue):
         return (0.0, 1.0)
-
-    t_stat = (mean1 - mean2) / se
-
-    # Welch-Satterthwaite degrees of freedom
-    num = (var1/n1 + var2/n2)**2
-    denom = (var1/n1)**2/(n1-1) + (var2/n2)**2/(n2-1)
-    df = num / denom if denom > 0 else 1
-
-    # Approximate p-value using normal distribution for large df
-    # (proper implementation would use t-distribution)
-    z = abs(t_stat)
-    p_value = 2 * (1 - _normal_cdf(z))
-
-    return (t_stat, p_value)
+    return (float(result.statistic), float(result.pvalue))
 
 
 def _normal_cdf(x: float) -> float:
@@ -128,11 +111,10 @@ def confidence_interval(
     mean = statistics.mean(data)
     se = statistics.stdev(data) / math.sqrt(n)
 
-    # Z-score for confidence level (approximation)
-    z_scores = {0.90: 1.645, 0.95: 1.96, 0.99: 2.576}
-    z = z_scores.get(confidence, 1.96)
+    from scipy import stats
 
-    margin = z * se
+    critical_value = stats.t.ppf((1.0 + confidence) / 2.0, df=n - 1)
+    margin = critical_value * se
     return (mean - margin, mean + margin)
 
 
@@ -197,19 +179,15 @@ def power_analysis(
     if effect_size == 0:
         return float('inf')
 
-    # Z-scores for alpha and beta
-    z_alpha = 1.96  # two-tailed alpha = 0.05
-    z_beta = 0.84   # power = 0.80
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be between 0 and 1")
+    if not 0 < power < 1:
+        raise ValueError("power must be between 0 and 1")
 
-    if alpha == 0.01:
-        z_alpha = 2.576
-    elif alpha == 0.10:
-        z_alpha = 1.645
+    from scipy import stats
 
-    if power == 0.90:
-        z_beta = 1.28
-    elif power == 0.95:
-        z_beta = 1.645
+    z_alpha = stats.norm.ppf(1.0 - alpha / 2.0)
+    z_beta = stats.norm.ppf(power)
 
     # Sample size formula
     n = 2 * ((z_alpha + z_beta) / effect_size) ** 2
@@ -238,6 +216,7 @@ def one_way_anova(groups: Dict[str, List[float]]) -> Dict[str, Any]:
     One-way ANOVA for comparing multiple groups.
     Returns F-statistic, p-value approximation, and eta-squared.
     """
+    groups = {name: values for name, values in groups.items() if values}
     if len(groups) < 2:
         return {'error': 'Need at least 2 groups'}
 
@@ -285,12 +264,13 @@ def one_way_anova(groups: Dict[str, List[float]]) -> Dict[str, Any]:
     # Effect size (eta-squared)
     eta_squared = ss_between / (ss_between + ss_within)
 
-    # Approximate p-value (rough approximation)
-    # Proper implementation would use F-distribution
-    p_value = 1 / (1 + f_stat) ** 0.5  # Very rough approximation
+    from scipy import stats
+
+    p_value = float(stats.f.sf(f_stat, df_between, df_within))
 
     return {
         'f_statistic': f_stat,
+        'p_value': p_value,
         'p_value_approx': p_value,
         'eta_squared': eta_squared,
         'eta_interpretation': interpret_eta_squared(eta_squared),

@@ -27,23 +27,160 @@
 #   )
 
 import numpy as np
+from numpy.random import default_rng
 import torch
 from typing import Dict, List, Any, Optional, Tuple, Callable
 from dataclasses import dataclass, field
 from sklearn.linear_model import Ridge
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.metrics import r2_score
 import warnings
 
 
+def filter_causal_samples(
+    activations: Dict[Any, Any],
+    labels: Any,
+    metadata: Optional[List[Dict[str, Any]]] = None,
+    *,
+    round_nums: Optional[Any] = None,
+    trial_ids: Optional[Any] = None,
+    pod_ids: Optional[Any] = None,
+) -> Tuple[Dict[Any, np.ndarray], np.ndarray, List[Dict[str, Any]], Optional[np.ndarray]]:
+    """Select real negotiation turns and build trial-level split groups.
+
+    Verification and plausibility probes are separate interventions, not
+    negotiation decisions. Causal tests must therefore exclude them from both
+    direction estimation and statistical controls. Legacy datasets may lack
+    ``sample_type``; in that case ``round_num >= 0`` is the compatibility rule.
+
+    Returns filtered activations, labels, metadata, and composite
+    ``pod_id:trial_id`` group identifiers (when trial IDs are available).
+    """
+    label_array = np.asarray(labels)
+    if label_array.ndim != 1:
+        raise ValueError(f"labels must be one-dimensional, got {label_array.shape}")
+    n_samples = len(label_array)
+
+    metadata_rows = list(metadata or [])
+    if metadata_rows and len(metadata_rows) != n_samples:
+        raise ValueError(
+            f"metadata has {len(metadata_rows)} rows, expected {n_samples}"
+        )
+
+    def _optional_array(values: Optional[Any], name: str) -> Optional[np.ndarray]:
+        if values is None:
+            return None
+        array = np.asarray(values)
+        if len(array) != n_samples:
+            raise ValueError(f"{name} has {len(array)} rows, expected {n_samples}")
+        return array
+
+    round_array = _optional_array(round_nums, "round_nums")
+    trial_array = _optional_array(trial_ids, "trial_ids")
+    pod_array = _optional_array(pod_ids, "pod_ids")
+
+    keep = np.ones(n_samples, dtype=bool)
+    if metadata_rows and any("sample_type" in row for row in metadata_rows):
+        keep = np.array([
+            row.get("sample_type", "negotiation") == "negotiation"
+            for row in metadata_rows
+        ])
+    elif round_array is not None:
+        keep = round_array.astype(float) >= 0
+    elif metadata_rows and any("round_num" in row for row in metadata_rows):
+        keep = np.array([
+            row.get("round_num", 0) is None or row.get("round_num", 0) >= 0
+            for row in metadata_rows
+        ])
+
+    if not keep.any():
+        raise ValueError("No negotiation samples remain after causal-data filtering")
+
+    filtered_activations: Dict[Any, np.ndarray] = {}
+    for layer, values in activations.items():
+        if isinstance(values, torch.Tensor):
+            array = values.detach().cpu().float().numpy()
+        else:
+            array = np.asarray(values)
+        if array.shape[0] != n_samples:
+            raise ValueError(
+                f"activation layer {layer!r} has {array.shape[0]} rows, "
+                f"expected {n_samples}"
+            )
+        filtered_activations[layer] = array[keep]
+
+    filtered_labels = label_array[keep]
+    filtered_metadata = (
+        [row for row, selected in zip(metadata_rows, keep) if selected]
+        if metadata_rows
+        else []
+    )
+
+    if trial_array is None and metadata_rows and all(
+        row.get("trial_id") is not None for row in metadata_rows
+    ):
+        trial_array = np.asarray([row["trial_id"] for row in metadata_rows])
+    if pod_array is None and metadata_rows:
+        pod_array = np.asarray([row.get("pod_id", 0) for row in metadata_rows])
+
+    group_ids = None
+    if trial_array is not None:
+        if pod_array is None:
+            pod_array = np.zeros(n_samples, dtype=int)
+        group_ids = np.asarray([
+            f"{pod_id}:{trial_id}"
+            for pod_id, trial_id in zip(pod_array[keep], trial_array[keep])
+        ])
+
+    return filtered_activations, filtered_labels, filtered_metadata, group_ids
+
+
+def _split_train_test_indices(
+    n_samples: int,
+    *,
+    groups: Optional[Any] = None,
+    test_size: float = 0.2,
+    random_state: int = 42,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return a reproducible split, preserving whole trials when available."""
+    if n_samples < 3:
+        raise ValueError("At least three samples are required for a train/test split")
+
+    indices = np.arange(n_samples)
+    if groups is None:
+        train_idx, test_idx = train_test_split(
+            indices, test_size=test_size, random_state=random_state
+        )
+    else:
+        group_array = np.asarray(groups)
+        if len(group_array) != n_samples:
+            raise ValueError(
+                f"groups has {len(group_array)} rows, expected {n_samples}"
+            )
+        if len(np.unique(group_array)) < 2:
+            raise ValueError("At least two distinct trial groups are required")
+        splitter = GroupShuffleSplit(
+            n_splits=1, test_size=test_size, random_state=random_state
+        )
+        train_idx, test_idx = next(splitter.split(indices, groups=group_array))
+
+    if len(train_idx) < 2 or len(test_idx) < 2:
+        raise ValueError(
+            "Train and test partitions must each contain at least two samples"
+        )
+    return np.asarray(train_idx), np.asarray(test_idx)
+
+
 def _to_serializable(obj: Any) -> Any:
     """Convert numpy/scalar containers to JSON-serializable Python primitives."""
-    if isinstance(obj, (np.bool_, np.bool8)):
+    if isinstance(obj, np.bool_):
         return bool(obj)
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
         return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
     if isinstance(obj, dict):
         return {k: _to_serializable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -223,6 +360,7 @@ def activation_patching_test(
     patch_magnitude: float = 2.0,
     n_samples: int = 20,
     verbose: bool = True,
+    random_state: int = 42,
 ) -> CausalValidationResult:
     """
     Activation Patching Test: Swap activations and measure behavioral change.
@@ -367,9 +505,10 @@ def activation_patching_test(
     # Generate same number of random samples as real test (add + sub combined)
     n_random = len(logit_changes_add) + len(logit_changes_sub)
     random_changes = []
+    rng = np.random.default_rng(random_state)
     for i in range(n_random):
         try:
-            random_dir = np.random.randn(len(direction))
+            random_dir = rng.standard_normal(len(direction))
             random_dir = random_dir / np.linalg.norm(random_dir)
             random_tensor = torch.tensor(random_dir, dtype=model_dtype)
 
@@ -424,6 +563,7 @@ def activation_patching_test(
             "random_baseline": float(np.mean(random_changes)) if random_changes else None,
             "effect_ratio": float(effect_ratio) if random_changes else None,
             "direction_metadata": dir_metadata,
+            "random_state": random_state,
         },
         message=f"Effect size: {overall_effect:.3f}, Ratio vs random: {effect_ratio:.2f}x" if random_changes else f"Effect size: {overall_effect:.3f}",
     )
@@ -453,6 +593,7 @@ def cross_sample_patching_test(
     metadata: List[Dict[str, Any]] = None,
     n_pairs: int = 10,
     verbose: bool = True,
+    random_state: int = 42,
 ) -> CausalValidationResult:
     """
     Cross-Sample Activation Patching (D11): Swap actual activations between
@@ -527,6 +668,7 @@ def cross_sample_patching_test(
 
     # Build matched pairs: prefer same-scenario pairs if metadata available
     pairs = []
+    rng = np.random.default_rng(random_state)
     if metadata is not None:
         # Group by scenario for matched pairing
         scenario_honest = {}
@@ -551,8 +693,8 @@ def cross_sample_patching_test(
 
     # Fill remaining pairs with random matching
     while len(pairs) < n_pairs and len(honest_idxs) > 0 and len(deceptive_idxs) > 0:
-        h_idx = np.random.choice(honest_idxs)
-        d_idx = np.random.choice(deceptive_idxs)
+        h_idx = rng.choice(honest_idxs)
+        d_idx = rng.choice(deceptive_idxs)
         pairs.append((int(h_idx), int(d_idx)))
 
     if verbose:
@@ -667,7 +809,7 @@ def cross_sample_patching_test(
             # Use a different honest sample
             other_h_idxs = [i for i in honest_idxs if i != h_idx]
             if other_h_idxs:
-                ctrl_idx = np.random.choice(other_h_idxs)
+                ctrl_idx = rng.choice(other_h_idxs)
                 ctrl_activation = torch.tensor(X[ctrl_idx], dtype=model_dtype)
                 ctrl_dir_proj = (ctrl_activation @ dec_dir_tensor).item()
 
@@ -747,6 +889,7 @@ def cross_sample_patching_test(
             "effect_ratio_vs_control": float(effect_ratio) if effect_ratio != float('inf') else None,
             "n_pairs_tested": len(d_into_h_kl),
             "n_control_tested": len(control_kl),
+            "random_state": random_state,
         },
         message=(
             f"Cross-class KL: {cross_class_effect:.3f}, "
@@ -781,6 +924,7 @@ def ablation_test(
     ablation_method: str = "directional",  # "zero", "mean", "noise", "directional"
     n_samples: int = 20,
     verbose: bool = True,
+    random_state: int = 42,
 ) -> CausalValidationResult:
     """
     Ablation Test: Remove/scramble layer activations and measure impact.
@@ -846,6 +990,7 @@ def ablation_test(
 
     # Test on prompts
     kl_divergences = []
+    rng = np.random.default_rng(random_state)
 
     n_test = min(n_samples, len(test_prompts))
 
@@ -876,7 +1021,7 @@ def ablation_test(
                     return activation
             elif ablation_method == "noise":
                 noise = torch.tensor(
-                    np.random.randn(X.shape[1]) * noise_std + noise_mean,
+                    rng.standard_normal(X.shape[1]) * noise_std + noise_mean,
                     dtype=model_dtype
                 )
 
@@ -939,6 +1084,7 @@ def ablation_test(
             "std_kl_divergence": float(std_kl),
             "ablation_method": ablation_method,
             "kl_values": [float(k) for k in kl_divergences[:10]],  # First 10
+            "random_state": random_state,
         },
         message=f"KL divergence: {mean_kl:.3f} +/- {std_kl:.3f} (threshold: {'0.01' if ablation_method == 'directional' else '0.5'})",
     )
@@ -1308,8 +1454,8 @@ def steering_behavioral_test(
 
     random_sweep = None
     if random_direction_control:
-        rng = np.random.RandomState(random_state)
-        random_dir = rng.randn(len(steering_vector.direction))
+        rng = default_rng(random_state)
+        random_dir = rng.standard_normal(len(steering_vector.direction))
         random_dir = random_dir / (np.linalg.norm(random_dir) + 1e-8)
         # Match the norm of the deception direction for a fair comparison
         dec_norm = float(np.linalg.norm(steering_vector.direction))
@@ -1360,7 +1506,7 @@ def steering_behavioral_test(
         return float((rx * ry).sum() / denom)
 
     spearman_rho = _spearman(mags_arr, rates_arr)
-    rng_perm = np.random.RandomState(random_state + 1)
+    rng_perm = default_rng(random_state + 1)
     n_extreme = 0
     for _ in range(n_perm):
         shuffled = rng_perm.permutation(rates_arr)
@@ -1448,6 +1594,7 @@ def probe_faithfulness_test(
     n_ablations: int = 100,
     verbose: bool = True,
     random_state: int = 42,
+    groups: Optional[Any] = None,
 ) -> CausalValidationResult:
     """
     Probe Faithfulness Test: Check if probe relies on meaningful features.
@@ -1468,6 +1615,8 @@ def probe_faithfulness_test(
         n_ablations: Number of top dimensions to ablate
         verbose: Print progress
         random_state: Random seed for reproducibility (default 42)
+        groups: Optional trial/dyad group identifiers. When supplied, no group
+            can occur in both train and test partitions.
 
     Returns:
         CausalValidationResult
@@ -1481,8 +1630,28 @@ def probe_faithfulness_test(
     if hasattr(X, 'numpy'):
         X = X.numpy()
 
-    # Train baseline probe (use random_state for reproducibility)
-    X_train, X_test, y_train, y_test = train_test_split(X, labels, test_size=0.2, random_state=random_state)
+    labels = np.asarray(labels)
+    if len(X) != len(labels):
+        raise ValueError(
+            f"Activation rows ({len(X)}) do not match labels ({len(labels)})"
+        )
+
+    try:
+        train_idx, test_idx = _split_train_test_indices(
+            len(labels), groups=groups, random_state=random_state
+        )
+    except ValueError as exc:
+        return CausalValidationResult(
+            test_name="probe_faithfulness",
+            passed=False,
+            effect_size=0.0,
+            n_samples_tested=0,
+            details={"split_unit": "trial" if groups is not None else "sample"},
+            message=f"Invalid train/test split: {exc}",
+        )
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = labels[train_idx], labels[test_idx]
 
     probe = Ridge(alpha=100.0)
     probe.fit(X_train, y_train)
@@ -1502,7 +1671,7 @@ def probe_faithfulness_test(
     X_ablated = X.copy()
     X_ablated[:, top_dims] = 0
 
-    X_train_abl, X_test_abl, _, _ = train_test_split(X_ablated, labels, test_size=0.2, random_state=random_state)
+    X_train_abl, X_test_abl = X_ablated[train_idx], X_ablated[test_idx]
 
     probe_ablated = Ridge(alpha=100.0)
     probe_ablated.fit(X_train_abl, y_train)
@@ -1510,10 +1679,10 @@ def probe_faithfulness_test(
 
     # Performance drop
     r2_drop = baseline_r2 - ablated_r2
-    relative_drop = r2_drop / (baseline_r2 + 1e-8)
+    relative_drop = r2_drop / max(abs(baseline_r2), 1e-8)
 
     # Probe is faithful if ablating top dims hurts performance
-    passed = relative_drop > 0.2  # At least 20% relative drop
+    passed = baseline_r2 > 0 and relative_drop > 0.2
 
     result = CausalValidationResult(
         test_name="probe_faithfulness",
@@ -1527,6 +1696,15 @@ def probe_faithfulness_test(
             "relative_drop": float(relative_drop),
             "n_dims_ablated": n_ablations,
             "top_dims": top_dims.tolist(),
+            "split_unit": "trial" if groups is not None else "sample",
+            "n_train_groups": (
+                int(len(np.unique(np.asarray(groups)[train_idx])))
+                if groups is not None else None
+            ),
+            "n_test_groups": (
+                int(len(np.unique(np.asarray(groups)[test_idx])))
+                if groups is not None else None
+            ),
         },
         message=f"R² drop: {r2_drop:.3f} ({relative_drop*100:.1f}% relative)",
     )
@@ -1551,6 +1729,7 @@ def selectivity_test(
     subset_size: int = 50,
     verbose: bool = True,
     random_state: int = 42,
+    groups: Optional[Any] = None,
 ) -> CausalValidationResult:
     """
     Selectivity Test: Random feature subsets should perform at chance.
@@ -1566,6 +1745,8 @@ def selectivity_test(
         subset_size: Size of each random subset
         verbose: Print progress
         random_state: Random seed for reproducibility (default 42)
+        groups: Optional trial/dyad group identifiers. When supplied, no group
+            can occur in both train and test partitions.
 
     Returns:
         CausalValidationResult
@@ -1579,14 +1760,38 @@ def selectivity_test(
     if hasattr(X, 'numpy'):
         X = X.numpy()
 
+    labels = np.asarray(labels)
+    if len(X) != len(labels):
+        raise ValueError(
+            f"Activation rows ({len(X)}) do not match labels ({len(labels)})"
+        )
+
+    try:
+        train_idx, test_idx = _split_train_test_indices(
+            len(labels), groups=groups, random_state=random_state
+        )
+    except ValueError as exc:
+        return CausalValidationResult(
+            test_name="selectivity",
+            passed=False,
+            effect_size=0.0,
+            n_samples_tested=0,
+            details={"split_unit": "trial" if groups is not None else "sample"},
+            message=f"Invalid train/test split: {exc}",
+        )
+
     random_r2s = []
+    rng = default_rng(random_state)
 
     for i in range(n_random_subsets):
         # Random subset of features
-        random_dims = np.random.choice(X.shape[1], size=min(subset_size, X.shape[1]), replace=False)
+        random_dims = rng.choice(
+            X.shape[1], size=min(subset_size, X.shape[1]), replace=False
+        )
         X_subset = X[:, random_dims]
 
-        X_train, X_test, y_train, y_test = train_test_split(X_subset, labels, test_size=0.2, random_state=random_state+i)
+        X_train, X_test = X_subset[train_idx], X_subset[test_idx]
+        y_train, y_test = labels[train_idx], labels[test_idx]
 
         probe = Ridge(alpha=100.0)
         probe.fit(X_train, y_train)
@@ -1609,6 +1814,15 @@ def selectivity_test(
             "std_random_r2": float(std_random_r2),
             "max_random_r2": float(np.max(random_r2s)),
             "subset_size": subset_size,
+            "split_unit": "trial" if groups is not None else "sample",
+            "n_train_groups": (
+                int(len(np.unique(np.asarray(groups)[train_idx])))
+                if groups is not None else None
+            ),
+            "n_test_groups": (
+                int(len(np.unique(np.asarray(groups)[test_idx])))
+                if groups is not None else None
+            ),
         },
         message=f"Random subset R²: {mean_random_r2:.3f} +/- {std_random_r2:.3f} (should be < 0.1)",
     )
@@ -1631,8 +1845,11 @@ def run_full_causal_validation(
     labels: np.ndarray,
     best_layer: int,
     test_prompts: List[str] = None,
+    sample_prompts: List[str] = None,
     metadata: List[Dict[str, Any]] = None,
+    group_ids: Optional[Any] = None,
     verbose: bool = True,
+    random_state: int = 42,
 ) -> Dict[str, Any]:
     """
     Run comprehensive causal validation suite.
@@ -1645,8 +1862,13 @@ def run_full_causal_validation(
         labels: Deception labels (GM ground truth)
         best_layer: Best layer from probe training
         test_prompts: Prompts for intervention tests
+        sample_prompts: Exact prompts aligned one-to-one with activation rows;
+            required for cross-sample patching.
         metadata: Per-sample metadata dicts (for matched pairing in cross-sample patching)
+        group_ids: Trial/dyad identifiers used to prevent turn-level leakage in
+            probe-based controls.
         verbose: Print progress
+        random_state: Seed shared across randomized controls
 
     Returns:
         Dict with all test results and overall assessment
@@ -1668,12 +1890,20 @@ def run_full_causal_validation(
         "n_tests_passed": 0,
         "n_tests_total": 0,
         "causal_evidence_strength": "none",
+        "sampling_controls": {
+            "random_state": int(random_state),
+            "split_unit": "trial" if group_ids is not None else "sample",
+            "cross_sample_prompt_alignment_required": True,
+        },
     }
 
     # Test 1: Selectivity (no model needed)
     if verbose:
         print("\n" + "-" * 60)
-    selectivity_result = selectivity_test(activations, labels, best_layer, verbose=verbose)
+    selectivity_result = selectivity_test(
+        activations, labels, best_layer, verbose=verbose,
+        groups=group_ids, random_state=random_state,
+    )
     results["tests"]["selectivity"] = selectivity_result.to_dict()
     results["n_tests_total"] += 1
     if selectivity_result.passed:
@@ -1682,7 +1912,10 @@ def run_full_causal_validation(
     # Test 2: Probe faithfulness (no model needed)
     if verbose:
         print("\n" + "-" * 60)
-    faithfulness_result = probe_faithfulness_test(activations, labels, best_layer, verbose=verbose)
+    faithfulness_result = probe_faithfulness_test(
+        activations, labels, best_layer, verbose=verbose,
+        groups=group_ids, random_state=random_state,
+    )
     results["tests"]["probe_faithfulness"] = faithfulness_result.to_dict()
     results["n_tests_total"] += 1
     if faithfulness_result.passed:
@@ -1694,7 +1927,8 @@ def run_full_causal_validation(
         if verbose:
             print("\n" + "-" * 60)
         patching_result = activation_patching_test(
-            model, activations, labels, best_layer, test_prompts, verbose=verbose
+            model, activations, labels, best_layer, test_prompts,
+            verbose=verbose, random_state=random_state,
         )
         results["tests"]["activation_patching"] = patching_result.to_dict()
         results["n_tests_total"] += 1
@@ -1705,7 +1939,8 @@ def run_full_causal_validation(
         if verbose:
             print("\n" + "-" * 60)
         ablation_result = ablation_test(
-            model, activations, labels, best_layer, test_prompts, verbose=verbose
+            model, activations, labels, best_layer, test_prompts,
+            verbose=verbose, random_state=random_state,
         )
         results["tests"]["ablation"] = ablation_result.to_dict()
         results["n_tests_total"] += 1
@@ -1750,6 +1985,7 @@ def run_full_causal_validation(
                     scenario=scenario,
                     scenario_params_list=scenario_params_list,
                     verbose=verbose,
+                    random_state=random_state,
                 )
                 results["tests"]["steering_behavioral"] = beh_result.to_dict()
                 results["n_tests_total"] += 1
@@ -1768,24 +2004,36 @@ def run_full_causal_validation(
         # Test 6: Cross-sample activation patching (D11)
         if verbose:
             print("\n" + "-" * 60)
-        try:
-            cross_patch_result = cross_sample_patching_test(
-                model, activations, labels, best_layer, test_prompts,
-                metadata=metadata, verbose=verbose,
-            )
-            results["tests"]["cross_sample_patching"] = cross_patch_result.to_dict()
-            results["n_tests_total"] += 1
-            if cross_patch_result.passed:
-                results["n_tests_passed"] += 1
-        except Exception as e:
-            if verbose:
-                print(f"Cross-sample patching test failed: {e}")
+        if sample_prompts is None or len(sample_prompts) != len(labels):
             results["tests"]["cross_sample_patching"] = {
                 "test_name": "cross_sample_patching",
                 "passed": False,
-                "message": str(e),
+                "skipped": True,
+                "message": (
+                    "Skipped: requires one exact generation prompt per "
+                    "activation row"
+                ),
             }
-            results["n_tests_total"] += 1
+        else:
+            try:
+                cross_patch_result = cross_sample_patching_test(
+                    model, activations, labels, best_layer, sample_prompts,
+                    metadata=metadata, verbose=verbose,
+                    random_state=random_state,
+                )
+                results["tests"]["cross_sample_patching"] = cross_patch_result.to_dict()
+                results["n_tests_total"] += 1
+                if cross_patch_result.passed:
+                    results["n_tests_passed"] += 1
+            except Exception as e:
+                if verbose:
+                    print(f"Cross-sample patching test failed: {e}")
+                results["tests"]["cross_sample_patching"] = {
+                    "test_name": "cross_sample_patching",
+                    "passed": False,
+                    "message": str(e),
+                }
+                results["n_tests_total"] += 1
 
     # Overall assessment
     pass_rate = results["n_tests_passed"] / results["n_tests_total"] if results["n_tests_total"] > 0 else 0
@@ -1815,7 +2063,11 @@ def run_full_causal_validation(
 
         print("\nIndividual tests:")
         for test_name, test_result in results["tests"].items():
-            status = "PASSED" if test_result["passed"] else "FAILED"
+            status = (
+                "SKIPPED" if test_result.get("skipped")
+                else "PASSED" if test_result["passed"]
+                else "FAILED"
+            )
             msg = test_result.get("message", "")
             print(f"  {test_name}: {status} - {msg}")
 
@@ -1848,10 +2100,11 @@ if __name__ == "__main__":
     d_model = 256
 
     # Fake activations with some signal
-    np.random.seed(42)
-    labels = np.random.rand(n_samples)
+    rng = np.random.default_rng(42)
+    labels = rng.random(n_samples)
     activations = {
-        12: np.random.randn(n_samples, d_model) + np.outer(labels, np.random.randn(d_model)) * 0.5
+        12: rng.standard_normal((n_samples, d_model))
+        + np.outer(labels, rng.standard_normal(d_model)) * 0.5
     }
 
     # Test non-model-based functions

@@ -161,6 +161,8 @@ class SocialIntelligenceGM(gm_modules.NegotiationGMModule):
       actor: str,
       statement: str,
       round_number: int,
+      *,
+      record: bool = True,
   ) -> Optional[DeceptionIndicator]:
     """Check for inconsistencies that might indicate deception."""
     if not self._detect_deception:
@@ -215,12 +217,13 @@ class SocialIntelligenceGM(gm_modules.NegotiationGMModule):
               )
 
     # Store current claims
-    for claim_type, claim_text in current_claims:
-      self._consistency_tracking[actor].append({
-          'type': claim_type,
-          'text': claim_text,
-          'round': round_number,
-      })
+    if record:
+      for claim_type, claim_text in current_claims:
+        self._consistency_tracking[actor].append({
+            'type': claim_type,
+            'text': claim_text,
+            'round': round_number,
+        })
 
     return None
 
@@ -284,7 +287,12 @@ class SocialIntelligenceGM(gm_modules.NegotiationGMModule):
         return False, "Escalating when already emotional may damage negotiation"
 
     # Check for manipulation attempts
-    deception = self.check_consistency(actor, action, context.current_round)
+    deception = self.check_consistency(
+        actor,
+        action,
+        context.current_round,
+        record=False,
+    )
     if deception and deception.severity > 0.8:
       return False, f"Potential deception detected: {deception.description}"
 
@@ -321,12 +329,18 @@ class SocialIntelligenceGM(gm_modules.NegotiationGMModule):
 
           # Similar emotions increase rapport
           if actor_emotion.primary_emotion == participant_emotion.primary_emotion:
-            self._rapport_levels[key] = self._rapport_levels.get(key, 0.5) + 0.05
+            self._rapport_levels[key] = min(
+                1.0,
+                self._rapport_levels.get(key, 0.5) + 0.05,
+            )
 
           # Responding to negative emotions with empathy
           if (participant_emotion.valence < 0 and
               any(word in event.lower() for word in ['understand', 'appreciate', 'acknowledge'])):
-            self._empathy_scores[key] = self._empathy_scores.get(key, 0.5) + 0.1
+            self._empathy_scores[key] = min(
+                1.0,
+                self._empathy_scores.get(key, 0.5) + 0.1,
+            )
 
         # Update mental models
         self.update_mental_model(actor, participant, event)
@@ -429,22 +443,74 @@ class SocialIntelligenceGM(gm_modules.NegotiationGMModule):
 
     return report
 
-  def get_state(self) -> str:
-    """Get the component state for saving/restoring."""
-    state_dict = {
-        'emotions': len(self._emotional_history),
-        'models': len(self._mental_models),
-        'deception': len(self._deception_indicators),
-        'empathy': len(self._empathy_scores),
-        'rapport': len(self._rapport_levels),
+  def get_state(self) -> Dict[str, Any]:
+    """Return complete social tracking state."""
+    return {
+        'base': self._get_base_state(),
+        'emotional_history': [
+            dataclasses.asdict(reading) for reading in self._emotional_history
+        ],
+        'current_emotions': {
+            participant: dataclasses.asdict(reading)
+            for participant, reading in self._current_emotions.items()
+        },
+        'mental_models': [
+            dataclasses.asdict(model) for model in self._mental_models.values()
+        ],
+        'deception_indicators': [
+            dataclasses.asdict(indicator)
+            for indicator in self._deception_indicators
+        ],
+        'consistency_tracking': {
+            actor: [dict(claim) for claim in claims]
+            for actor, claims in self._consistency_tracking.items()
+        },
+        'empathy_scores': [
+            {'parties': list(parties), 'score': score}
+            for parties, score in self._empathy_scores.items()
+        ],
+        'rapport_levels': [
+            {'parties': list(parties), 'score': score}
+            for parties, score in self._rapport_levels.items()
+        ],
     }
-    return str(state_dict)
 
-  def set_state(self, state: str) -> None:
-    """Set the component state from a saved string."""
-    # Since this tracks dynamic data, we only restore basic structure
-    # Full restoration would require serializing all tracking data
-    pass
+  def set_state(self, state: Dict[str, Any]) -> None:
+    """Restore complete social tracking state."""
+    if not isinstance(state, dict):
+      raise TypeError('Social GM state must be a mapping.')
+    self._set_base_state(state)
+    self._emotional_history = [
+        EmotionalReading(**reading)
+        for reading in state.get('emotional_history', [])
+    ]
+    self._current_emotions = {
+        str(participant): EmotionalReading(**reading)
+        for participant, reading in state.get('current_emotions', {}).items()
+    }
+    models = [
+        MentalModelSnapshot(**model)
+        for model in state.get('mental_models', [])
+    ]
+    self._mental_models = {
+        (model.modeler, model.subject): model for model in models
+    }
+    self._deception_indicators = [
+        DeceptionIndicator(**indicator)
+        for indicator in state.get('deception_indicators', [])
+    ]
+    self._consistency_tracking = {
+        str(actor): [dict(claim) for claim in claims]
+        for actor, claims in state.get('consistency_tracking', {}).items()
+    }
+    self._empathy_scores = {
+        tuple(item['parties']): float(item['score'])
+        for item in state.get('empathy_scores', [])
+    }
+    self._rapport_levels = {
+        tuple(item['parties']): float(item['score'])
+        for item in state.get('rapport_levels', [])
+    }
 
 
 # Register the module

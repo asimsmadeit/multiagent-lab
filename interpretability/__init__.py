@@ -74,6 +74,7 @@ from .statistical_analysis import (
 from .llm_evaluation import (
     LLMAgentRunner,
     LLMAgentConfig,
+    ALL_MODULES,
     create_mock_model,
     create_ollama_model,
     create_remote_ollama_model,
@@ -194,10 +195,7 @@ __all__ = [
     'RealityGameshowScenario',
     'create_scenario',
     # Harness
-    'ExperimentRunner',
-    'ExperimentConfig',
     'ALL_MODULES',
-    'create_ablation_configs',
     # Baselines
     'RandomAgent',
     'FixedStrategyAgent',

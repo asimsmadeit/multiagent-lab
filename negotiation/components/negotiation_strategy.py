@@ -2,11 +2,14 @@
 
 import abc
 import dataclasses
-from typing import Dict, List, Optional, Tuple
+import math
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional, Tuple
 
-from concordia_mini.typing import entity_component
+from concordia.typing import entity_component
 
 from config.agents.negotiation import StrategyConfig
+from negotiation.utils.parsing import contains_offer, parse_offer_value
 
 
 @dataclasses.dataclass
@@ -204,6 +207,14 @@ class BasicNegotiationStrategy(entity_component.ContextComponent):
             target_value: Ideal outcome value
             verbose: Whether to print debug information
         """
+        if negotiation_style not in {'cooperative', 'competitive', 'integrative'}:
+            raise ValueError(
+                'negotiation_style must be cooperative, competitive, or integrative.'
+            )
+        if not math.isfinite(reservation_value) or not math.isfinite(target_value):
+            raise ValueError('reservation_value and target_value must be finite.')
+        if target_value < reservation_value:
+            raise ValueError('target_value must be at least the reservation_value.')
         self._agent_name = agent_name
         self._style = negotiation_style
         self._reservation_value = reservation_value
@@ -291,38 +302,18 @@ class BasicNegotiationStrategy(entity_component.ContextComponent):
     def pre_observe(self, observation: str) -> str:
         """Process strategic observations."""
         # Enhanced parsing to detect opponent offers and extract values
-        if 'offer' in observation.lower():
+        if contains_offer(observation):
             parsed_value = self._parse_offer_value(observation)
             if parsed_value is not None:
                 self._last_opponent_offer = parsed_value
                 # Adjust our strategy based on the offer
                 self._adjust_strategy_for_offer(parsed_value)
-            self.update_state()
+                self.update_state(parsed_value)
         return ""
     
     def _parse_offer_value(self, text: str) -> Optional[float]:
         """Parse monetary values from text."""
-        import re
-        
-        # Look for currency amounts like $150, 150.00, USD 150, etc.
-        patterns = [
-            r'\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # $150, $1,200.50
-            r'(\d+(?:,\d{3})*(?:\.\d{2})?)\s*(?:dollars?|USD|\$)',  # 150 dollars, 150 USD
-            r'(?:USD|dollars?)\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # USD 150
-            r'\b(\d+(?:,\d{3})*(?:\.\d{2})?)\b',  # Plain numbers as fallback
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                # Take the first match and clean it
-                value_str = matches[0].replace(',', '')
-                try:
-                    return float(value_str)
-                except ValueError:
-                    continue
-        
-        return None
+        return parse_offer_value(text)
     
     def _adjust_strategy_for_offer(self, offer_value: float) -> None:
         """Adjust strategy based on opponent's offer."""
@@ -351,13 +342,52 @@ class BasicNegotiationStrategy(entity_component.ContextComponent):
         """Component name."""
         return 'BasicNegotiationStrategy'
 
-    def get_state(self) -> str:
+    def get_state(self) -> Dict[str, Any]:
         """Get the component state for saving/restoring."""
-        return f'{self._state.current_position}|{self._state.rounds_elapsed}'
+        return {
+            'current_position': self._state.current_position,
+            'opponent_position': self._state.opponent_position,
+            'rounds_elapsed': self._state.rounds_elapsed,
+            'concessions_made': list(self._state.concessions_made),
+            'zone_of_agreement': (
+                list(self._state.zone_of_agreement)
+                if self._state.zone_of_agreement is not None else None
+            ),
+            'negotiation_temperature': self._state.negotiation_temperature,
+            'target_value': self._target_value,
+            'last_opponent_offer': self._last_opponent_offer,
+        }
 
-    def set_state(self, state: str) -> None:
+    def set_state(self, state: Mapping[str, Any] | str) -> None:
         """Set the component state from a saved string."""
-        if '|' in state:
+        if isinstance(state, str) and '|' in state:
             position, rounds = state.split('|', 1)
             self._state.current_position = float(position)
             self._state.rounds_elapsed = int(rounds)
+            return
+        if not isinstance(state, Mapping):
+            raise TypeError('Strategy state must be a mapping or legacy string.')
+        self._state.current_position = float(
+            state.get('current_position', self._state.current_position)
+        )
+        self._state.opponent_position = float(
+            state.get('opponent_position', self._state.opponent_position)
+        )
+        self._state.rounds_elapsed = int(
+            state.get('rounds_elapsed', self._state.rounds_elapsed)
+        )
+        self._state.concessions_made = [
+            float(value) for value in state.get('concessions_made', [])
+        ]
+        zone = state.get('zone_of_agreement')
+        self._state.zone_of_agreement = (
+            (float(zone[0]), float(zone[1])) if zone is not None else None
+        )
+        self._state.negotiation_temperature = float(
+            state.get('negotiation_temperature', self._state.negotiation_temperature)
+        )
+        self._target_value = float(state.get('target_value', self._target_value))
+        last_offer = state.get('last_opponent_offer')
+        self._last_opponent_offer = (
+            float(last_offer) if last_offer is not None else None
+        )

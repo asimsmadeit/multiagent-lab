@@ -11,12 +11,40 @@
 
 import logging
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
 logger = logging.getLogger(__name__)
+
+
+def _split_indices(
+    X: np.ndarray,
+    y: np.ndarray,
+    random_state: int,
+    groups: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Create a row or group-disjoint split for sanity checks."""
+    indices = np.arange(len(y))
+    if len(X) != len(y):
+        raise ValueError("X and y must contain the same number of samples")
+    if groups is None:
+        return train_test_split(
+            indices, test_size=0.2, random_state=random_state
+        )
+
+    from sklearn.model_selection import GroupShuffleSplit
+
+    groups = np.asarray(groups)
+    if len(groups) != len(y):
+        raise ValueError("groups must have one value per sample")
+    if len(np.unique(groups)) < 2:
+        raise ValueError("group-aware splitting requires at least two groups")
+    splitter = GroupShuffleSplit(
+        n_splits=1, test_size=0.2, random_state=random_state
+    )
+    return next(splitter.split(X, y, groups=groups))
 
 
 # =============================================================================
@@ -28,6 +56,7 @@ def sanity_check_random_labels(
     y: np.ndarray,
     n_shuffles: int = 5,
     random_state: int = 42,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Check 1: Probes on shuffled labels should give R² ≈ 0.
@@ -41,13 +70,14 @@ def sanity_check_random_labels(
     """
     shuffle_r2s = []
 
+    rng = np.random.default_rng(random_state)
     for seed in range(n_shuffles):
-        np.random.seed(seed)
-        y_shuffled = np.random.permutation(y)
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y_shuffled, test_size=0.2, random_state=random_state
+        y_shuffled = rng.permutation(y)
+        train_idx, test_idx = _split_indices(
+            X, y_shuffled, random_state + seed, groups=groups
         )
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y_shuffled[train_idx], y_shuffled[test_idx]
 
         probe = Ridge(alpha=1.0)
         probe.fit(X_train, y_train)
@@ -68,6 +98,7 @@ def sanity_check_train_test_gap(
     X: np.ndarray,
     y: np.ndarray,
     random_state: int = 42,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Check 2: Large train-test gap indicates overfitting.
@@ -77,9 +108,11 @@ def sanity_check_train_test_gap(
         y: Labels [N]
         random_state: Random seed for train/test split
     """
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state
+    train_idx, test_idx = _split_indices(
+        X, y, random_state, groups=groups
     )
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
 
     probe = Ridge(alpha=1.0)
     probe.fit(X_train, y_train)
@@ -117,6 +150,7 @@ def sanity_check_layer_0_baseline(
     activations: Dict[int, np.ndarray],
     y: np.ndarray,
     random_state: int = 42,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Check 4: Layer 0 should have lower R² than mid-layers.
@@ -135,15 +169,23 @@ def sanity_check_layer_0_baseline(
             "message": "Layer 0 not in activations, skipping check"
         }
 
+    split_X = activations[layers[0]]
+    if hasattr(split_X, 'detach'):
+        split_X = split_X.detach().cpu().numpy()
+    else:
+        split_X = np.asarray(split_X)
+    y = np.asarray(y)
+    train_idx, test_idx = _split_indices(
+        split_X, y, random_state, groups=groups
+    )
     layer_r2s = {}
     for layer in layers:
         X = activations[layer]
         if hasattr(X, 'numpy'):
-            X = X.numpy()
+            X = X.detach().cpu().numpy()
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=random_state
-        )
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
 
         probe = Ridge(alpha=1.0)
         probe.fit(X_train, y_train)
@@ -170,6 +212,7 @@ def run_all_sanity_checks(
     gm_labels: np.ndarray,
     verbose: bool = True,
     random_state: int = 42,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Run all 4 sanity checks.
@@ -185,13 +228,15 @@ def run_all_sanity_checks(
     """
     # Get mid-layer activations for single-layer checks
     layers = sorted(activations.keys())
+    if not layers:
+        raise ValueError("activations must contain at least one layer")
     mid_layer = layers[len(layers) // 2]
     X_mid = activations[mid_layer]
     if hasattr(X_mid, 'numpy'):
-        X_mid = X_mid.numpy()
+        X_mid = X_mid.detach().cpu().numpy()
 
     if hasattr(gm_labels, 'numpy'):
-        gm_labels = gm_labels.numpy()
+        gm_labels = gm_labels.detach().cpu().numpy()
 
     results = {}
 
@@ -201,14 +246,18 @@ def run_all_sanity_checks(
         print("=" * 60)
 
     # Check 1: Random labels
-    results["random_labels"] = sanity_check_random_labels(X_mid, gm_labels, random_state=random_state)
+    results["random_labels"] = sanity_check_random_labels(
+        X_mid, gm_labels, random_state=random_state, groups=groups
+    )
     if verbose:
         status = "PASSED" if results["random_labels"]["passed"] else "FAILED"
         print(f"\n1. Random Labels: {status}")
         print(f"   {results['random_labels']['message']}")
 
     # Check 2: Train-test gap
-    results["train_test_gap"] = sanity_check_train_test_gap(X_mid, gm_labels, random_state=random_state)
+    results["train_test_gap"] = sanity_check_train_test_gap(
+        X_mid, gm_labels, random_state=random_state, groups=groups
+    )
     if verbose:
         status = "PASSED" if results["train_test_gap"]["passed"] else "FAILED"
         print(f"\n2. Train-Test Gap: {status}")
@@ -222,7 +271,9 @@ def run_all_sanity_checks(
         print(f"   {results['label_variance']['message']}")
 
     # Check 4: Layer 0 baseline
-    results["layer_0_baseline"] = sanity_check_layer_0_baseline(activations, gm_labels, random_state=random_state)
+    results["layer_0_baseline"] = sanity_check_layer_0_baseline(
+        activations, gm_labels, random_state=random_state, groups=groups
+    )
     if verbose:
         status = "PASSED" if results["layer_0_baseline"]["passed"] else "FAILED"
         print(f"\n4. Layer 0 Baseline: {status}")
@@ -430,9 +481,9 @@ If R² > 0.15 and sanity checks pass:
   -> Deception is likely linearly represented at some layer
   -> But this doesn't prove the model "knows" it's being deceptive
 
-If GM R² > Agent R²:
-  -> Model encodes information it doesn't "acknowledge" in its responses
-  -> This is the key finding for implicit deception research
+If actual-deception R² > counterpart-belief R²:
+  -> Actual behavior is more linearly decodable than the agent's estimate of its counterpart
+  -> This does not establish hidden self-knowledge or self-awareness
 
 If generalization R² > 0.10:
   -> Probe captures general deception, not scenario-specific patterns

@@ -2,10 +2,16 @@
 
 import dataclasses
 import datetime
+from collections.abc import Callable, Mapping
 from typing import Dict, List, Optional, Any
 
-from concordia_mini.associative_memory import basic_associative_memory
-from concordia_mini.typing import entity_component
+from concordia.associative_memory import basic_associative_memory
+from concordia.typing import entity_component
+from negotiation.utils.parsing import (
+    contains_offer,
+    parse_offer_value,
+    signals_agreement,
+)
 
 
 @dataclasses.dataclass
@@ -45,6 +51,7 @@ class NegotiationMemory(entity_component.ContextComponent):
         agent_name: str,
         memory_bank: basic_associative_memory.AssociativeMemoryBank,
         verbose: bool = False,
+        clock: Callable[[], datetime.datetime] = datetime.datetime.now,
     ):
         """Initialize negotiation memory.
 
@@ -52,10 +59,12 @@ class NegotiationMemory(entity_component.ContextComponent):
             agent_name: Name of the agent
             memory_bank: Associative memory bank for storage
             verbose: Whether to print debug information
+            clock: Injectable timestamp source for deterministic runs
         """
         self._agent_name = agent_name
         self._memory = memory_bank
         self._verbose = verbose
+        self._clock = clock
 
         # Negotiation-specific tracking
         self._offer_history: List[Offer] = []
@@ -84,7 +93,7 @@ class NegotiationMemory(entity_component.ContextComponent):
         self._memory.add(text=memory_text)
 
         # Update current best if applicable
-        if offer.recipient == self._agent_name and offer.value:
+        if offer.recipient == self._agent_name and offer.value is not None:
             if (self._current_best_offer is None or
                 offer.value > self._current_best_offer.value):
                 self._current_best_offer = offer
@@ -164,11 +173,14 @@ class NegotiationMemory(entity_component.ContextComponent):
             summary += f"- Total concessions made: {total_concession}\n"
 
         # Recent offer trend
-        if len(self._offer_history) >= 2:
-            last_two = self._offer_history[-2:]
-            if all(o.value is not None for o in last_two):
-                trend = last_two[1].value - last_two[0].value
-                summary += f"- Recent trend: {'improving' if trend > 0 else 'declining'}\n"
+        received_values = [
+            offer.value for offer in self._offer_history
+            if offer.recipient == self._agent_name and offer.value is not None
+        ]
+        if len(received_values) >= 2:
+            trend = received_values[-1] - received_values[-2]
+            direction = 'stable' if trend == 0 else 'improving' if trend > 0 else 'declining'
+            summary += f"- Recent received-offer trend: {direction}\n"
 
         return summary
 
@@ -194,12 +206,14 @@ class NegotiationMemory(entity_component.ContextComponent):
     def post_act(self, action_attempt: str) -> str:
         """Update memory after action."""
         # Parse if action was an offer
-        if 'offer' in action_attempt.lower():
+        if contains_offer(action_attempt):
             # Simple parsing - in real implementation would be more sophisticated
             offer = Offer(
                 offerer=self._agent_name,
                 recipient='other_party',  # Would parse from context
                 content=action_attempt,
+                value=parse_offer_value(action_attempt),
+                timestamp=self._clock(),
                 round_number=len(self._offer_history) + 1,
             )
             self.remember_offer(offer)
@@ -208,24 +222,29 @@ class NegotiationMemory(entity_component.ContextComponent):
     def pre_observe(self, observation: str) -> str:
         """Process negotiation observations."""
         # Parse if observation contains an offer
-        if 'offer' in observation.lower():
+        if contains_offer(observation):
             # Simple parsing for now
             offer = Offer(
                 offerer='other_party',  # Would parse from observation
                 recipient=self._agent_name,
                 content=observation,
+                value=parse_offer_value(observation),
+                timestamp=self._clock(),
                 round_number=len(self._offer_history) + 1,
             )
             self.remember_offer(offer)
 
         # Detect negotiation end
-        if any(phrase in observation.lower() for phrase in ['deal', 'agree', 'accept']):
+        if signals_agreement(observation):
+            participants = list(dict.fromkeys(
+                [offer.offerer for offer in self._offer_history] +
+                [offer.recipient for offer in self._offer_history]
+            ))
             outcome = NegotiationOutcome(
                 agreement_reached=True,
                 final_value=self._current_best_offer.value if self._current_best_offer else None,
                 rounds_taken=len(self._offer_history),
-                participants=list(set([o.offerer for o in self._offer_history] +
-                                     [o.recipient for o in self._offer_history])),
+                participants=participants,
                 summary=observation,
             )
             self.remember_outcome(outcome)
@@ -245,12 +264,83 @@ class NegotiationMemory(entity_component.ContextComponent):
         """Component name."""
         return 'NegotiationMemory'
 
-    def get_state(self) -> str:
+    def get_state(self) -> Dict[str, Any]:
         """Get the component state for saving/restoring."""
-        # For now, return empty state. Could serialize offer history if needed.
-        return ''
+        return {
+            'offer_history': [
+                {
+                    **dataclasses.asdict(offer),
+                    'timestamp': (
+                        offer.timestamp.isoformat()
+                        if offer.timestamp is not None else None
+                    ),
+                }
+                for offer in self._offer_history
+            ],
+            'negotiation_outcomes': [
+                dataclasses.asdict(outcome)
+                for outcome in self._negotiation_outcomes
+            ],
+            'current_negotiation_partners': list(
+                self._current_negotiation_partners
+            ),
+            'patterns_learned': dict(self._patterns_learned),
+            'current_best_offer_index': (
+                self._offer_history.index(self._current_best_offer)
+                if self._current_best_offer in self._offer_history else None
+            ),
+            'concessions_made': list(self._concessions_made),
+            'value_discovered': self._value_discovered,
+        }
 
-    def set_state(self, state: str) -> None:
-        """Set the component state from a saved string."""
-        # For now, do nothing. Could deserialize offer history if needed.
-        pass
+    def set_state(self, state: Mapping[str, Any] | str) -> None:
+        """Restore structured negotiation memory state."""
+        if state == '':
+            return
+        if not isinstance(state, Mapping):
+            raise TypeError('Negotiation memory state must be a mapping.')
+        self._offer_history = []
+        for raw_offer in state.get('offer_history', []):
+            timestamp = raw_offer.get('timestamp')
+            self._offer_history.append(Offer(
+                offerer=str(raw_offer['offerer']),
+                recipient=str(raw_offer['recipient']),
+                content=str(raw_offer['content']),
+                value=(
+                    float(raw_offer['value'])
+                    if raw_offer.get('value') is not None else None
+                ),
+                timestamp=(
+                    datetime.datetime.fromisoformat(timestamp)
+                    if timestamp else None
+                ),
+                round_number=int(raw_offer.get('round_number', 0)),
+                offer_type=str(raw_offer.get('offer_type', 'standard')),
+            ))
+        self._negotiation_outcomes = [
+            NegotiationOutcome(
+                agreement_reached=bool(raw['agreement_reached']),
+                final_value=(
+                    float(raw['final_value'])
+                    if raw.get('final_value') is not None else None
+                ),
+                rounds_taken=int(raw['rounds_taken']),
+                participants=[str(p) for p in raw.get('participants', [])],
+                summary=str(raw.get('summary', '')),
+            )
+            for raw in state.get('negotiation_outcomes', [])
+        ]
+        self._current_negotiation_partners = [
+            str(partner)
+            for partner in state.get('current_negotiation_partners', [])
+        ]
+        self._patterns_learned = dict(state.get('patterns_learned', {}))
+        best_index = state.get('current_best_offer_index')
+        self._current_best_offer = (
+            self._offer_history[int(best_index)]
+            if best_index is not None else None
+        )
+        self._concessions_made = [
+            float(value) for value in state.get('concessions_made', [])
+        ]
+        self._value_discovered = float(state.get('value_discovered', 0.0))

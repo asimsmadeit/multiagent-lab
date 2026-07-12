@@ -17,7 +17,7 @@
 import dataclasses
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from concordia_mini.typing import entity_component
+from concordia.typing import entity_component
 
 
 @dataclasses.dataclass
@@ -158,12 +158,14 @@ class NegotiationValidator(entity_component.ContextComponent):
 
   def set_batna(self, party: str, batna: Dict[str, Any]) -> None:
     """Set BATNA (Best Alternative to Negotiated Agreement) for a party."""
-    self._batnas[party] = batna
+    if not isinstance(batna, dict):
+      raise TypeError('BATNA must be a mapping of terms and role metadata.')
+    self._batnas[party] = dict(batna)
 
   def set_required_issues(self, issues: List[str]) -> None:
     """Set required issues for multi-issue negotiations."""
     if self._domain_type == 'multi_issue':
-      self._constraints['required_issues'] = issues
+      self._constraints['required_issues'] = list(dict.fromkeys(issues))
 
   def _check_all_issues(self, terms: Dict[str, Any]) -> bool:
     """Check if all required issues are addressed."""
@@ -272,6 +274,9 @@ class NegotiationValidator(entity_component.ContextComponent):
       context: Optional[Dict[str, Any]] = None,
   ) -> Agreement:
     """Validate a potential agreement between parties."""
+    if len(parties) < 2 or len(set(parties)) != len(parties):
+      raise ValueError('An agreement requires at least two unique parties.')
+
     # Validate from each party's perspective
     all_errors = []
 
@@ -284,8 +289,8 @@ class NegotiationValidator(entity_component.ContextComponent):
     agreement_id = f"agreement_{len(self._agreements) + 1}"
     agreement = Agreement(
         agreement_id=agreement_id,
-        parties=parties,
-        terms=terms,
+        parties=list(parties),
+        terms=dict(terms),
         validation_status='valid' if not all_errors else 'invalid',
         validation_errors=all_errors,
         timestamp='current',
@@ -345,17 +350,17 @@ class NegotiationValidator(entity_component.ContextComponent):
     """Provide validation context."""
     return self.get_validation_report()
 
-  def post_act(self, action_attempt: str) -> None:
+  def post_act(self, action_attempt: str) -> str:
     """Process validation-related actions."""
-    pass
+    return ""
 
-  def pre_observe(self, observation: str) -> None:
+  def pre_observe(self, observation: str) -> str:
     """Process observations."""
-    pass
+    return ""
 
-  def post_observe(self) -> None:
+  def post_observe(self) -> str:
     """Post-observation processing."""
-    pass
+    return ""
 
   def update(self) -> None:
     """Update internal state."""
@@ -366,13 +371,31 @@ class NegotiationValidator(entity_component.ContextComponent):
     """Component name."""
     return 'NegotiationValidator'
 
-  def get_state(self) -> str:
-    """Get component state."""
-    valid = sum(1 for a in self._agreements.values()
-               if a.validation_status == 'valid')
-    return f"{len(self._agreements)}|{valid}"
+  def get_state(self) -> Dict[str, Any]:
+    """Return complete validation and enforcement state."""
+    return {
+        'batnas': {
+            party: dict(batna) for party, batna in self._batnas.items()
+        },
+        'agreements': {
+            agreement_id: dataclasses.asdict(agreement)
+            for agreement_id, agreement in self._agreements.items()
+        },
+        'constraints': dict(self._constraints),
+    }
 
-  def set_state(self, state: str) -> None:
-    """Restore component state."""
-    # Simple state restoration
-    pass
+  def set_state(self, state: Dict[str, Any]) -> None:
+    """Restore complete validation and enforcement state."""
+    if not isinstance(state, dict):
+      raise TypeError('Negotiation validator state must be a mapping.')
+    self._batnas = {
+        str(party): dict(batna)
+        for party, batna in state.get('batnas', {}).items()
+    }
+    self._agreements = {
+        str(agreement_id): Agreement(**agreement)
+        for agreement_id, agreement in state.get('agreements', {}).items()
+    }
+    self._constraints = dict(
+        state.get('constraints', self._get_domain_constraints())
+    )

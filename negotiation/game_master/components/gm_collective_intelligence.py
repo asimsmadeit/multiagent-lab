@@ -127,6 +127,15 @@ class CollectiveIntelligenceGM(gm_modules.NegotiationGMModule):
       potential_members.update(pair)
 
     if len(potential_members) >= 2:
+      existing = next(
+          (
+              coalition for coalition in self._coalitions
+              if coalition.active and coalition.members == potential_members
+          ),
+          None,
+      )
+      if existing is not None:
+        return existing
       # Create coalition
       coalition = Coalition(
           members=potential_members,
@@ -205,6 +214,8 @@ class CollectiveIntelligenceGM(gm_modules.NegotiationGMModule):
       context: gm_modules.ModuleContext,
   ) -> Optional[CollectiveDecision]:
     """Assess potential for collective decision-making."""
+    if not participants:
+      return None
     # Look for consensus indicators
     if not any(word in proposal.lower() for word in ['we', 'all', 'together', 'consensus']):
       return None
@@ -222,8 +233,11 @@ class CollectiveIntelligenceGM(gm_modules.NegotiationGMModule):
 
     for participant in participants:
       # Base support on recent agreement patterns
-      recent_agreements = len([a for a in self._information_flows[-5:]
-                              if participant in a.recipients and 'agree' in str(a)])
+      recent_actions = context.shared_data.get('recent_actions', [])
+      recent_agreements = sum(
+          1 for actor, action in recent_actions[-5:]
+          if actor == participant and 'agree' in action.lower()
+      )
       support_level[participant] = min(1.0, 0.5 + recent_agreements * 0.1)
       commitment_level[participant] = support_level[participant] * 0.8
 
@@ -307,8 +321,18 @@ class CollectiveIntelligenceGM(gm_modules.NegotiationGMModule):
       recent_decisions = [d for d in self._collective_decisions 
                          if d.round_decided > context.current_round - 5]
       if len(recent_decisions) >= 2:
-        avg_support = sum(sum(d.support_level.values()) / len(d.support_level) 
-                         for d in recent_decisions) / len(recent_decisions)
+        supported_decisions = [
+            decision for decision in recent_decisions
+            if decision.support_level
+        ]
+        avg_support = (
+            sum(
+                sum(decision.support_level.values()) /
+                len(decision.support_level)
+                for decision in supported_decisions
+            ) / len(supported_decisions)
+            if supported_decisions else 0.0
+        )
         if avg_support > 0.8:
           emergent_patterns.append("consensus_convergence")
 
@@ -476,8 +500,14 @@ class CollectiveIntelligenceGM(gm_modules.NegotiationGMModule):
 
       # Network density
       if self._information_networks:
-        total_connections = sum(len(connections) for connections in self._information_networks.values())
-        participants = len(self._information_networks)
+        total_connections = sum(
+            len(connections)
+            for connections in self._information_networks.values()
+        )
+        nodes = set(self._information_networks)
+        for connections in self._information_networks.values():
+          nodes.update(connections)
+        participants = len(nodes)
         if participants > 1:
           possible_connections = participants * (participants - 1)
           density = total_connections / possible_connections
@@ -529,20 +559,99 @@ class CollectiveIntelligenceGM(gm_modules.NegotiationGMModule):
 
     return report
 
-  def get_state(self) -> str:
-    """Get the component state for saving/restoring."""
-    state_dict = {
-        'coalitions': len(self._coalitions),
-        'flows': len(self._information_flows),
-        'decisions': len(self._collective_decisions),
-        'emergence': len(self._emergence_indicators),
+  def get_state(self) -> Dict[str, Any]:
+    """Return complete collective-intelligence state."""
+    return {
+        'base': self._get_base_state(),
+        'coalitions': [
+            {
+                **dataclasses.asdict(coalition),
+                'members': sorted(coalition.members),
+            }
+            for coalition in self._coalitions
+        ],
+        'coalition_history': [
+            {
+                **event,
+                'coalition': sorted(event.get('coalition', [])),
+            }
+            for event in self._coalition_history
+        ],
+        'information_flows': [
+            {
+                **dataclasses.asdict(flow),
+                'recipients': sorted(flow.recipients),
+            }
+            for flow in self._information_flows
+        ],
+        'information_networks': {
+            participant: sorted(connections)
+            for participant, connections in self._information_networks.items()
+        },
+        'collective_decisions': [
+            {
+                **dataclasses.asdict(decision),
+                'participants': sorted(decision.participants),
+            }
+            for decision in self._collective_decisions
+        ],
+        'consensus_tracking': {
+            topic: dict(values)
+            for topic, values in self._consensus_tracking.items()
+        },
+        'coordination_patterns': {
+            participant: list(patterns)
+            for participant, patterns in self._coordination_patterns.items()
+        },
+        'emergence_indicators': [
+            dict(item) for item in self._emergence_indicators
+        ],
     }
-    return str(state_dict)
 
-  def set_state(self, state: str) -> None:
-    """Set the component state from a saved string."""
-    # Since this tracks dynamic data, we only restore basic structure
-    pass
+  def set_state(self, state: Dict[str, Any]) -> None:
+    """Restore complete collective-intelligence state."""
+    if not isinstance(state, dict):
+      raise TypeError('Collective GM state must be a mapping.')
+    self._set_base_state(state)
+    self._coalitions = [
+        Coalition(**{**item, 'members': set(item.get('members', []))})
+        for item in state.get('coalitions', [])
+    ]
+    self._coalition_history = [
+        {**event, 'coalition': set(event.get('coalition', []))}
+        for event in state.get('coalition_history', [])
+    ]
+    self._information_flows = [
+        InformationFlow(
+            **{**item, 'recipients': set(item.get('recipients', []))}
+        )
+        for item in state.get('information_flows', [])
+    ]
+    self._information_networks = {
+        str(participant): set(connections)
+        for participant, connections in state.get(
+            'information_networks', {}
+        ).items()
+    }
+    self._collective_decisions = [
+        CollectiveDecision(
+            **{**item, 'participants': set(item.get('participants', []))}
+        )
+        for item in state.get('collective_decisions', [])
+    ]
+    self._consensus_tracking = {
+        str(topic): {str(name): float(value) for name, value in values.items()}
+        for topic, values in state.get('consensus_tracking', {}).items()
+    }
+    self._coordination_patterns = {
+        str(participant): [str(pattern) for pattern in patterns]
+        for participant, patterns in state.get(
+            'coordination_patterns', {}
+        ).items()
+    }
+    self._emergence_indicators = [
+        dict(item) for item in state.get('emergence_indicators', [])
+    ]
 
 
 # Register the module

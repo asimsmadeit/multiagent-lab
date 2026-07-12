@@ -352,15 +352,17 @@ class StrategyEvolutionGM(gm_modules.NegotiationGMModule):
 
     # Analyze current strategy
     snapshot = self.analyze_strategy_from_action(actor, event, context)
-    self._strategy_snapshots.append(snapshot)
 
-    # Update current strategy tracking
-    self._current_strategies[actor] = snapshot.strategy_type
-
-    # Detect strategy changes
+    # Compare with history before adding the current snapshot. Appending first
+    # made the current snapshot compare with itself, disabling both detections.
     transition = self.detect_strategy_change(actor, snapshot)
     if transition:
       self._strategy_transitions.append(transition)
+
+    self.detect_innovation(snapshot, context)
+
+    self._strategy_snapshots.append(snapshot)
+    self._current_strategies[actor] = snapshot.strategy_type
 
     # Track learning indicators
     if any(word in event.lower() for word in ['learn', 'realize', 'understand', 'see now']):
@@ -373,9 +375,6 @@ class StrategyEvolutionGM(gm_modules.NegotiationGMModule):
       if actor not in self._adaptation_triggers:
         self._adaptation_triggers[actor] = []
       self._adaptation_triggers[actor].append(event)
-
-    # Detect innovation
-    innovation = self.detect_innovation(snapshot, context)
 
     # Update strategy diffusion tracking
     if context.current_round % 3 == 0:  # Every 3 rounds
@@ -571,20 +570,87 @@ class StrategyEvolutionGM(gm_modules.NegotiationGMModule):
 
     return report
 
-  def get_state(self) -> str:
-    """Get the component state for saving/restoring."""
-    state_dict = {
-        'snapshots': len(self._strategy_snapshots),
-        'transitions': len(self._strategy_transitions),
-        'current_strategies': len(self._current_strategies),
-        'innovations': len(self._innovation_events),
+  def get_state(self) -> Dict[str, Any]:
+    """Return complete strategy-evolution tracking state."""
+    return {
+        'base': self._get_base_state(),
+        'strategy_snapshots': [
+            dataclasses.asdict(snapshot)
+            for snapshot in self._strategy_snapshots
+        ],
+        'strategy_transitions': [
+            dataclasses.asdict(transition)
+            for transition in self._strategy_transitions
+        ],
+        'current_strategies': dict(self._current_strategies),
+        'performance_metrics': [
+            {
+                'key': list(key),
+                'metrics': dataclasses.asdict(metrics),
+            }
+            for key, metrics in self._performance_metrics.items()
+        ],
+        'outcome_history': [dict(item) for item in self._outcome_history],
+        'learning_indicators': {
+            participant: list(events)
+            for participant, events in self._learning_indicators.items()
+        },
+        'adaptation_triggers': {
+            participant: list(events)
+            for participant, events in self._adaptation_triggers.items()
+        },
+        'strategy_diffusion': {
+            strategy: dict(paths)
+            for strategy, paths in self._strategy_diffusion.items()
+        },
+        'innovation_events': [dict(item) for item in self._innovation_events],
     }
-    return str(state_dict)
 
-  def set_state(self, state: str) -> None:
-    """Set the component state from a saved string."""
-    # Since this tracks dynamic data, we only restore basic structure
-    pass
+  def set_state(self, state: Dict[str, Any]) -> None:
+    """Restore complete strategy-evolution tracking state."""
+    if not isinstance(state, dict):
+      raise TypeError('Strategy-evolution GM state must be a mapping.')
+    self._set_base_state(state)
+    self._strategy_snapshots = [
+        StrategySnapshot(**item)
+        for item in state.get('strategy_snapshots', [])
+    ]
+    self._strategy_transitions = [
+        StrategyTransition(**item)
+        for item in state.get('strategy_transitions', [])
+    ]
+    self._current_strategies = {
+        str(participant): str(strategy)
+        for participant, strategy in state.get(
+            'current_strategies', {}
+        ).items()
+    }
+    self._performance_metrics = {
+        tuple(item['key']): PerformanceMetrics(**item['metrics'])
+        for item in state.get('performance_metrics', [])
+    }
+    self._outcome_history = [
+        dict(item) for item in state.get('outcome_history', [])
+    ]
+    self._learning_indicators = {
+        str(participant): [str(event) for event in events]
+        for participant, events in state.get(
+            'learning_indicators', {}
+        ).items()
+    }
+    self._adaptation_triggers = {
+        str(participant): [str(event) for event in events]
+        for participant, events in state.get(
+            'adaptation_triggers', {}
+        ).items()
+    }
+    self._strategy_diffusion = {
+        str(strategy): {str(path): int(count) for path, count in paths.items()}
+        for strategy, paths in state.get('strategy_diffusion', {}).items()
+    }
+    self._innovation_events = [
+        dict(item) for item in state.get('innovation_events', [])
+    ]
 
 
 # Register the module

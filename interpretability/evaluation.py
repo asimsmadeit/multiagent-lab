@@ -26,6 +26,8 @@ import logging
 import torch
 import numpy as np
 import hashlib
+from pathlib import Path
+from importlib.metadata import PackageNotFoundError, version
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Tuple
@@ -34,12 +36,57 @@ from collections import defaultdict
 # Set up module logger
 logger = logging.getLogger(__name__)
 
-from concordia_mini.language_model import language_model
-from concordia_mini.associative_memory import basic_associative_memory
-from concordia_mini.typing import entity as entity_lib
+
+def _package_version(distribution: str) -> Optional[str]:
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return None
+
+
+def _tokens_through_stored_response(
+    tokenizer: Any,
+    generated_tokens: torch.Tensor,
+    prompt_length: int,
+    response: str,
+) -> Optional[torch.Tensor]:
+    """Trim generated IDs to the last token represented in stored response text.
+
+    Generation commonly ends with an EOS/chat marker that disappears under
+    ``skip_special_tokens=True``. Terminators can also truncate the persisted
+    response. Selecting the raw final ID would therefore bind an activation to
+    text that is not in the dataset. This finds the last decoded response-token
+    prefix that remains in the stored response.
+    """
+    target = response.strip()
+    response_ids = generated_tokens[0, prompt_length:]
+    if not target or response_ids.numel() == 0:
+        return None
+
+    last_offset = None
+    last_visible_prefix = ""
+    for offset in range(1, response_ids.shape[0] + 1):
+        decoded = tokenizer.decode(
+            response_ids[:offset], skip_special_tokens=True
+        ).strip()
+        if not decoded or decoded == last_visible_prefix:
+            continue
+        if target.startswith(decoded):
+            last_offset = offset
+            last_visible_prefix = decoded
+            continue
+        break
+
+    if last_offset is None:
+        return None
+    return generated_tokens[:, :prompt_length + last_offset]
+
+from concordia.language_model import language_model
+from concordia.associative_memory import basic_associative_memory
+from concordia.typing import entity as entity_lib
 from negotiation import advanced_negotiator
 from config.agents.negotiation import InterpretabilityConfig
-from concordia_mini.prefabs.entity import minimal as minimal_entity
+from concordia.prefabs.entity import minimal as minimal_entity
 from .scenarios.contest_scenarios import create_scenario
 
 # =============================================================================
@@ -231,6 +278,11 @@ class ActivationSample:
     # Cross-context test: same scenario, different prompt framing
     framing_variant: Optional[str] = None  # "formal", "casual", "first_person", "third_person", "embedded"
 
+    # Token position represented by ``activations``. New datasets use the
+    # final generated response token in both model wrappers.
+    activation_position: str = "last_response_token"
+    sampling_config: Dict[str, Any] = field(default_factory=dict)
+
     # === MULTI-EVALUATOR GROUND TRUTH (C8) ===
     # Separate labels from each detection method for inter-annotator agreement
     gt_regex: Optional[float] = None       # Regex-based detection (0 or 1)
@@ -285,6 +337,7 @@ class TransformerLensWrapper(language_model.LanguageModel):
             dtype=torch_dtype,
         )
         self.device = device
+        self.model_name = model_name
         self.default_max_tokens = max_tokens
 
         # Default: capture first, middle, and last layers
@@ -298,6 +351,8 @@ class TransformerLensWrapper(language_model.LanguageModel):
         # Storage for current call's activations
         self._current_activations: Dict[str, torch.Tensor] = {}
         self._call_count = 0
+        self._last_prompt: Optional[str] = None
+        self._last_sampling_config: Dict[str, Any] = {}
 
         print(f"  Loaded: {n_layers} layers, {self.model.cfg.d_model} dims")
         print(f"  Capturing layers: {self.layers_to_capture}")
@@ -332,6 +387,14 @@ class TransformerLensWrapper(language_model.LanguageModel):
     def get_activations(self) -> Dict[str, torch.Tensor]:
         """Get activations from the last call."""
         return self._current_activations.copy()
+
+    def get_last_prompt(self) -> Optional[str]:
+        """Return the exact context passed into the last generation call."""
+        return self._last_prompt
+
+    def get_last_sampling_config(self) -> Dict[str, Any]:
+        """Return sampling controls used by the last generation call."""
+        return dict(self._last_sampling_config)
 
     def capture_followup_activations(self, original_prompt: str, response: str) -> Dict[str, torch.Tensor]:
         """Capture activations for Apollo's follow-up question probe.
@@ -414,14 +477,20 @@ class TransformerLensWrapper(language_model.LanguageModel):
         """True if a steering vector is currently active."""
         return getattr(self, '_steering_direction', None) is not None
 
-    def _make_steering_hook(self):
-        """Create a hook function that adds the steering vector to activations."""
+    def _make_steering_hook(self, replay_start: Optional[int] = None):
+        """Create a generation-step or teacher-forced replay steering hook."""
         direction = self._steering_direction
         magnitude = self._steering_magnitude
 
         def hook_fn(activation, hook):
-            # Add steering direction to the last token position
-            activation[:, -1, :] += magnitude * direction.to(activation.device)
+            steering = magnitude * direction.to(activation.device)
+            if replay_start is None:
+                # Cached generation processes one new last position per step.
+                activation[:, -1, :] += steering
+            else:
+                # Replay the positions that were each "last" during generation:
+                # the final prompt token, then every retained response token.
+                activation[:, replay_start:, :] += steering
             return activation
 
         return hook_fn
@@ -433,8 +502,12 @@ class TransformerLensWrapper(language_model.LanguageModel):
         max_tokens: int = None,
         terminators: tuple = (),
         temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
         timeout: float = 60,
         seed: int | None = None,
+        capture_activations: bool = True,
+        apply_steering: bool = True,
     ) -> str:
         """Generate text and capture activations. Applies steering if active.
 
@@ -451,6 +524,15 @@ class TransformerLensWrapper(language_model.LanguageModel):
             Mistral responses and 8-13% of Llama responses).
         """
         self._call_count += 1
+        self._last_prompt = prompt
+        self._current_activations = {}
+        self._last_sampling_config = {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+            "seed": seed,
+            "do_sample": temperature > 0,
+        }
 
         # Use instance default if not specified
         if max_tokens is None:
@@ -486,29 +568,15 @@ class TransformerLensWrapper(language_model.LanguageModel):
             tokens = tokens[:, -(max_ctx - 256):]  # Leave room for generation
 
         # Apply steering hooks if active (for both cache capture and generation)
-        if self.is_steering:
+        steering_active = self.is_steering and apply_steering
+        if steering_active:
             self.model.reset_hooks()
             self.model.add_hook(self._steering_hook_name, self._make_steering_hook())
 
-        # Run with cache to capture activations, generate, then clean up hooks
+        # Generate, then cache the exact generated token sequence. Capturing a
+        # prompt-only forward pass here would make this wrapper incompatible
+        # with HybridLanguageModel, which represents the response token.
         try:
-            with torch.no_grad():
-                _, cache = self.model.run_with_cache(
-                    tokens,
-                    names_filter=lambda name: name in self.hook_names
-                )
-
-            # Extract activations from each layer
-            self._current_activations = {}
-            for hook_name in self.hook_names:
-                if hook_name in cache:
-                    # Last token: [d_model] — standard mech interp position
-                    self._current_activations[hook_name] = cache[hook_name][0, -1, :].cpu()
-                    # E13: Mean-pooled over all token positions (context-level representation)
-                    if self.capture_mean_pooled:
-                        self._current_activations[hook_name + ".mean"] = cache[hook_name][0, :, :].mean(dim=0).cpu()
-
-            # Generate response (hooks still active if steering)
             if seed is not None:
                 torch.manual_seed(seed)
 
@@ -519,6 +587,9 @@ class TransformerLensWrapper(language_model.LanguageModel):
             gen_kwargs = dict(
                 max_new_tokens=min(max_tokens, 256),
                 temperature=max(temperature, 0.1),
+                do_sample=temperature > 0,
+                top_p=top_p,
+                top_k=top_k,
                 stop_at_eos=True,
             )
             try:
@@ -528,28 +599,54 @@ class TransformerLensWrapper(language_model.LanguageModel):
             except TypeError:
                 # TransformerLens version does not support freq_penalty; fall back.
                 generated = self.model.generate(tokens, **gen_kwargs)
+
+            response_tokens = generated[0, tokens.shape[1]:]
+            if tokenizer is not None and hasattr(tokenizer, 'decode'):
+                response = tokenizer.decode(
+                    response_tokens, skip_special_tokens=True
+                )
+            else:
+                response = self.model.to_string(response_tokens)
+
+            for term in terminators:
+                if term in response:
+                    response = response.split(term)[0]
+            response = response.strip()
+
+            if capture_activations and tokenizer is not None:
+                stored_tokens = _tokens_through_stored_response(
+                    tokenizer, generated, tokens.shape[1], response
+                )
+                if stored_tokens is not None:
+                    if steering_active:
+                        self.model.reset_hooks()
+                        self.model.add_hook(
+                            self._steering_hook_name,
+                            self._make_steering_hook(
+                                replay_start=max(tokens.shape[1] - 1, 0)
+                            ),
+                        )
+                    with torch.no_grad():
+                        _, cache = self.model.run_with_cache(
+                            stored_tokens,
+                            names_filter=lambda name: name in self.hook_names,
+                        )
+
+                    for hook_name in self.hook_names:
+                        if hook_name in cache:
+                            self._current_activations[hook_name] = cache[
+                                hook_name
+                            ][0, -1, :].cpu()
+                            if self.capture_mean_pooled:
+                                self._current_activations[hook_name + ".mean"] = cache[
+                                    hook_name
+                                ][0, :, :].mean(dim=0).cpu()
         finally:
             # Always clean up hooks after forward+generate
-            if self.is_steering:
+            if steering_active:
                 self.model.reset_hooks()
 
-        # Decode only the newly-generated tokens. Prefer the HF tokenizer's
-        # decode with skip_special_tokens=True so </s>, <|eot_id|>, etc. do
-        # not leak into the response string.
-        response_tokens = generated[0, tokens.shape[1]:]
-        if tokenizer is not None and hasattr(tokenizer, 'decode'):
-            response = tokenizer.decode(
-                response_tokens, skip_special_tokens=True
-            )
-        else:
-            response = self.model.to_string(response_tokens)
-
-        # Apply terminators
-        for term in terminators:
-            if term in response:
-                response = response.split(term)[0]
-
-        return response.strip()
+        return response
 
     @property
     def activation_dim(self) -> int:
@@ -593,6 +690,7 @@ class HybridLanguageModel(language_model.LanguageModel):
             torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
         self.device = device
+        self.model_name = model_name
         self.default_max_tokens = max_tokens
 
         print(f"Loading HybridLanguageModel: {model_name}")
@@ -663,6 +761,8 @@ class HybridLanguageModel(language_model.LanguageModel):
         self._current_activations: Dict[str, torch.Tensor] = {}
         self._current_sae_features = None
         self._call_count = 0
+        self._last_prompt: Optional[str] = None
+        self._last_sampling_config: Dict[str, Any] = {}
 
         logger.info("HybridLanguageModel ready!")
         logger.info("Layers to capture: %s", self.layers_to_capture)
@@ -675,9 +775,12 @@ class HybridLanguageModel(language_model.LanguageModel):
         max_tokens: int = None,
         terminators: tuple = (),
         temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
         timeout: float = 60,
         seed: int | None = None,
         capture_activations: bool = True,  # Skip expensive TransformerLens pass when False
+        apply_steering: bool = True,  # Accepted for FastModelWrapper parity; hybrid has no steering hook.
     ) -> str:
         """Generate text with HuggingFace, optionally capture activations with TransformerLens.
 
@@ -687,6 +790,16 @@ class HybridLanguageModel(language_model.LanguageModel):
                                Only set True for the negotiator responses you want to analyze.
         """
         self._call_count += 1
+        self._last_prompt = prompt
+        self._current_activations = {}
+        self._current_sae_features = None
+        self._last_sampling_config = {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+            "seed": seed,
+            "do_sample": temperature > 0,
+        }
 
         if max_tokens is None:
             max_tokens = self.default_max_tokens
@@ -717,15 +830,19 @@ class HybridLanguageModel(language_model.LanguageModel):
         gen_kwargs = {
             "max_new_tokens": min(max_tokens, 256),
             "temperature": max(temperature, 0.1),
-            "do_sample": True,
-            "top_p": 0.9,  # Nucleus sampling for stability
-            "top_k": 50,   # Limit vocabulary for stability
+            "do_sample": temperature > 0,
+            "top_p": top_p,
+            "top_k": top_k,
             "pad_token_id": self.tokenizer.pad_token_id,
             # repetition_penalty added 2026-04-21 to address looping on
             # Llama-3.1-8B and Mistral-7B runs. 1.15 is a conservative
             # default that reduces loops without destroying fluency.
             "repetition_penalty": 1.15,
         }
+        if not gen_kwargs["do_sample"]:
+            gen_kwargs.pop("temperature")
+            gen_kwargs.pop("top_p")
+            gen_kwargs.pop("top_k")
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -799,8 +916,17 @@ class HybridLanguageModel(language_model.LanguageModel):
         # =========================================================
         # OPTIMIZATION: Skip this expensive step when not needed
         if capture_activations:
-            full_text = prompt + response
-            tokens = self.tl_model.to_tokens(full_text, truncate=True)
+            # HF and TransformerLens wrap the same checkpoint/tokenizer. Reuse
+            # exact IDs, trimming EOS/chat markers and any terminator-truncated
+            # suffix so the final position is represented in stored response.
+            tokens = _tokens_through_stored_response(
+                self.tokenizer,
+                outputs,
+                inputs.input_ids.shape[1],
+                response,
+            )
+            if tokens is None:
+                return response
             # Ensure we don't exceed max position embeddings
             max_pos = getattr(self.tl_model.cfg, 'n_ctx', 8192)
             if tokens.shape[1] > max_pos:
@@ -813,7 +939,6 @@ class HybridLanguageModel(language_model.LanguageModel):
                 )
 
             # Extract last-token activations from each layer
-            self._current_activations = {}
             for hook_name in self.hook_names:
                 if hook_name in cache:
                     self._current_activations[hook_name] = cache[hook_name][0, -1, :].cpu()
@@ -862,6 +987,14 @@ class HybridLanguageModel(language_model.LanguageModel):
     def get_activations(self) -> Dict[str, torch.Tensor]:
         """Get activations from the last call."""
         return self._current_activations.copy()
+
+    def get_last_prompt(self) -> Optional[str]:
+        """Return the exact context passed into the last generation call."""
+        return self._last_prompt
+
+    def get_last_sampling_config(self) -> Dict[str, Any]:
+        """Return sampling controls used by the last generation call."""
+        return dict(self._last_sampling_config)
 
     def get_sae_features(self):
         """Get SAE features from the last call (if SAE enabled)."""
@@ -931,16 +1064,25 @@ class FastModelWrapper(language_model.LanguageModel):
     for agents we don't need to analyze.
     """
 
-    def __init__(self, base_model: HybridLanguageModel):
+    def __init__(self, base_model: language_model.LanguageModel):
         self._base = base_model
 
     def sample_text(self, prompt: str, **kwargs) -> str:
         # Always skip activation capture
         kwargs['capture_activations'] = False
+        kwargs['apply_steering'] = False
         return self._base.sample_text(prompt, **kwargs)
 
     def sample_choice(self, prompt: str, responses: list, **kwargs):
-        return self._base.sample_choice(prompt, responses, **kwargs)
+        seed = kwargs.pop('seed', None)
+        sample = self.sample_text(prompt, max_tokens=100, seed=seed, **kwargs)
+        sample_words = set(sample.lower().split())
+        best_idx = max(
+            range(len(responses)),
+            key=lambda idx: len(sample_words & set(responses[idx].lower().split())),
+            default=0,
+        )
+        return best_idx, responses[best_idx], {'sample': sample}
 
     @property
     def call_count(self) -> int:
@@ -1004,21 +1146,24 @@ class InterpretabilityRunner:
 
         # Create fast model wrapper for non-essential calls (counterpart, etc.)
         # This provides ~5x speedup by skipping activation capture
-        if use_hybrid:
-            self.fast_model = FastModelWrapper(self.model)
-        else:
-            self.fast_model = self.model  # TransformerLensWrapper doesn't have the flag
+        self.fast_model = FastModelWrapper(self.model)
 
         # Setup evaluator model for ground truth extraction (AFTER main model is created)
         self.evaluator_model = None
         self.evaluator_type = evaluator_type
         self._deepeval_detector = None
 
-        # Initialize evaluator based on type
+        # DeepEval and the structured-data extractor are independent. The
+        # previous mutually-exclusive branch silently ignored evaluator_api
+        # whenever evaluator_type used its default ("deepeval").
         if evaluator_type == "deepeval":
             self._setup_deepeval()
-        elif evaluator_api:
+        if evaluator_api:
             self.evaluator_model = self._setup_evaluator(evaluator_api)
+
+    def _get_last_sampling_config(self) -> Dict[str, Any]:
+        getter = getattr(self.model, "get_last_sampling_config", None)
+        return getter() if callable(getter) else {}
 
     def _normalize_incentive_condition(self, condition: Any) -> 'IncentiveCondition':
         """Accept Enum or string (any case) and return IncentiveCondition."""
@@ -1175,16 +1320,36 @@ class InterpretabilityRunner:
 
         return labels
 
-    def _create_memory_bank(self):
+    def _create_memory_bank(self, allow_duplicates: bool = False):
         """Create memory bank with simple embedder."""
         def embedder(text: str) -> np.ndarray:
             hash_bytes = hashlib.sha256(text.encode()).digest()
             embedding = np.array([float(b) / 255.0 for b in hash_bytes[:64]])
             return embedding / (np.linalg.norm(embedding) + 1e-8)
 
-        return basic_associative_memory.AssociativeMemoryBank(
-            sentence_embedder=embedder
-        )
+        try:
+            return basic_associative_memory.AssociativeMemoryBank(
+                sentence_embedder=embedder,
+                allow_duplicates=allow_duplicates,
+            )
+        except TypeError:
+            # Compatibility with the vendored pre-2.4 memory bank while the
+            # runtime migration is in progress. Concordia 2.4 handles this
+            # natively through ``allow_duplicates``.
+            memory_bank = basic_associative_memory.AssociativeMemoryBank(
+                sentence_embedder=embedder
+            )
+            memory_bank._allow_duplicates = allow_duplicates
+            if allow_duplicates:
+                original_add = memory_bank.add
+
+                def add_with_duplicates(text: str) -> None:
+                    normalized = text.replace('\n', ' ')
+                    memory_bank._stored_hashes.discard(hash((normalized,)))
+                    original_add(text)
+
+                memory_bank.add = add_with_duplicates
+            return memory_bank
 
     def _extract_agent_labels(self, agent) -> Dict[str, float]:
         """Extract labels from agent's cognitive modules (first-person beliefs).
@@ -1677,7 +1842,7 @@ Example: yes, yes'''
             from negotiation.game_master import negotiation as gm_negotiation
 
             gm_modules = gm_modules or ['social_intelligence']
-            memory_bank = self._create_memory_bank()
+            memory_bank = self._create_memory_bank(allow_duplicates=True)
 
             gm = gm_negotiation.build_game_master(
                 model=self.model,
@@ -1716,6 +1881,7 @@ Example: yes, yes'''
         gm_modules = gm_modules or ['social_intelligence']
         self._trial_id += 1
         trial_samples = []
+        base_sample_idx = len(self.activation_samples)
         deception_count = 0
 
         # Generate scenario params for ground truth extraction
@@ -1755,9 +1921,10 @@ Example: yes, yes'''
                 if scenario_type in INSTRUCTED_SCENARIOS:
                     cond = Condition.DECEPTIVE if condition_id == 'deceptive' else Condition.HONEST
                     if cond in INSTRUCTED_SCENARIOS[scenario_type].get('conditions', {}):
-                        agent_goal = INSTRUCTED_SCENARIOS[scenario_type]['conditions'][cond].get(
+                        template = INSTRUCTED_SCENARIOS[scenario_type]['conditions'][cond].get(
                             'system_prompt', agent_goal
                         )
+                        agent_goal = template.format(**scenario_params)
             except Exception as e:
                 logger.debug(f"Could not load instructed scenario prompt: {e}")
 
@@ -1817,6 +1984,12 @@ Example: yes, yes'''
                     output_type=entity_lib.OutputType.FREE,
                 )
                 action = agent.act(action_spec)
+                model_prompt = (
+                    self.model.get_last_prompt()
+                    if hasattr(self.model, 'get_last_prompt')
+                    else action_prompt
+                ) or action_prompt
+                sampling_config = self._get_last_sampling_config()
                 round_actions.append((agent.name, action))
 
                 # Track proposals for utility calculation
@@ -1871,7 +2044,7 @@ Example: yes, yes'''
                         round_num=round_num,
                         agent_name=agent.name,
                         activations=activations,
-                        prompt=action_prompt,
+                        prompt=model_prompt,
                         response=action,
                         # Agent labels
                         perceived_deception=agent_labels['perceived_deception'],
@@ -1909,6 +2082,7 @@ Example: yes, yes'''
                         # Full reasoning chain capture
                         component_reasoning=component_reasoning,
                         dialogue_history=dialogue_snapshot,
+                        sampling_config=sampling_config,
                     )
                     round_samples[agent.name] = sample
                     trial_samples.append(sample)
@@ -1924,15 +2098,17 @@ Example: yes, yes'''
             if len(round_samples) == 2:
                 sample_list = list(round_samples.values())
                 # Get indices in trial_samples
-                idx_0 = len(trial_samples) - 2
-                idx_1 = len(trial_samples) - 1
+                idx_0 = base_sample_idx + len(trial_samples) - 2
+                idx_1 = base_sample_idx + len(trial_samples) - 1
                 # Link them to each other
-                trial_samples[idx_0].counterpart_idx = idx_1
-                trial_samples[idx_1].counterpart_idx = idx_0
+                trial_samples[-2].counterpart_idx = idx_1
+                trial_samples[-1].counterpart_idx = idx_0
 
             # Check for agreement
-            combined = ' '.join([a[1] for a in round_actions]).lower()
-            if agreement_round is None and ('agree' in combined or 'deal' in combined or 'accept' in combined):
+            if agreement_round is None and any(
+                self._response_signals_agreement(action)
+                for _, action in round_actions
+            ):
                 agreement_round = round_num
 
         # === NEW: Determine trial outcome ===
@@ -1961,6 +2137,33 @@ Example: yes, yes'''
             'deception_detected': deception_count,
             'outcome': outcome,  # NEW: Include outcome details
         }
+
+    @staticmethod
+    def _response_signals_agreement(response: str) -> bool:
+        """Return whether a response explicitly accepts the current deal.
+
+        Substring checks such as ``"agree" in text`` misclassify "disagree",
+        proposed deals, and hypothetical acceptance as completed agreements.
+        """
+        import re
+
+        text = response.lower()
+        negative_patterns = (
+            r"\b(?:do not|don't|cannot|can't|won't)\s+(?:agree|accept)\b",
+            r"\bdisagree\b",
+            r"\breject(?:ed|ing)?\b",
+            r"\bnot\s+(?:an\s+)?agreement\b",
+        )
+        if any(re.search(pattern, text) for pattern in negative_patterns):
+            return False
+
+        acceptance_patterns = (
+            r"\b(?:i|we)\s+(?:accept|agree)\b",
+            r"\b(?:offer|proposal|terms)\s+(?:is|are)\s+accepted\b",
+            r"\bdeal\s+accepted\b",
+            r"\bwe\s+have\s+(?:a\s+)?deal\b",
+        )
+        return any(re.search(pattern, text) for pattern in acceptance_patterns)
 
     def _evaluate_outcome(
         self,
@@ -2063,6 +2266,8 @@ Example: yes, yes'''
 
         agent_modules = agent_modules if agent_modules is not None else ['theory_of_mind']
         gm_modules = gm_modules or ['social_intelligence']
+        sample_start = len(self.activation_samples)
+        call_start = self.model.call_count
 
         print(f"\nRunning {num_trials} trials of {scenario} scenario")
         if condition:
@@ -2096,8 +2301,8 @@ Example: yes, yes'''
             average_payoff=0.0,
             agreement_rate=np.mean([s > 0 for s in cooperation_scores]),
             num_trials=num_trials,
-            activation_samples=self.activation_samples,
-            total_llm_calls=self.model.call_count,
+            activation_samples=self.activation_samples[sample_start:],
+            total_llm_calls=self.model.call_count - call_start,
             layers_captured=self.model.hook_names,
             activation_dim=self.model.activation_dim,
             total_deception_detected=total_deception,
@@ -2150,6 +2355,7 @@ Example: yes, yes'''
 
         # Default to empty modules - theory_of_mind has compatibility issues
         agent_modules = agent_modules if agent_modules is not None else ['theory_of_mind']
+        sample_start = len(self.activation_samples)
         condition_enums = [
             self._normalize_incentive_condition(c)
             for c in (conditions or [IncentiveCondition.HIGH_INCENTIVE, IncentiveCondition.LOW_INCENTIVE])
@@ -2264,7 +2470,7 @@ Example: yes, yes'''
             }
             results['total_deception'] += deception_count
 
-        results['total_samples'] = len(self.activation_samples)
+        results['total_samples'] = len(self.activation_samples) - sample_start
 
         # Print summary
         print(f"\n{'='*70}")
@@ -2382,6 +2588,12 @@ Example: yes, yes'''
                 output_type=entity_lib.OutputType.FREE,
             )
             verify_response = main_agent.act(verify_spec)
+            verify_model_prompt = (
+                self.model.get_last_prompt()
+                if hasattr(self.model, 'get_last_prompt')
+                else verification_prompt
+            ) or verification_prompt
+            verify_sampling_config = self._get_last_sampling_config()
 
             if self.model.call_count > pre_verify_count:
                 verify_activations = self.model.get_activations()
@@ -2391,7 +2603,7 @@ Example: yes, yes'''
                     sample_type="pre_verification",  # 2026-04-21 audit fix: tag explicitly so probe training can filter
                     agent_name="Negotiator",
                     activations=verify_activations,
-                    prompt=verification_prompt,
+                    prompt=verify_model_prompt,
                     response=verify_response,
                     perceived_deception=0.0,
                     emotion_intensity=0.0,
@@ -2411,6 +2623,7 @@ Example: yes, yes'''
                     experiment_mode="emergent",
                     is_verification_probe=True,
                     counterpart_type=ct_label,
+                    sampling_config=verify_sampling_config,
                 )
                 trial_samples.append(verify_sample)
                 logger.debug("Belief verification probe captured for trial %d", self._trial_id)
@@ -2446,6 +2659,12 @@ Example: yes, yes'''
             )
 
             response = main_agent.act(action_spec)
+            model_prompt = (
+                self.model.get_last_prompt()
+                if hasattr(self.model, 'get_last_prompt')
+                else action_prompt
+            ) or action_prompt
+            sampling_config = self._get_last_sampling_config()
             all_responses.append(response)
 
             # Capture activations if LLM was called
@@ -2460,7 +2679,13 @@ Example: yes, yes'''
                 # Compute ground truth using LLM-based GM detection (proper research approach)
                 # This compares agent's response against known ground truth params
                 gm_labels = self._detect_deception_with_llm(scenario, response, params)
-                is_deceptive = gm_labels['actual_deception'] > 0.5
+                # ``emergent_ground_truth`` labels this acting-model call. A
+                # cumulative transcript label would mark later honest turns as
+                # deceptive after any earlier event and misalign activation and
+                # target. Trial-level detection is accumulated separately.
+                is_deceptive = bool(compute_ground_truth(
+                    scenario, response, params
+                ))
                 if is_deceptive:
                     deception_detected = True
 
@@ -2471,7 +2696,9 @@ Example: yes, yes'''
                 gt_deepeval_val = None
                 try:
                     from .scenarios.emergent_prompts import compute_ground_truth as regex_gt
-                    gt_regex_val = 1.0 if regex_gt(scenario, response, params) else 0.0
+                    gt_regex_val = 1.0 if regex_gt(
+                        scenario, response, params
+                    ) else 0.0
                 except Exception:
                     pass
                 try:
@@ -2513,7 +2740,7 @@ Example: yes, yes'''
                     round_num=round_num,
                     agent_name="Negotiator",
                     activations=activations,
-                    prompt=action_prompt,
+                    prompt=model_prompt,
                     response=response,
                     # Agent labels
                     perceived_deception=agent_labels['perceived_deception'],
@@ -2563,6 +2790,7 @@ Example: yes, yes'''
                     belief_shift_injected=injection_happened,
                     belief_shift_type=injection_type,
                     belief_shift_round=injection_round,
+                    sampling_config=sampling_config,
                 )
                 trial_samples.append(sample)
 
@@ -2600,6 +2828,12 @@ Example: yes, yes'''
                 output_type=entity_lib.OutputType.FREE,
             )
             plausibility_response = main_agent.act(plaus_spec)
+            plaus_model_prompt = (
+                self.model.get_last_prompt()
+                if hasattr(self.model, 'get_last_prompt')
+                else plausibility_prompt
+            ) or plausibility_prompt
+            plaus_sampling_config = self._get_last_sampling_config()
 
             # Capture activations for the plausibility probe too
             if self.model.call_count > pre_plaus_count:
@@ -2610,7 +2844,7 @@ Example: yes, yes'''
                     sample_type="post_plausibility",  # 2026-04-21 audit fix: tag explicitly so probe training can filter
                     agent_name="Negotiator",
                     activations=plaus_activations,
-                    prompt=plausibility_prompt,
+                    prompt=plaus_model_prompt,
                     response=plausibility_response,
                     perceived_deception=0.0,
                     emotion_intensity=0.0,
@@ -2630,6 +2864,7 @@ Example: yes, yes'''
                     experiment_mode="emergent",
                     plausibility_response=plausibility_response,
                     counterpart_type=ct_label,
+                    sampling_config=plaus_sampling_config,
                 )
                 trial_samples.append(plaus_sample)
                 logger.debug("Plausibility probe captured for trial %d", self._trial_id)
@@ -2947,6 +3182,8 @@ Example: yes, yes'''
                 dialogue_so_far = []
                 last_response = None
                 last_activations = {}
+                last_model_prompt = framed_prompt
+                last_sampling_config = {}
 
                 for round_num in range(max_rounds):
                     # Main agent acts
@@ -2956,6 +3193,12 @@ Example: yes, yes'''
                         output_type=entity_lib.OutputType.FREE,
                     )
                     response = main_agent.act(action_spec)
+                    last_model_prompt = (
+                        self.model.get_last_prompt()
+                        if hasattr(self.model, 'get_last_prompt')
+                        else action_spec.call_to_action
+                    ) or action_spec.call_to_action
+                    last_sampling_config = self._get_last_sampling_config()
                     dialogue_so_far.append(f"Negotiator: {response}")
                     last_response = response
 
@@ -2974,7 +3217,6 @@ Example: yes, yes'''
                     main_agent.observe(f"Counterpart: {cp_response}")
                     counterpart.observe(f"Negotiator: {response}")
 
-                # Ground truth from last response
                 gt = compute_ground_truth(scenario, last_response or "", params)
 
                 # Create sample with framing_variant tag
@@ -2983,7 +3225,7 @@ Example: yes, yes'''
                     round_num=max_rounds - 1,
                     agent_name="Negotiator",
                     activations=last_activations,
-                    prompt=framed_prompt,
+                    prompt=last_model_prompt,
                     response=last_response or "",
                     perceived_deception=0.0,
                     emotion_intensity=0.0,
@@ -2997,12 +3239,13 @@ Example: yes, yes'''
                     modules_enabled=[],
                     pod_id=self._pod_id,
                     emergent_scenario=scenario,
-                    incentive_condition=condition_enum.name,
+                    incentive_condition=condition_enum.value,
                     scenario_params=params.copy(),
                     emergent_ground_truth=gt,
                     experiment_mode="emergent",
                     framing_variant=framing,
                     dialogue_history=dialogue_so_far,
+                    sampling_config=last_sampling_config,
                 )
                 self.activation_samples.append(sample)
 
@@ -3031,9 +3274,14 @@ Example: yes, yes'''
                     # Compute mean activation per framing, then cosine similarity
                     mean_1 = torch.stack(acts_1).mean(dim=0)
                     mean_2 = torch.stack(acts_2).mean(dim=0)
-                    cos_sim = float(torch.nn.functional.cosine_similarity(
-                        mean_1.unsqueeze(0), mean_2.unsqueeze(0)
-                    ))
+                    flat_1 = mean_1.reshape(-1).float()
+                    flat_2 = mean_2.reshape(-1).float()
+                    denominator = float(flat_1.norm() * flat_2.norm())
+                    cos_sim = (
+                        float((flat_1 * flat_2).sum()) / denominator
+                        if denominator > 0.0
+                        else 0.0
+                    )
                     similarity_matrix[f"{f1}_vs_{f2}"] = cos_sim
 
         # Summary
@@ -3189,7 +3437,7 @@ Example: yes, yes'''
         all_gm_deception = []  # Single deception score for probe training
         all_agent_deception = []  # Perceived deception for comparison
         all_scenarios = []  # Scenario names for cross-scenario analysis
-        all_sae_features = []  # SAE feature activations (if available)
+        all_sae_features = []  # SAE feature activations aligned to samples
         all_sae_top_features = []  # Top-k SAE feature indices
         metadata = []
 
@@ -3201,7 +3449,22 @@ Example: yes, yes'''
         all_trial_outcomes = []  # RQ-MA3: Outcome prediction
         all_pod_ids = []  # For parallel execution: identifies source pod
 
-        for sample in self.activation_samples:
+        if not self.activation_samples:
+            logger.warning("No samples to save!")
+            return
+
+        expected_layer_names = set(self.activation_samples[0].activations)
+        if not expected_layer_names:
+            raise ValueError("First activation sample has no captured activations")
+
+        for sample_idx, sample in enumerate(self.activation_samples):
+            layer_names = set(sample.activations)
+            if layer_names != expected_layer_names:
+                raise ValueError(
+                    "Activation layers are not aligned across samples: "
+                    f"sample {sample_idx} has {sorted(layer_names)}, expected "
+                    f"{sorted(expected_layer_names)}"
+                )
             # Organize activations by layer
             for layer_name, activation in sample.activations.items():
                 # Extract layer key from hook name
@@ -3226,7 +3489,7 @@ Example: yes, yes'''
                 gm_label = sample.actual_deception
             all_gm_deception.append(gm_label)
 
-            # Agent self-report label
+            # Agent belief about counterpart deception (not self-report)
             all_agent_deception.append(sample.perceived_deception)
 
             # Scenario name (use emergent_scenario if available)
@@ -3255,6 +3518,9 @@ Example: yes, yes'''
                 'emergent_ground_truth': sample.emergent_ground_truth,
                 'actual_deception': sample.actual_deception,
                 'perceived_deception': sample.perceived_deception,
+                'modules_enabled': list(sample.modules_enabled),
+                'activation_position': sample.activation_position,
+                'sampling_config': dict(sample.sampling_config),
                 # RQ1: Mode tracking
                 'experiment_mode': sample.experiment_mode,
                 # Multi-agent fields
@@ -3297,10 +3563,17 @@ Example: yes, yes'''
                 'framing_variant': sample.framing_variant,
             })
 
-            # SAE features (if available)
-            if sample.sae_features is not None:
-                all_sae_features.append(sample.sae_features)
-                all_sae_top_features.append(sample.sae_top_features or [])
+            try:
+                from interpretability.core.qc_filter import classify_response
+                metadata[-1]['qc_flags'] = sorted(
+                    classify_response(sample.response)
+                )
+            except ImportError:
+                metadata[-1]['qc_flags'] = []
+
+            # Preserve the main sample axis even when SAE capture failed.
+            all_sae_features.append(sample.sae_features)
+            all_sae_top_features.append(sample.sae_top_features or [])
 
         if activations_by_layer:
             # Stack activations by layer: Dict[layer_num, Tensor[N, d_model]]
@@ -3332,10 +3605,29 @@ Example: yes, yes'''
 
                 # Config info
                 'config': {
+                    'dataset_schema_version': '2.0',
                     'model': getattr(self.model, 'model_name', 'unknown'),
                     'layers': list(stacked_activations.keys()),
                     'n_samples': len(all_gm_deception),
-                    'has_sae': len(all_sae_features) > 0,
+                    'has_sae': any(f is not None for f in all_sae_features),
+                    'activation_position': self.activation_samples[0].activation_position,
+                    'sampling_configs': [
+                        json.loads(serialized)
+                        for serialized in sorted({
+                            json.dumps(sample.sampling_config, sort_keys=True)
+                            for sample in self.activation_samples
+                            if sample.sampling_config
+                        })
+                    ],
+                    'runtime_versions': {
+                        'gdm-concordia': _package_version('gdm-concordia'),
+                        'transformer-lens': _package_version('transformer-lens'),
+                        'torch': _package_version('torch'),
+                    },
+                    'label_semantics': {
+                        'gm_labels': 'acting-agent deception ground truth',
+                        'agent_labels': 'acting agent estimate of counterpart deception',
+                    },
                 },
 
                 # Parallel execution info (for merging results from multiple pods)
@@ -3351,12 +3643,13 @@ Example: yes, yes'''
             }
 
             # Add SAE features if available
-            if all_sae_features:
+            if any(f is not None for f in all_sae_features):
                 # Convert SAE features to tensor format
                 # sae_features is Dict[int, float] -> convert to dense tensor
                 try:
                     # Get the max feature index to determine tensor size
-                    max_idx = max(max(f.keys()) for f in all_sae_features if f)
+                    populated = [f for f in all_sae_features if f]
+                    max_idx = max(max(f.keys()) for f in populated)
                     sae_dim = max_idx + 1
 
                     # Create dense SAE feature tensor [N, sae_dim]
@@ -3368,6 +3661,9 @@ Example: yes, yes'''
 
                     dataset['sae_features'] = sae_tensor
                     dataset['sae_top_features'] = all_sae_top_features
+                    dataset['sae_available_mask'] = [
+                        features is not None for features in all_sae_features
+                    ]
                     dataset['config']['sae_dim'] = sae_dim
                 except Exception as e:
                     logger.warning("Could not save SAE features: %s", e)
@@ -3377,8 +3673,11 @@ Example: yes, yes'''
             # Also save transcripts as .jsonl for easy human inspection (no torch needed)
             try:
                 import json
-                jsonl_path = filepath.replace('.pt', '_transcripts.jsonl')
-                with open(jsonl_path, 'w') as jf:
+                dataset_path = Path(filepath)
+                jsonl_path = dataset_path.with_name(
+                    f"{dataset_path.stem}_transcripts.jsonl"
+                )
+                with jsonl_path.open('w') as jf:
                     for m in metadata:
                         record = {
                             'trial_id': m.get('trial_id'),
@@ -3400,8 +3699,8 @@ Example: yes, yes'''
 
             # Log summary
             n_samples = len(all_gm_deception)
-            layers = sorted(stacked_activations.keys())
-            d_model = stacked_activations[layers[0]].shape[1] if layers else 0
+            layers = sorted(stacked_activations.keys(), key=lambda value: str(value))
+            d_model = stacked_activations[layers[0]].shape[-1] if layers else 0
 
             logger.info("Saved %d samples to %s", n_samples, filepath)
             logger.info("Layers: %s", layers)
@@ -3409,8 +3708,9 @@ Example: yes, yes'''
             logger.info("GM deception rate: %.1f%%", np.mean(all_gm_deception) * 100)
 
             # SAE summary
-            if all_sae_features:
-                logger.info("SAE features: %d samples, dim=%s", len(all_sae_features), dataset['config'].get('sae_dim', 'N/A'))
+            if any(f is not None for f in all_sae_features):
+                n_sae = sum(f is not None for f in all_sae_features)
+                logger.info("SAE features: %d samples, dim=%s", n_sae, dataset['config'].get('sae_dim', 'N/A'))
             else:
                 logger.info("SAE features: None (not captured or SAE disabled)")
 
@@ -3436,8 +3736,6 @@ Example: yes, yes'''
             for r in all_round_nums:
                 round_counts[r] = round_counts.get(r, 0) + 1
             logger.info("Round breakdown: %s", dict(sorted(round_counts.items())))
-        else:
-            logger.warning("No samples to save!")
 
     def print_summary(self, results: EvaluationResult):
         """Print summary of results."""

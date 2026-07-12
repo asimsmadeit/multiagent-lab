@@ -157,7 +157,7 @@ class NegotiationMetrics:
         """Rounds efficiency (lower is better)."""
         if self.max_rounds == 0:
             return 0.0
-        return 1.0 - (self.rounds_used / self.max_rounds)
+        return max(0.0, min(1.0, 1.0 - (self.rounds_used / self.max_rounds)))
 
     @property
     def pareto_efficiency(self) -> float:
@@ -490,6 +490,8 @@ def calculate_effect_size(group1: List[float], group2: List[float]) -> float:
 
     # Pooled standard deviation
     n1, n2 = len(group1), len(group2)
+    if n1 + n2 <= 2:
+        return 0.0
     pooled_std = ((var1 * (n1 - 1) + var2 * (n2 - 1)) / (n1 + n2 - 2)) ** 0.5
 
     if pooled_std == 0:

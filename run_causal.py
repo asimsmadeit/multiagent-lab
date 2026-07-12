@@ -13,7 +13,7 @@ Usage:
     python run_causal.py --scenario ultimatum_bluff
     python run_causal.py --scenario ultimatum_bluff --model meta-llama/Llama-3.1-8B-Instruct --layer 16
     python run_causal.py --scenario alliance_betrayal --n-prompts 100 --layer 14
-    python run_causal.py --scenario info_withholding --device cuda
+    python run_causal.py --scenario info_withholding --device cudadeception in mul
 """
 
 # ── Flash attention workaround (must be before any torch/transformers imports) ──

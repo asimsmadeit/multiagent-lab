@@ -2,12 +2,12 @@
 
 import dataclasses
 import math
-import random
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
-from concordia_mini.typing import entity_component
-from concordia_mini.typing import entity as entity_lib
+from concordia.typing import entity_component
+from concordia.typing import entity as entity_lib
 
 
 @dataclasses.dataclass
@@ -20,13 +20,29 @@ class BeliefDistribution:
     evidence_count: int = 0  # Number of observations supporting this belief
     last_updated: Optional[str] = None
 
-    def sample(self, n: int = 1) -> Union[float, List[float]]:
+    def __post_init__(self) -> None:
+        if self.std <= 0:
+            raise ValueError('Belief standard deviation must be positive.')
+        self.confidence = max(0.0, min(1.0, self.confidence))
+
+    def sample(
+        self,
+        n: int = 1,
+        *,
+        rng: Optional[np.random.Generator] = None,
+    ) -> Union[float, List[float]]:
         """Sample from the belief distribution."""
-        samples = np.random.normal(self.mean, self.std, n)
+        if n < 1:
+            raise ValueError('n must be at least 1.')
+        generator = rng or np.random.default_rng()
+        samples = generator.normal(self.mean, self.std, n)
         return samples[0] if n == 1 else samples.tolist()
 
     def update_with_evidence(self, observation: float, reliability: float = 1.0):
         """Bayesian update with new evidence."""
+        reliability = max(0.0, min(1.0, reliability))
+        if reliability == 0.0:
+            return
         # Simple Bayesian updating assuming normal distributions
         prior_precision = 1 / (self.std ** 2)
         evidence_precision = reliability / (self.std ** 2)  # Reliability affects precision
@@ -47,7 +63,9 @@ class BeliefDistribution:
 
     def get_confidence_interval(self, level: float = 0.95) -> Tuple[float, float]:
         """Get confidence interval for the belief."""
-        z_score = 1.96 if level == 0.95 else 2.58  # 95% or 99%
+        if level not in (0.95, 0.99):
+            raise ValueError('Only 0.95 and 0.99 confidence levels are supported.')
+        z_score = 1.96 if level == 0.95 else 2.58
         margin = z_score * self.std
         return (self.mean - margin, self.mean + margin)
 
@@ -84,6 +102,7 @@ class UncertaintyAware(entity_component.ContextComponent):
         confidence_threshold: float = 0.7,
         risk_tolerance: float = 0.3,
         information_gathering_budget: float = 0.1,
+        seed: Optional[int] = None,
     ):
         """Initialize uncertainty-aware component.
 
@@ -92,11 +111,20 @@ class UncertaintyAware(entity_component.ContextComponent):
             confidence_threshold: Minimum confidence for decisions
             risk_tolerance: Tolerance for uncertainty (0-1)
             information_gathering_budget: Fraction of value to spend on info gathering
+            seed: Optional seed for reproducible scenario sampling
         """
+        for name, value in (
+            ('confidence_threshold', confidence_threshold),
+            ('risk_tolerance', risk_tolerance),
+            ('information_gathering_budget', information_gathering_budget),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f'{name} must be between 0 and 1.')
         self._model = model
         self._confidence_threshold = confidence_threshold
         self._risk_tolerance = risk_tolerance
         self._info_budget = information_gathering_budget
+        self._rng = np.random.default_rng(seed)
 
         # Belief state tracking
         self._beliefs: Dict[str, BeliefDistribution] = {}
@@ -198,7 +226,7 @@ SCENARIOS: [Key scenarios to consider]"""
 
         return analysis
 
-    def _update_beliefs_from_context(self, context: str):
+    def _update_beliefs_from_context(self, context: str) -> set[str]:
         """Update beliefs based on new context information."""
         # Extract numerical hints from context
         prompt = f"""Extract any numerical or quantitative information from this context that could update our beliefs:
@@ -222,30 +250,37 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
         response = self._model.sample_text(prompt)
 
         # Parse and update beliefs
-        lines = response.split('\n')
-        for line in lines:
-            if line.startswith('BUDGET_INFO:'):
-                parts = line[12:].strip().split()
-                if len(parts) >= 2:
-                    try:
-                        value = float(parts[0])
-                        confidence = float(parts[1])
-                        self._beliefs['counterpart_reservation'].update_with_evidence(value, confidence)
-                    except ValueError:
-                        pass
-            elif line.startswith('TIMELINE_INFO:'):
-                parts = line[13:].strip().split()
-                if len(parts) >= 2:
-                    try:
-                        flexibility = float(parts[0])
-                        confidence = float(parts[1])
-                        self._beliefs['counterpart_flexibility'].update_with_evidence(flexibility, confidence)
-                    except ValueError:
-                        pass
-            # Similar parsing for other info types
+        updated: set[str] = set()
+        field_mapping = {
+            'BUDGET_INFO': ('counterpart_reservation', (0.0, float('inf'))),
+            'TIMELINE_INFO': ('counterpart_flexibility', (0.0, 1.0)),
+            'PRIORITY_INFO': ('deal_probability', (0.0, 1.0)),
+            'MARKET_INFO': ('market_conditions', (-1.0, 1.0)),
+            'RELATIONSHIP_INFO': ('deal_probability', (0.0, 1.0)),
+        }
+        number = r'[-+]?(?:\d+(?:,\d{3})*(?:\.\d+)?|\.\d+)'
+        for label, (belief_name, bounds) in field_mapping.items():
+            match = re.search(
+                rf'{label}:\s*\[?\$?({number})\]?\s*\[?({number})\]?',
+                response,
+                flags=re.IGNORECASE,
+            )
+            if match is None:
+                continue
+            try:
+                value = float(match.group(1).replace(',', ''))
+                reliability = float(match.group(2).replace(',', ''))
+            except ValueError:
+                continue
+            value = max(bounds[0], min(bounds[1], value))
+            self._beliefs[belief_name].update_with_evidence(value, reliability)
+            updated.add(belief_name)
+        return updated
 
     def _generate_scenarios(self, n_scenarios: int = 5) -> List[ScenarioAnalysis]:
         """Generate scenarios based on current beliefs."""
+        if n_scenarios < 0:
+            raise ValueError('n_scenarios must be non-negative.')
         scenarios = []
 
         # Define scenario types with different assumptions
@@ -282,23 +317,37 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
             }
         ]
 
-        for template in scenario_templates:
+        selected_templates = scenario_templates[:n_scenarios]
+        probability_total = sum(t['probability'] for t in selected_templates)
+        for template in selected_templates:
             # Calculate scenario values based on current beliefs and multipliers
             reservation_belief = self._beliefs['counterpart_reservation']
             flexibility_belief = self._beliefs['counterpart_flexibility']
             deal_prob_belief = self._beliefs['deal_probability']
 
             # Sample values for this scenario
-            reservation_sample = reservation_belief.sample() * template['multipliers']['reservation']
-            flexibility_sample = flexibility_belief.sample() * template['multipliers']['flexibility']
-            deal_prob_sample = deal_prob_belief.sample() * template['multipliers']['deal_prob']
+            reservation_sample = max(
+                0.0,
+                reservation_belief.sample(rng=self._rng) * template['multipliers']['reservation'],
+            )
+            flexibility_sample = max(0.0, min(
+                1.0,
+                flexibility_belief.sample(rng=self._rng) * template['multipliers']['flexibility'],
+            ))
+            deal_prob_sample = max(0.0, min(
+                1.0,
+                deal_prob_belief.sample(rng=self._rng) * template['multipliers']['deal_prob'],
+            ))
 
             # Estimate expected value for scenario
             expected_value = reservation_sample * deal_prob_sample * (1 + flexibility_sample)
 
             scenario = ScenarioAnalysis(
                 scenario_name=template['name'],
-                probability=template['probability'],
+                probability=(
+                    template['probability'] / probability_total
+                    if probability_total else 0.0
+                ),
                 expected_value=expected_value,
                 worst_case=expected_value * 0.7,  # Assume 30% downside
                 best_case=expected_value * 1.3,   # Assume 30% upside
@@ -444,21 +493,17 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
 
     def post_act(self, action_attempt: str) -> str:
         """Update uncertainty state based on action taken."""
-        # Analyze action for information gathering or commitment
-        if '?' in action_attempt or 'ask' in action_attempt.lower() or 'question' in action_attempt.lower():
-            # Information gathering action
-            for belief in self._beliefs.values():
-                belief.confidence = min(0.95, belief.confidence + 0.02)  # Small confidence boost
-
+        # Asking a question is not evidence; confidence changes on observation.
         return ""
 
     def observe(self, observation: str) -> None:
         """Process observations to update beliefs."""
         # Update beliefs based on new observations
-        self._update_beliefs_from_context(observation)
+        updated = self._update_beliefs_from_context(observation)
 
         # Extract any explicit information from counterpart
-        if 'budget' in observation.lower() or '$' in observation:
+        if ('counterpart_reservation' not in updated and
+                ('budget' in observation.lower() or '$' in observation)):
             # Try to extract budget information
             import re
             numbers = re.findall(r'\$?(\d+(?:,\d+)*(?:\.\d+)?)', observation)
@@ -469,8 +514,13 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
                 except ValueError:
                     pass
 
+    def pre_observe(self, observation: str) -> str:
+        """Feed entity observations into Bayesian belief updates."""
+        self.observe(observation)
+        return ""
+
     def get_state(self) -> Dict[str, Any]:
-        """Get component state."""
+        """Return the complete probabilistic state."""
         return {
             'beliefs': {
                 name: {
@@ -478,21 +528,52 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
                     'std': belief.std,
                     'confidence': belief.confidence,
                     'evidence_count': belief.evidence_count,
+                    'last_updated': belief.last_updated,
                 }
                 for name, belief in self._beliefs.items()
             },
-            'avg_confidence': np.mean([belief.confidence for belief in self._beliefs.values()]),
-            'uncertainty_level': 1 - np.mean([belief.confidence for belief in self._beliefs.values()]),
+            'avg_confidence': float(np.mean([
+                belief.confidence for belief in self._beliefs.values()
+            ])),
+            'uncertainty_level': float(1 - np.mean([
+                belief.confidence for belief in self._beliefs.values()
+            ])),
+            'scenario_probabilities': dict(self._scenario_probabilities),
+            'uncertainty_sources': list(self._uncertainty_sources),
+            'information_gaps': list(self._information_gaps),
+            'rng_state': self._rng.bit_generator.state,
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Set component state."""
+        if not isinstance(state, dict):
+            raise TypeError('Uncertainty state must be a mapping.')
         for name, belief_data in state.get('beliefs', {}).items():
             if name in self._beliefs:
-                self._beliefs[name].mean = belief_data.get('mean', self._beliefs[name].mean)
-                self._beliefs[name].std = belief_data.get('std', self._beliefs[name].std)
-                self._beliefs[name].confidence = belief_data.get('confidence', self._beliefs[name].confidence)
-                self._beliefs[name].evidence_count = belief_data.get('evidence_count', self._beliefs[name].evidence_count)
+                belief = self._beliefs[name]
+                belief.mean = float(belief_data.get('mean', belief.mean))
+                belief.std = max(0.01, float(belief_data.get('std', belief.std)))
+                belief.confidence = max(0.0, min(
+                    1.0,
+                    float(belief_data.get('confidence', belief.confidence)),
+                ))
+                belief.evidence_count = int(
+                    belief_data.get('evidence_count', belief.evidence_count)
+                )
+                updated = belief_data.get('last_updated')
+                belief.last_updated = str(updated) if updated is not None else None
+        self._scenario_probabilities = {
+            str(name): float(value)
+            for name, value in state.get('scenario_probabilities', {}).items()
+        }
+        self._uncertainty_sources = [
+            str(item) for item in state.get('uncertainty_sources', [])
+        ]
+        self._information_gaps = [
+            str(item) for item in state.get('information_gaps', [])
+        ]
+        if 'rng_state' in state:
+            self._rng.bit_generator.state = state['rng_state']
 
     def get_action_attempt(
         self,
@@ -610,4 +691,4 @@ Action:"""
         for belief in self._beliefs.values():
             if belief.evidence_count == 0:
                 belief.confidence *= 0.99  # Slow decay
-                belief.std = min(belief.std * 1.01, belief.std * 2)  # Increase uncertainty
+                belief.std *= 1.01

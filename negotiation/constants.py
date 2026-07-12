@@ -67,7 +67,7 @@ MODULE_COMPONENT_NAMES = {
     ModuleType.CULTURAL_ADAPTATION: 'CulturalAdaptation',
     ModuleType.TEMPORAL_STRATEGY: 'TemporalStrategy',
     ModuleType.SWARM_INTELLIGENCE: 'SwarmIntelligence',
-    ModuleType.UNCERTAINTY_AWARE: 'UncertaintyAwareNegotiator',
+    ModuleType.UNCERTAINTY_AWARE: 'UncertaintyAware',
     ModuleType.STRATEGY_EVOLUTION: 'StrategyEvolution',
 }
 

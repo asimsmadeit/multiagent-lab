@@ -2,10 +2,12 @@
 
 import dataclasses
 import enum
-from typing import Dict, List, Optional, Tuple
+import re
+from collections.abc import Mapping
+from typing import Any, Dict, List, Optional, Tuple
 
-from concordia_mini.language_model import language_model
-from concordia_mini.typing import entity_component
+from concordia.language_model import language_model
+from concordia.typing import entity_component
 
 
 class CulturalDimension(enum.Enum):
@@ -159,6 +161,11 @@ class CulturalAdaptation(entity_component.ContextComponent):
             adaptation_level: How much to adapt (0 = none, 1 = full)
             detect_culture: Whether to auto-detect counterpart's culture
         """
+        if own_culture not in CULTURAL_PROFILES:
+            valid = ', '.join(sorted(CULTURAL_PROFILES))
+            raise ValueError(f'Unknown culture {own_culture!r}. Expected one of: {valid}.')
+        if not 0.0 <= adaptation_level <= 1.0:
+            raise ValueError('adaptation_level must be between 0 and 1.')
         self._model = model
         self._own_profile = CULTURAL_PROFILES[own_culture]
         self._adaptation_level = adaptation_level
@@ -199,8 +206,15 @@ Return only the profile name (e.g., western_business).'''
         response = self._model.sample_text(prompt, max_tokens=20)
 
         # Validate response
-        profile_name = response.strip().lower()
-        if profile_name in CULTURAL_PROFILES:
+        response_lower = response.lower()
+        profile_name = next(
+            (
+                name for name in CULTURAL_PROFILES
+                if re.search(rf'\b{re.escape(name)}\b', response_lower)
+            ),
+            None,
+        )
+        if profile_name is not None:
             self._detected_culture = profile_name
             self._counterpart_profile = CULTURAL_PROFILES[profile_name]
             return profile_name
@@ -212,9 +226,8 @@ Return only the profile name (e.g., western_business).'''
         if not self._counterpart_profile:
             return self._get_own_style()
 
-        # Calculate adaptation based on cultural distance and adaptation level
-        distance = self._own_profile.get_distance_from(self._counterpart_profile)
-        actual_adaptation = min(distance, self._adaptation_level)
+        # Interpolate according to the documented 0 (none) to 1 (full) level.
+        actual_adaptation = self._adaptation_level
 
         # Interpolate between own and counterpart styles
         adapted_directness = self._interpolate(
@@ -366,7 +379,7 @@ Return only the profile name (e.g., western_business).'''
     def pre_observe(self, observation: str) -> str:
         """Detect cultural cues from observations."""
         # Try to detect culture from substantial communications
-        if len(observation) > 100 and 'said:' in observation:
+        if len(observation.strip()) >= 20:
             self.detect_cultural_style(observation)
         return ""
 
@@ -383,14 +396,40 @@ Return only the profile name (e.g., western_business).'''
         """Component name."""
         return 'CulturalAdaptation'
 
-    def get_state(self) -> str:
+    def get_state(self) -> Dict[str, Any]:
         """Get component state."""
-        return f'{self._detected_culture}|{len(self._adaptation_history)}'
+        return {
+            'detected_culture': self._detected_culture,
+            'adaptation_history': [
+                [culture, action]
+                for culture, action in self._adaptation_history
+            ],
+            'cultural_bridges': list(self._cultural_bridges),
+        }
 
-    def set_state(self, state: str) -> None:
+    def set_state(self, state: Mapping[str, Any] | str) -> None:
         """Set component state."""
-        if '|' in state:
-            culture, history_len = state.split('|', 1)
+        if isinstance(state, str) and '|' in state:
+            culture, _ = state.split('|', 1)
             if culture != 'None' and culture in CULTURAL_PROFILES:
                 self._detected_culture = culture
                 self._counterpart_profile = CULTURAL_PROFILES[culture]
+            return
+        if not isinstance(state, Mapping):
+            raise TypeError('Cultural state must be a mapping or legacy string.')
+        culture = state.get('detected_culture')
+        self._detected_culture = (
+            str(culture) if culture in CULTURAL_PROFILES else None
+        )
+        self._counterpart_profile = (
+            CULTURAL_PROFILES[self._detected_culture]
+            if self._detected_culture is not None else None
+        )
+        self._adaptation_history = [
+            (str(item[0]), str(item[1]))
+            for item in state.get('adaptation_history', [])
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        ]
+        self._cultural_bridges = [
+            str(bridge) for bridge in state.get('cultural_bridges', [])
+        ]

@@ -40,6 +40,7 @@ class UncertaintyMetrics:
   outcome_uncertainty: float  # 0-1
   opponent_model_confidence: float  # 0-1
   information_seeking_behavior: float  # 0-1
+  last_updated_round: int = 0
 
 
 @dataclasses.dataclass
@@ -84,6 +85,10 @@ class UncertaintyManagementGM(gm_modules.NegotiationGMModule):
     self._allow_information_trading = self._config.get('allow_information_trading', True)
     self._uncertainty_threshold = self._config.get('uncertainty_threshold', 0.7)
     self._information_decay_rate = self._config.get('information_decay_rate', 0.95)
+    if not 0.0 <= self._uncertainty_threshold <= 1.0:
+      raise ValueError('uncertainty_threshold must be between 0 and 1.')
+    if not 0.0 <= self._information_decay_rate <= 1.0:
+      raise ValueError('information_decay_rate must be between 0 and 1.')
 
   def get_supported_agent_modules(self) -> Set[str]:
     """Return agent modules this supports."""
@@ -101,11 +106,13 @@ class UncertaintyManagementGM(gm_modules.NegotiationGMModule):
     if not self._track_asymmetries:
       return
 
+    knowledge_level = max(0.0, min(1.0, knowledge_level))
+    strategic_value = max(0.0, min(1.0, strategic_value))
     asymmetry = InformationAsymmetry(
         actor=actor,
         information_type=information_type,
         knowledge_level=knowledge_level,
-        visibility=visible_to,
+        visibility=set(visible_to),
         strategic_value=strategic_value,
         revelation_cost=1 - strategic_value,  # Inverse relationship
     )
@@ -130,21 +137,17 @@ class UncertaintyManagementGM(gm_modules.NegotiationGMModule):
     metrics = self._uncertainty_metrics[participant]
 
     # Update based on negotiation progress
-    total_rounds = context.current_round
-    if total_rounds > 5:
-      # Uncertainty typically decreases over time
-      decay_factor = self._information_decay_rate ** (total_rounds - 5)
+    total_rounds = max(0, context.current_round)
+    elapsed_rounds = max(
+        0,
+        total_rounds - max(5, metrics.last_updated_round),
+    )
+    if elapsed_rounds:
+      decay_factor = self._information_decay_rate ** elapsed_rounds
       metrics.preference_uncertainty *= decay_factor
       metrics.constraint_uncertainty *= decay_factor
       metrics.outcome_uncertainty *= decay_factor
-
-    # Increase confidence if information was revealed
-    recent_revelations = [r for r in self._information_revelation_history
-                         if r.get('recipient') == participant and
-                         r.get('round', 0) > total_rounds - 3]
-    
-    confidence_boost = min(0.3, len(recent_revelations) * 0.1)
-    metrics.opponent_model_confidence = min(1.0, metrics.opponent_model_confidence + confidence_boost)
+    metrics.last_updated_round = max(metrics.last_updated_round, total_rounds)
 
     return metrics
 
@@ -183,7 +186,10 @@ class UncertaintyManagementGM(gm_modules.NegotiationGMModule):
         asymmetry_bonus = asymmetry.strategic_value * 0.3
         break
 
-    total_value = min(1.0, base_value + uncertainty_factor * 0.3 + asymmetry_bonus) * phase_multiplier
+    total_value = min(
+        1.0,
+        (base_value + uncertainty_factor * 0.3 + asymmetry_bonus) * phase_multiplier,
+    )
     return total_value
 
   def process_information_request(
@@ -251,15 +257,6 @@ class UncertaintyManagementGM(gm_modules.NegotiationGMModule):
       context: gm_modules.ModuleContext,
   ) -> Tuple[bool, Optional[str]]:
     """Validate action for uncertainty management compliance."""
-    # Check for information revelation
-    if any(word in action.lower() for word in ['reveal', 'tell', 'share', 'disclose']):
-      # This could affect information asymmetries
-      self._information_revelation_history.append({
-          'revealer': actor,
-          'round': context.current_round,
-          'action': action,
-      })
-
     # Check if action exploits uncertainty inappropriately
     if any(word in action.lower() for word in ['exploit', 'take advantage', 'mislead']):
       return False, "Exploitative behavior detected in uncertain environment"
@@ -413,19 +410,78 @@ class UncertaintyManagementGM(gm_modules.NegotiationGMModule):
 
     return report
 
-  def get_state(self) -> str:
-    """Get the component state for saving/restoring."""
-    state_dict = {
-        'asymmetries': len(self._information_asymmetries),
-        'requests': len(self._information_requests),
-        'metrics': len(self._uncertainty_metrics),
+  def get_state(self) -> Dict[str, Any]:
+    """Return complete uncertainty-management state."""
+    return {
+        'base': self._get_base_state(),
+        'information_asymmetries': [
+            {
+                **dataclasses.asdict(asymmetry),
+                'visibility': sorted(asymmetry.visibility),
+            }
+            for asymmetry in self._information_asymmetries
+        ],
+        'uncertainty_metrics': {
+            participant: dataclasses.asdict(metrics)
+            for participant, metrics in self._uncertainty_metrics.items()
+        },
+        'information_requests': [
+            dataclasses.asdict(request) for request in self._information_requests
+        ],
+        'information_revelation_history': [
+            dict(item) for item in self._information_revelation_history
+        ],
+        'uncertainty_exploitation': {
+            participant: list(events)
+            for participant, events in self._uncertainty_exploitation.items()
+        },
+        'information_values': dict(self._information_values),
+        'information_trading': [
+            {'parties': list(parties), 'trade': dict(trade)}
+            for parties, trade in self._information_trading.items()
+        ],
     }
-    return str(state_dict)
 
-  def set_state(self, state: str) -> None:
-    """Set the component state from a saved string."""
-    # Since this tracks dynamic data, we only restore basic structure
-    pass
+  def set_state(self, state: Dict[str, Any]) -> None:
+    """Restore complete uncertainty-management state."""
+    if not isinstance(state, dict):
+      raise TypeError('Uncertainty GM state must be a mapping.')
+    self._set_base_state(state)
+    self._information_asymmetries = [
+        InformationAsymmetry(
+            **{
+                **item,
+                'visibility': set(item.get('visibility', [])),
+            }
+        )
+        for item in state.get('information_asymmetries', [])
+    ]
+    self._uncertainty_metrics = {
+        str(participant): UncertaintyMetrics(**metrics)
+        for participant, metrics in state.get('uncertainty_metrics', {}).items()
+    }
+    self._information_requests = [
+        InformationRequest(**request)
+        for request in state.get('information_requests', [])
+    ]
+    self._information_revelation_history = [
+        dict(item)
+        for item in state.get('information_revelation_history', [])
+    ]
+    self._uncertainty_exploitation = {
+        str(participant): [str(event) for event in events]
+        for participant, events in state.get(
+            'uncertainty_exploitation', {}
+        ).items()
+    }
+    self._information_values = {
+        str(name): float(value)
+        for name, value in state.get('information_values', {}).items()
+    }
+    self._information_trading = {
+        tuple(item['parties']): dict(item['trade'])
+        for item in state.get('information_trading', [])
+    }
 
 
 # Register the module

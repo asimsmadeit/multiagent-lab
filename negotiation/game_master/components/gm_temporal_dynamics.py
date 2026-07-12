@@ -40,6 +40,7 @@ class TemporalCommitment:
   created_round: int
   deadline_round: Optional[int]
   fulfilled: bool = False
+  violation_recorded: bool = False
 
 
 class TemporalDynamicsGM(gm_modules.NegotiationGMModule):
@@ -157,7 +158,7 @@ class TemporalDynamicsGM(gm_modules.NegotiationGMModule):
     violations = []
     for commitment in self._commitments:
       if (not commitment.fulfilled and
-          commitment.deadline_round and
+          commitment.deadline_round is not None and
           current_round > commitment.deadline_round):
         violations.append(commitment)
     return violations
@@ -203,8 +204,10 @@ class TemporalDynamicsGM(gm_modules.NegotiationGMModule):
 
     # Update relationships based on actions
     action_lower = event.lower()
-    for participant in context.participants:
-      if participant != actor:
+    if self._track_relationships:
+      for participant in context.participants:
+        if participant == actor:
+          continue
         # Positive relationship updates
         if any(word in action_lower for word in ['agree', 'accept', 'compromise']):
           self.update_relationship(actor, participant, trust_delta=0.1, commitment_delta=0.05)
@@ -214,24 +217,31 @@ class TemporalDynamicsGM(gm_modules.NegotiationGMModule):
         # Commitment actions
         elif any(word in action_lower for word in ['commit', 'promise', 'guarantee']):
           self.update_relationship(actor, participant, commitment_delta=0.1)
-          # Record commitment
-          if 'long' in action_lower:
-            time_horizon = 'long'
-          elif 'short' in action_lower:
-            time_horizon = 'short'
-          else:
-            time_horizon = 'medium'
-          self.record_commitment(
-              actor, 'promise', {'action': event},
-              time_horizon, context.current_round
-          )
+
+    if any(word in action_lower for word in ['commit', 'promise', 'guarantee']):
+      if 'long' in action_lower:
+        time_horizon = 'long'
+      elif 'short' in action_lower:
+        time_horizon = 'short'
+      else:
+        time_horizon = 'medium'
+      self.record_commitment(
+          actor,
+          'promise',
+          {'action': event},
+          time_horizon,
+          context.current_round,
+      )
 
     # Update reputation based on commitment fulfillment
     violations = self.check_commitment_violations(context.current_round)
     for violation in violations:
+      if violation.violation_recorded:
+        continue
       if violation.committer not in self._reputation_scores:
         self._reputation_scores[violation.committer] = 1.0
       self._reputation_scores[violation.committer] *= 0.9  # Reputation penalty
+      violation.violation_recorded = True
 
   def get_observation_context(
       self,
@@ -321,20 +331,50 @@ class TemporalDynamicsGM(gm_modules.NegotiationGMModule):
 
     return report
 
-  def get_state(self) -> str:
-    """Get the component state for saving/restoring."""
-    state_dict = {
-        'relationships': len(self._relationships),
-        'commitments': len(self._commitments),
-        'reputation': len(self._reputation_scores),
-        'milestones': len(self._milestones),
+  def get_state(self) -> Dict[str, Any]:
+    """Return complete temporal tracking state."""
+    return {
+        'base': self._get_base_state(),
+        'relationships': [
+            {'parties': list(parties), **dataclasses.asdict(relationship)}
+            for parties, relationship in self._relationships.items()
+        ],
+        'commitments': [
+            dataclasses.asdict(commitment) for commitment in self._commitments
+        ],
+        'phase_durations': dict(self._phase_durations),
+        'phase_transitions': [list(item) for item in self._phase_transitions],
+        'reputation_scores': dict(self._reputation_scores),
     }
-    return str(state_dict)
 
-  def set_state(self, state: str) -> None:
-    """Set the component state from a saved string."""
-    # Since this tracks dynamic data, we only restore basic structure
-    pass
+  def set_state(self, state: Dict[str, Any]) -> None:
+    """Restore complete temporal tracking state."""
+    if not isinstance(state, dict):
+      raise TypeError('Temporal GM state must be a mapping.')
+    self._set_base_state(state)
+    self._relationships = {
+        tuple(item['parties']): RelationshipState(
+            **{key: value for key, value in item.items() if key != 'parties'}
+        )
+        for item in state.get('relationships', [])
+    }
+    self._commitments = [
+        TemporalCommitment(**item) for item in state.get('commitments', [])
+    ]
+    self._phase_durations = {
+        str(phase): int(duration)
+        for phase, duration in state.get('phase_durations', {}).items()
+    }
+    for phase in ('opening', 'bargaining', 'closing'):
+      self._phase_durations.setdefault(phase, 0)
+    self._phase_transitions = [
+        (str(item[0]), int(item[1]))
+        for item in state.get('phase_transitions', [])
+    ]
+    self._reputation_scores = {
+        str(participant): float(score)
+        for participant, score in state.get('reputation_scores', {}).items()
+    }
 
 
 # Register the module

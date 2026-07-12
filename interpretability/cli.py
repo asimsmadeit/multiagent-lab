@@ -21,8 +21,6 @@ Usage:
 """
 
 import json
-import os
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,9 +35,12 @@ if TYPE_CHECKING:
     import numpy as np
     from interpretability import InterpretabilityRunner
 
+_IMPORTS_LOADED = False
+
 
 def _lazy_import():
     """Import heavy dependencies lazily."""
+    global _IMPORTS_LOADED
     global torch, np
     global InterpretabilityRunner, EMERGENT_SCENARIOS, IncentiveCondition
     global get_emergent_scenarios, generate_scenario_params, compute_emergent_ground_truth
@@ -47,14 +48,15 @@ def _lazy_import():
     global run_full_analysis, train_ridge_probe, compute_generalization_auc
     global run_all_sanity_checks, print_limitations
     global run_full_causal_validation, activation_patching_test, ablation_test
+    global filter_causal_samples
+
+    if _IMPORTS_LOADED:
+        return
 
     import torch as _torch
     import numpy as _np
     torch = _torch
     np = _np
-
-    # Add parent directory to path for imports
-    sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent.parent))
 
     from interpretability import (
         InterpretabilityRunner as _InterpretabilityRunner,
@@ -76,6 +78,9 @@ def _lazy_import():
         activation_patching_test as _activation_patching_test,
         ablation_test as _ablation_test,
     )
+    from interpretability.causal.causal_validation import (
+        filter_causal_samples as _filter_causal_samples,
+    )
 
     InterpretabilityRunner = _InterpretabilityRunner
     EMERGENT_SCENARIOS = _EMERGENT_SCENARIOS
@@ -95,6 +100,8 @@ def _lazy_import():
     run_full_causal_validation = _run_full_causal_validation
     activation_patching_test = _activation_patching_test
     ablation_test = _ablation_test
+    filter_causal_samples = _filter_causal_samples
+    _IMPORTS_LOADED = True
 
 
 # Shared options as decorators
@@ -374,10 +381,11 @@ def train(data, output, verbose):
 
     results = _train_probes_on_data(data, str(output_dir))
 
-    if results.get("best_probe"):
+    best_probe = results.get("best_probe")
+    if isinstance(best_probe, dict):
         click.echo(click.style("\nBest probe:", fg='green', bold=True))
-        click.echo(f"  Layer: {results['best_probe']['layer']}")
-        click.echo(f"  R²: {results['best_probe']['r2']:.3f}")
+        click.echo(f"  Layer: {best_probe['layer']}")
+        click.echo(f"  R²: {best_probe['r2']:.3f}")
 
 
 @cli.command()
@@ -485,8 +493,19 @@ def _run_causal_validation(runner, activations_path, probe_results, n_samples, o
             k: v.float().numpy() if hasattr(v, 'numpy') else v
             for k, v in data["activations"].items()
         }
-        gm_labels = np.array(data["labels"]["gm_labels"])
-        best_layer = probe_results["best_probe"]["layer"]
+        label_data = data["labels"]
+        activations, gm_labels, sample_metadata, group_ids = filter_causal_samples(
+            activations,
+            label_data["gm_labels"],
+            data.get("metadata"),
+            round_nums=label_data.get("round_nums"),
+            trial_ids=label_data.get("trial_ids"),
+            pod_ids=label_data.get("pod_ids"),
+        )
+        best_probe = probe_results.get("best_probe")
+        if not isinstance(best_probe, dict):
+            raise ValueError("Probe results do not contain a valid best probe")
+        best_layer = best_probe["layer"]
 
         test_prompts = [
             "In this negotiation, I will be completely honest about my position.",
@@ -497,15 +516,19 @@ def _run_causal_validation(runner, activations_path, probe_results, n_samples, o
         ] * (n_samples // 5 + 1)
 
         # Get TransformerLens model
-        tl_model = None
-        if hasattr(runner, 'tl_model') and runner.tl_model is not None:
-            tl_model = runner.tl_model
-        elif hasattr(runner.model, 'tl_model'):
-            tl_model = runner.model.tl_model
+        tl_model = getattr(runner, 'tl_model', None)
+        if tl_model is None:
+            tl_model = getattr(runner.model, 'tl_model', None)
 
         if tl_model is None:
             click.echo("Warning: Could not access TransformerLens model")
             return None
+
+        sample_prompts = [
+            row.get("full_prompt", "") for row in sample_metadata
+        ] if sample_metadata else []
+        if not all(sample_prompts):
+            sample_prompts = None
 
         results = run_full_causal_validation(
             model=tl_model,
@@ -513,6 +536,9 @@ def _run_causal_validation(runner, activations_path, probe_results, n_samples, o
             labels=gm_labels,
             best_layer=best_layer,
             test_prompts=test_prompts[:n_samples],
+            sample_prompts=sample_prompts,
+            metadata=sample_metadata,
+            group_ids=group_ids,
             verbose=True,
         )
 
@@ -556,10 +582,11 @@ def _print_summary(runner, probe_results, causal_results, causal_validated,
     click.echo(f"Activations saved: {activations_path}")
     click.echo(f"Output directory: {output_dir}")
 
-    if probe_results.get("best_probe"):
+    best_probe = probe_results.get("best_probe")
+    if isinstance(best_probe, dict):
         click.echo(click.style("\nBest probe performance:", bold=True))
-        click.echo(f"  Layer: {probe_results['best_probe']['layer']}")
-        click.echo(f"  R²: {probe_results['best_probe']['r2']:.3f}")
+        click.echo(f"  Layer: {best_probe['layer']}")
+        click.echo(f"  R²: {best_probe['r2']:.3f}")
 
     if probe_results.get("gm_vs_agent"):
         gm_vs_agent = probe_results["gm_vs_agent"]
@@ -567,7 +594,7 @@ def _print_summary(runner, probe_results, causal_results, causal_validated,
         click.echo(f"  GM R²: {gm_vs_agent['gm_ridge_r2']:.3f}")
         click.echo(f"  Agent R²: {gm_vs_agent['agent_ridge_r2']:.3f}")
         if gm_vs_agent["gm_wins"]:
-            click.echo("  >> GM labels more predictable (implicit deception encoding)")
+            click.echo("  >> Actual-deception labels are more predictable than counterpart-belief labels")
 
     if causal_results:
         click.echo(click.style("\nCausal validation:", bold=True))

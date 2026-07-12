@@ -42,7 +42,7 @@ class BaselineAgent:
         self.seed = seed
         self.action_count = 0
         self.state: Dict[str, Any] = {}
-        random.seed(seed)
+        self._rng = random.Random(seed)
 
     def observe(self, observation: str) -> None:
         """Process an observation."""
@@ -80,7 +80,7 @@ class RandomAgent(BaselineAgent):
         obs = self.state.get('last_observation', '').lower()
 
         if 'fish' in obs or 'boat' in obs:
-            boats = random.randint(1, 15)
+            boats = self._rng.randint(1, 15)
             return f"Deploy {boats} boats."
 
         elif 'treaty' in obs or 'climate' in obs:
@@ -90,7 +90,7 @@ class RandomAgent(BaselineAgent):
                 "I oppose the current proposal.",
                 "I propose $100B climate fund."
             ]
-            return random.choice(actions)
+            return self._rng.choice(actions)
 
         elif 'vote' in obs or 'alliance' in obs:
             actions = [
@@ -99,10 +99,10 @@ class RandomAgent(BaselineAgent):
                 "I will observe this round.",
                 "I support my allies."
             ]
-            return random.choice(actions)
+            return self._rng.choice(actions)
 
         else:
-            return random.choice(self.valid_actions) if self.valid_actions else "I take a random action."
+            return self._rng.choice(self.valid_actions) if self.valid_actions else "I take a random action."
 
 
 class FixedStrategyAgent(BaselineAgent):
@@ -365,12 +365,22 @@ def create_single_module_agent(
 
 # Baseline configurations for standard comparisons
 
-STANDARD_BASELINES = {
-    'random': lambda: create_random_agent("RandomBaseline"),
-    'aggressive': lambda: create_fixed_strategy_agent("AggressiveBaseline", "aggressive"),
-    'cooperative': lambda: create_fixed_strategy_agent("CooperativeBaseline", "cooperative"),
-    'tit_for_tat': lambda: create_fixed_strategy_agent("TitForTatBaseline", "tit_for_tat"),
-    'moderate': lambda: create_fixed_strategy_agent("ModerateBaseline", "moderate"),
+STANDARD_BASELINES: Dict[
+    str, Callable[[Optional[LanguageModel]], BaselineAgent]
+] = {
+    'random': lambda _model=None: create_random_agent("RandomBaseline"),
+    'aggressive': lambda _model=None: create_fixed_strategy_agent(
+        "AggressiveBaseline", "aggressive"
+    ),
+    'cooperative': lambda _model=None: create_fixed_strategy_agent(
+        "CooperativeBaseline", "cooperative"
+    ),
+    'tit_for_tat': lambda _model=None: create_fixed_strategy_agent(
+        "TitForTatBaseline", "tit_for_tat"
+    ),
+    'moderate': lambda _model=None: create_fixed_strategy_agent(
+        "ModerateBaseline", "moderate"
+    ),
     'basic_llm': lambda model=None: create_basic_llm_agent("BasicLLMBaseline", model),
 }
 
@@ -383,10 +393,7 @@ def create_all_baselines(model: Optional[LanguageModel] = None) -> Dict[str, Bas
     """
     baselines = {}
     for name, factory in STANDARD_BASELINES.items():
-        if name == 'basic_llm':
-            baselines[name] = factory(model)
-        else:
-            baselines[name] = factory()
+        baselines[name] = factory(model)
     return baselines
 
 

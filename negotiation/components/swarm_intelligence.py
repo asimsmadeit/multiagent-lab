@@ -5,8 +5,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from abc import ABC, abstractmethod
 
-from concordia_mini.typing import entity_component
-from concordia_mini.typing import entity as entity_lib
+from concordia.typing import entity_component
+from concordia.typing import entity as entity_lib
 
 from negotiation.utils.parsing import (
     parse_structured_response,
@@ -57,6 +57,7 @@ class SubAgent(ABC):
 
     def update_performance(self, outcome_score: float):
         """Update performance history and expertise weight."""
+        outcome_score = max(0.0, min(1.0, float(outcome_score)))
         self._performance_history.append(outcome_score)
         # Keep last 10 outcomes
         if len(self._performance_history) > 10:
@@ -65,7 +66,7 @@ class SubAgent(ABC):
         # Update expertise weight based on recent performance
         if self._performance_history:
             recent_performance = np.mean(self._performance_history[-5:])
-            self._expertise_weight = 0.5 + recent_performance  # 0.5 to 1.5 range
+            self._expertise_weight = float(0.5 + recent_performance)
 
 
 class MarketAnalysisAgent(SubAgent):
@@ -167,47 +168,7 @@ OPPORTUNITIES: [List relationship opportunities]"""
 
     def _parse_response(self, response: str) -> Dict[str, Any]:
         """Parse structured response from language model."""
-        # Same parsing logic as MarketAnalysisAgent
-        lines = response.split('\n')
-        parsed = {
-            'analysis': '',
-            'recommendations': [],
-            'confidence': 0.7,
-            'key_factors': [],
-            'risks': [],
-            'opportunities': []
-        }
-
-        current_section = None
-        for line in lines:
-            line = line.strip()
-            if line.startswith('ANALYSIS:'):
-                current_section = 'analysis'
-                parsed['analysis'] = line[9:].strip()
-            elif line.startswith('RECOMMENDATIONS:'):
-                current_section = 'recommendations'
-                parsed['recommendations'] = [line[16:].strip()]
-            elif line.startswith('CONFIDENCE:'):
-                try:
-                    parsed['confidence'] = float(line[11:].strip())
-                except (ValueError, IndexError):
-                    parsed['confidence'] = 0.7
-            elif line.startswith('KEY_FACTORS:'):
-                current_section = 'key_factors'
-                parsed['key_factors'] = [line[12:].strip()]
-            elif line.startswith('RISKS:'):
-                current_section = 'risks'
-                parsed['risks'] = [line[6:].strip()]
-            elif line.startswith('OPPORTUNITIES:'):
-                current_section = 'opportunities'
-                parsed['opportunities'] = [line[14:].strip()]
-            elif current_section and line and not line.startswith(('ANALYSIS:', 'RECOMMENDATIONS:', 'CONFIDENCE:', 'KEY_FACTORS:', 'RISKS:', 'OPPORTUNITIES:')):
-                if current_section in ['recommendations', 'key_factors', 'risks', 'opportunities']:
-                    parsed[current_section].append(line)
-                else:
-                    parsed[current_section] += ' ' + line
-
-        return parsed
+        return parse_structured_response(response)
 
 
 class GameTheoryStrategist(SubAgent):
@@ -257,47 +218,7 @@ OPPORTUNITIES: [List strategic opportunities]"""
 
     def _parse_response(self, response: str) -> Dict[str, Any]:
         """Parse structured response from language model."""
-        # Same parsing logic as other agents
-        lines = response.split('\n')
-        parsed = {
-            'analysis': '',
-            'recommendations': [],
-            'confidence': 0.7,
-            'key_factors': [],
-            'risks': [],
-            'opportunities': []
-        }
-
-        current_section = None
-        for line in lines:
-            line = line.strip()
-            if line.startswith('ANALYSIS:'):
-                current_section = 'analysis'
-                parsed['analysis'] = line[9:].strip()
-            elif line.startswith('RECOMMENDATIONS:'):
-                current_section = 'recommendations'
-                parsed['recommendations'] = [line[16:].strip()]
-            elif line.startswith('CONFIDENCE:'):
-                try:
-                    parsed['confidence'] = float(line[11:].strip())
-                except (ValueError, IndexError):
-                    parsed['confidence'] = 0.7
-            elif line.startswith('KEY_FACTORS:'):
-                current_section = 'key_factors'
-                parsed['key_factors'] = [line[12:].strip()]
-            elif line.startswith('RISKS:'):
-                current_section = 'risks'
-                parsed['risks'] = [line[6:].strip()]
-            elif line.startswith('OPPORTUNITIES:'):
-                current_section = 'opportunities'
-                parsed['opportunities'] = [line[14:].strip()]
-            elif current_section and line and not line.startswith(('ANALYSIS:', 'RECOMMENDATIONS:', 'CONFIDENCE:', 'KEY_FACTORS:', 'RISKS:', 'OPPORTUNITIES:')):
-                if current_section in ['recommendations', 'key_factors', 'risks', 'opportunities']:
-                    parsed[current_section].append(line)
-                else:
-                    parsed[current_section] += ' ' + line
-
-        return parsed
+        return parse_structured_response(response)
 
 
 class DiplomaticRelationsAgent(SubAgent):
@@ -347,47 +268,7 @@ OPPORTUNITIES: [List partnership opportunities]"""
 
     def _parse_response(self, response: str) -> Dict[str, Any]:
         """Parse structured response from language model."""
-        # Same parsing logic as other agents
-        lines = response.split('\n')
-        parsed = {
-            'analysis': '',
-            'recommendations': [],
-            'confidence': 0.7,
-            'key_factors': [],
-            'risks': [],
-            'opportunities': []
-        }
-
-        current_section = None
-        for line in lines:
-            line = line.strip()
-            if line.startswith('ANALYSIS:'):
-                current_section = 'analysis'
-                parsed['analysis'] = line[9:].strip()
-            elif line.startswith('RECOMMENDATIONS:'):
-                current_section = 'recommendations'
-                parsed['recommendations'] = [line[16:].strip()]
-            elif line.startswith('CONFIDENCE:'):
-                try:
-                    parsed['confidence'] = float(line[11:].strip())
-                except (ValueError, IndexError):
-                    parsed['confidence'] = 0.7
-            elif line.startswith('KEY_FACTORS:'):
-                current_section = 'key_factors'
-                parsed['key_factors'] = [line[12:].strip()]
-            elif line.startswith('RISKS:'):
-                current_section = 'risks'
-                parsed['risks'] = [line[6:].strip()]
-            elif line.startswith('OPPORTUNITIES:'):
-                current_section = 'opportunities'
-                parsed['opportunities'] = [line[14:].strip()]
-            elif current_section and line and not line.startswith(('ANALYSIS:', 'RECOMMENDATIONS:', 'CONFIDENCE:', 'KEY_FACTORS:', 'RISKS:', 'OPPORTUNITIES:')):
-                if current_section in ['recommendations', 'key_factors', 'risks', 'opportunities']:
-                    parsed[current_section].append(line)
-                else:
-                    parsed[current_section] += ' ' + line
-
-        return parsed
+        return parse_structured_response(response)
 
 
 class SwarmIntelligence(entity_component.ContextComponent):
@@ -408,6 +289,10 @@ class SwarmIntelligence(entity_component.ContextComponent):
             max_iterations: Maximum consensus-building iterations
             enable_sub_agents: List of sub-agents to enable
         """
+        if not 0.0 <= consensus_threshold <= 1.0:
+            raise ValueError('consensus_threshold must be between 0 and 1.')
+        if max_iterations < 1:
+            raise ValueError('max_iterations must be at least 1.')
         self._model = model
         self._consensus_threshold = consensus_threshold
         self._max_iterations = max_iterations
@@ -417,6 +302,17 @@ class SwarmIntelligence(entity_component.ContextComponent):
             enable_sub_agents = ['market_analysis', 'emotional_intelligence', 'game_theory', 'diplomatic_relations']
 
         self._sub_agents: Dict[str, SubAgent] = {}
+        supported_agents = {
+            'market_analysis',
+            'emotional_intelligence',
+            'game_theory',
+            'diplomatic_relations',
+        }
+        unknown_agents = set(enable_sub_agents) - supported_agents
+        if unknown_agents:
+            raise ValueError(
+                f'Unknown sub-agents: {sorted(unknown_agents)}'
+            )
         for agent_type in enable_sub_agents:
             if agent_type == 'market_analysis':
                 self._sub_agents[agent_type] = MarketAnalysisAgent(model)
@@ -470,6 +366,8 @@ class SwarmIntelligence(entity_component.ContextComponent):
                 weights[agent_type] /= total_relevance
         else:
             # Equal weights if no relevance detected
+            if not weights:
+                return {}
             equal_weight = 1.0 / len(weights)
             for agent_type in weights:
                 weights[agent_type] = equal_weight
@@ -486,7 +384,7 @@ class SwarmIntelligence(entity_component.ContextComponent):
         # Score recommendations based on weighted support
         rec_scores = {}
         for agent_type, analysis in analyses.items():
-            weight = weights[agent_type]
+            weight = weights.get(agent_type, 0.0)
             confidence = analysis.confidence
             combined_weight = weight * confidence
 
@@ -601,25 +499,48 @@ class SwarmIntelligence(entity_component.ContextComponent):
         return ""
 
     def get_state(self) -> Dict[str, Any]:
-        """Get component state."""
+        """Return a JSON-safe snapshot that can reproduce future behavior."""
         return {
             'sub_agents': {
                 name: {
                     'expertise_weight': agent._expertise_weight,
-                    'performance_history': agent._performance_history,
+                    'performance_history': [
+                        float(score) for score in agent._performance_history
+                    ],
                 }
                 for name, agent in self._sub_agents.items()
             },
-            'decision_count': len(self._decision_history),
-            'last_decision': self._decision_history[-1].__dict__ if self._decision_history else None,
+            'last_analyses': {
+                name: dataclasses.asdict(analysis)
+                for name, analysis in self._last_analyses.items()
+            },
+            'decision_history': [
+                dataclasses.asdict(decision)
+                for decision in self._decision_history
+            ],
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
-        """Set component state."""
+        """Restore a snapshot produced by :meth:`get_state`."""
+        if not isinstance(state, dict):
+            raise TypeError('Swarm intelligence state must be a mapping.')
         for name, data in state.get('sub_agents', {}).items():
             if name in self._sub_agents:
-                self._sub_agents[name]._expertise_weight = data.get('expertise_weight', 1.0)
-                self._sub_agents[name]._performance_history = data.get('performance_history', [])
+                self._sub_agents[name]._expertise_weight = float(
+                    data.get('expertise_weight', 1.0)
+                )
+                self._sub_agents[name]._performance_history = [
+                    float(value)
+                    for value in data.get('performance_history', [])
+                ]
+        self._last_analyses = {
+            str(name): SubAgentAnalysis(**data)
+            for name, data in state.get('last_analyses', {}).items()
+        }
+        self._decision_history = [
+            CollectiveDecision(**data)
+            for data in state.get('decision_history', [])
+        ]
 
     def update(self) -> None:
         """Update swarm intelligence state."""

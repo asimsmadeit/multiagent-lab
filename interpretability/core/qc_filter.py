@@ -102,7 +102,7 @@ def classify_response(text: Optional[str]) -> Set[str]:
     rather than raising, since legacy samples may have missing responses.
     """
     flags: Set[str] = set()
-    if text is None:
+    if not isinstance(text, str):
         return {'too_short'}
 
     if len(text) < 20:
@@ -167,6 +167,9 @@ def filter_samples(
         response_getter: callable extracting the response string from a sample.
     """
     keep_flags = set(keep_flags)
+    unknown_flags = keep_flags.difference(KNOWN_FLAGS)
+    if unknown_flags:
+        raise ValueError(f"Unknown QC flags: {sorted(unknown_flags)}")
     kept: List[Any] = []
     for s in samples:
         if drop_probe_rounds and not _sample_is_negotiation(s):

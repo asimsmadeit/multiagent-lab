@@ -4,7 +4,7 @@ This module provides pre-built negotiation agents with modular cognitive
 enhancements.
 
 Quick Start:
-    from concordia_mini.prefabs.entity import negotiation
+    from concordia.prefabs.entity import negotiation
 
     # Build a basic negotiator
     agent = negotiation.build_agent(model, memory, name='Alice')

@@ -7,12 +7,13 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 import numpy as np
 from collections import deque
 
-from concordia_mini.typing import entity_component
-from concordia_mini.typing import entity as entity_lib
+from concordia.typing import entity_component
+from concordia.typing import entity as entity_lib
 from config.agents.negotiation import (
     DeceptionDetectionConfig,
     TheoryOfMindConfig,
 )
+from negotiation.utils.parsing import parse_named_floats
 
 # Set up module logger
 logger = logging.getLogger(__name__)
@@ -87,6 +88,12 @@ class TheoryOfMind(entity_component.ContextComponent):
             emotion_sensitivity: Sensitivity to emotional cues (0-1)
             empathy_level: Level of empathic responding (0-1)
         """
+        if max_recursion_depth < 0:
+            raise ValueError('max_recursion_depth must be non-negative.')
+        if not 0.0 <= emotion_sensitivity <= 1.0:
+            raise ValueError('emotion_sensitivity must be between 0 and 1.')
+        if not 0.0 <= empathy_level <= 1.0:
+            raise ValueError('empathy_level must be between 0 and 1.')
         self._model = model
         self._max_recursion_depth = max_recursion_depth
         self._emotion_sensitivity = emotion_sensitivity
@@ -146,37 +153,17 @@ Format: anger:X.X fear:X.X joy:X.X sadness:X.X surprise:X.X trust:X.X anticipati
         arousal = 0.0
         confidence = 0.5
 
-        # Extract values from response
-        for line in response.split('\n'):
-            line = line.lower().strip()
-            for emotion in emotions.keys():
-                if f"{emotion}:" in line:
-                    try:
-                        value = float(line.split(':')[1].strip())
-                        emotions[emotion] = max(0.0, min(1.0, value))
-                    except (ValueError, IndexError) as e:
-                        logger.debug("Failed to parse emotion '%s' from line: %s", emotion, line)
-
-            if "valence:" in line:
-                try:
-                    valence = float(line.split(':')[1].strip())
-                    valence = max(-1.0, min(1.0, valence))
-                except (ValueError, IndexError) as e:
-                    logger.debug("Failed to parse valence from line: %s", line)
-
-            if "arousal:" in line:
-                try:
-                    arousal = float(line.split(':')[1].strip())
-                    arousal = max(0.0, min(1.0, arousal))
-                except (ValueError, IndexError) as e:
-                    logger.debug("Failed to parse arousal from line: %s", line)
-
-            if "confidence:" in line:
-                try:
-                    confidence = float(line.split(':')[1].strip())
-                    confidence = max(0.0, min(1.0, confidence))
-                except (ValueError, IndexError) as e:
-                    logger.debug("Failed to parse confidence from line: %s", line)
+        field_bounds = {name: (0.0, 1.0) for name in emotions}
+        field_bounds.update({
+            'valence': (-1.0, 1.0),
+            'arousal': (0.0, 1.0),
+            'confidence': (0.0, 1.0),
+        })
+        scores = parse_named_floats(response, field_bounds)
+        emotions.update({name: scores[name] for name in emotions if name in scores})
+        valence = scores.get('valence', valence)
+        arousal = scores.get('arousal', arousal)
+        confidence = scores.get('confidence', confidence)
 
         # Identify emotional triggers
         triggers = self._identify_emotional_triggers(communication, emotions)
@@ -239,16 +226,10 @@ Format: financial:X.X costs:X.X relationship:X.X precedent:X.X information:X.X t
             'capabilities': 0.5, 'flexibility': 0.5
         }
 
-        # Parse goal likelihoods
-        for line in response.split('\n'):
-            line = line.lower().strip()
-            for goal in goals.keys():
-                if f"{goal}:" in line:
-                    try:
-                        value = float(line.split(':')[1].strip())
-                        goals[goal] = max(0.0, min(1.0, value))
-                    except (ValueError, IndexError) as e:
-                        logger.debug("Failed to parse goal '%s' from line: %s", goal, line)
+        goals.update(parse_named_floats(
+            response,
+            {goal: (0.0, 1.0) for goal in goals},
+        ))
 
         return goals
 
@@ -281,16 +262,10 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
             'patience': 0.5, 'assertiveness': 0.5, 'analytical': 0.5
         }
 
-        # Parse personality scores
-        for line in response.split('\n'):
-            line = line.lower().strip()
-            for trait in traits.keys():
-                if f"{trait}:" in line:
-                    try:
-                        value = float(line.split(':')[1].strip())
-                        traits[trait] = max(0.0, min(1.0, value))
-                    except (ValueError, IndexError) as e:
-                        logger.debug("Failed to parse trait '%s' from line: %s", trait, line)
+        traits.update(parse_named_floats(
+            response,
+            {trait: (0.0, 1.0) for trait in traits},
+        ))
 
         return traits
 
@@ -453,7 +428,11 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
         else:
             return templates[-1]  # Gentler acknowledgment
 
-    def _update_mental_model(self, counterpart_id: str, observations: List[str]) -> None:
+    def _update_mental_model(
+        self,
+        counterpart_id: str,
+        observations: List[str],
+    ) -> EmotionalState:
         """Update mental model of counterpart."""
         # Detect emotions
         latest_communication = observations[-1] if observations else ""
@@ -477,6 +456,7 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
             deception_indicators=deception_indicators,
             last_updated="current"
         )
+        return emotional_state
 
     def _generate_theory_of_mind_guidance(self, context: str) -> str:
         """Generate guidance based on theory of mind analysis."""
@@ -573,10 +553,7 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
             return ""
 
         # Update mental model based on observation
-        self._update_mental_model("counterpart", [observation])
-
-        # Detect and store emotional state
-        emotional_state = self._detect_emotions(observation)
+        emotional_state = self._update_mental_model("counterpart", [observation])
         self._emotion_history.append(emotional_state)
 
         # Update deception detection baseline
@@ -594,24 +571,26 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
         self.post_observe()
 
     def get_state(self) -> Dict[str, Any]:
-        """Get component state."""
-        current_mental_models = {}
-        for counterpart_id, model in self._mental_models.items():
-            current_mental_models[counterpart_id] = {
-                'dominant_emotion': model.emotional_state.dominant_emotion()[0],
-                'emotion_intensity': model.emotional_state.emotional_intensity(),
-                'valence': model.emotional_state.valence,
-                'top_goals': sorted(model.goals.items(), key=lambda x: x[1], reverse=True)[:3],
-                'personality_summary': {k: v for k, v in model.personality_traits.items() if v > 0.6},
-                'deception_risk': max(model.deception_indicators.values()) if model.deception_indicators else 0.0
-            }
-
+        """Return all evidence-bearing state needed for exact restoration."""
         return {
-            'mental_models': current_mental_models,
+            'mental_models': {
+                counterpart_id: dataclasses.asdict(model)
+                for counterpart_id, model in self._mental_models.items()
+            },
+            'belief_hierarchy': {
+                str(level): [dataclasses.asdict(belief) for belief in beliefs]
+                for level, beliefs in self._belief_hierarchy.items()
+            },
+            'emotion_history': [
+                dataclasses.asdict(emotion)
+                for emotion in self._emotion_history
+            ],
+            'baseline_patterns': dict(self._baseline_patterns),
+            'deception_indicators': list(self._deception_indicators),
             'recursion_depth': self._max_recursion_depth,
-            'emotion_history_length': len(self._emotion_history),
+            'emotion_sensitivity': self._emotion_sensitivity,
             'empathy_level': self._empathy_level,
-            'recent_emotional_trend': self._get_emotional_trend()
+            'last_observation': getattr(self, '_last_observation', ''),
         }
 
     def _get_emotional_trend(self) -> str:
@@ -633,9 +612,62 @@ Format: openness:X.X conscientiousness:X.X extraversion:X.X agreeableness:X.X ne
             return "stable"
 
     def set_state(self, state: Dict[str, Any]) -> None:
-        """Set component state."""
-        self._max_recursion_depth = state.get('recursion_depth', 3)
-        self._empathy_level = state.get('empathy_level', 0.8)
+        """Restore a snapshot produced by :meth:`get_state`."""
+        if not isinstance(state, dict):
+            raise TypeError('Theory-of-mind state must be a mapping.')
+        self._max_recursion_depth = int(
+            state.get('recursion_depth', self._max_recursion_depth)
+        )
+        self._emotion_sensitivity = float(
+            state.get('emotion_sensitivity', self._emotion_sensitivity)
+        )
+        self._empathy_level = float(
+            state.get('empathy_level', self._empathy_level)
+        )
+        self._mental_models = {}
+        for counterpart_id, data in state.get('mental_models', {}).items():
+            emotional_data = data.get('emotional_state')
+            if not isinstance(emotional_data, dict):
+                # Legacy summary states did not contain enough data to restore.
+                continue
+            self._mental_models[str(counterpart_id)] = MentalModel(
+                counterpart_id=str(data.get('counterpart_id', counterpart_id)),
+                goals={str(k): float(v) for k, v in data.get('goals', {}).items()},
+                personality_traits={
+                    str(k): float(v)
+                    for k, v in data.get('personality_traits', {}).items()
+                },
+                emotional_state=EmotionalState(**emotional_data),
+                strategies={
+                    str(k): float(v)
+                    for k, v in data.get('strategies', {}).items()
+                },
+                constraints=[str(item) for item in data.get('constraints', [])],
+                deception_indicators={
+                    str(k): float(v)
+                    for k, v in data.get('deception_indicators', {}).items()
+                },
+                last_updated=str(data.get('last_updated', 'current')),
+            )
+        self._belief_hierarchy = {
+            int(level): [RecursiveBelief(**belief) for belief in beliefs]
+            for level, beliefs in state.get('belief_hierarchy', {}).items()
+        }
+        self._emotion_history = deque(
+            (
+                EmotionalState(**emotion)
+                for emotion in state.get('emotion_history', [])
+            ),
+            maxlen=TheoryOfMindConfig.EMOTION_HISTORY_SIZE,
+        )
+        self._baseline_patterns = {
+            str(name): float(value)
+            for name, value in state.get('baseline_patterns', {}).items()
+        }
+        self._deception_indicators = [
+            str(item) for item in state.get('deception_indicators', [])
+        ]
+        self._last_observation = str(state.get('last_observation', ''))
 
     def get_action_attempt(
         self,
@@ -697,13 +729,6 @@ Action:"""
 
     def update(self) -> None:
         """Update theory of mind component."""
-        # Decay old emotional assessments
-        if len(self._emotion_history) > 10:
-            # Keep recent emotional history
-            self._emotion_history = deque(list(self._emotion_history)[-10:], maxlen=20)
-
-        # Update mental model confidence based on interaction count
-        for model in self._mental_models.values():
-            # Gradually increase confidence with more observations
-            if hasattr(model, 'observation_count'):
-                model.observation_count = getattr(model, 'observation_count', 0) + 1
+        # The bounded deque performs retention; model confidence is updated only
+        # from evidence, not from lifecycle calls that contain no observation.
+        return None

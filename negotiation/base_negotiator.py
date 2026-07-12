@@ -2,12 +2,13 @@
 
 from collections.abc import Mapping
 import dataclasses
+from typing import Any
 
-from concordia_mini.agents import entity_agent_with_logging
-from concordia_mini.associative_memory import basic_associative_memory
-from concordia_mini.components import agent as agent_components
-from concordia_mini.language_model import language_model
-from concordia_mini.typing import prefab as prefab_lib
+from concordia.agents import entity_agent_with_logging
+from concordia.associative_memory import basic_associative_memory
+from concordia.components import agent as agent_components
+from concordia.language_model import language_model
+from concordia.typing import prefab as prefab_lib
 
 # Import our negotiation components
 from negotiation.components import negotiation_instructions
@@ -32,7 +33,7 @@ class Entity(prefab_lib.Prefab):
         'and maintains memory of negotiation history.'
     )
 
-    params: Mapping[str, str] = dataclasses.field(default_factory=lambda: {
+    params: Mapping[str, Any] = dataclasses.field(default_factory=lambda: {
         'name': 'Negotiator',
         'goal': 'Reach a mutually beneficial agreement',
         'negotiation_style': 'integrative',
@@ -60,6 +61,12 @@ class Entity(prefab_lib.Prefab):
         goal = self.params.get('goal', 'Reach a mutually beneficial agreement')
         style = self.params.get('negotiation_style', 'integrative')
         reservation = float(self.params.get('reservation_value', '0.0'))
+        target_value_param = self.params.get('target_value')
+        target_value = (
+            float(target_value_param)
+            if target_value_param is not None
+            else reservation * 2.0 if reservation > 0.0 else 100.0
+        )
         ethics = self.params.get('ethical_constraints', 'Be honest and fair.')
 
         # Create memory component
@@ -98,7 +105,7 @@ class Entity(prefab_lib.Prefab):
             agent_name=agent_name,
             negotiation_style=style,
             reservation_value=reservation,
-            target_value=reservation * 2.0,  # Default target is 2x reservation
+            target_value=target_value,
             verbose=True,
         )
 

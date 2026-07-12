@@ -3,12 +3,12 @@
 from collections.abc import Mapping
 import dataclasses
 import json
-from typing import Union
+from typing import Any, Optional, Sequence
 
-from concordia_mini.agents import entity_agent_with_logging
-from concordia_mini.associative_memory import basic_associative_memory
-from concordia_mini.language_model import language_model
-from concordia_mini.typing import prefab as prefab_lib
+from concordia.agents import entity_agent_with_logging
+from concordia.associative_memory import basic_associative_memory
+from concordia.language_model import language_model
+from concordia.typing import prefab as prefab_lib
 
 # Import base negotiator and advanced components
 from negotiation import base_negotiator
@@ -18,7 +18,7 @@ from negotiation.components import swarm_intelligence
 from negotiation.components import uncertainty_aware
 from negotiation.components import strategy_evolution
 from negotiation.components import theory_of_mind
-from negotiation.constants import ModuleType
+from negotiation.constants import MODULE_COMPONENT_NAMES, ModuleType
 
 
 @dataclasses.dataclass
@@ -43,7 +43,7 @@ class Entity(prefab_lib.Prefab):
         'intelligence, and other sophisticated negotiation capabilities.'
     )
 
-    params: Mapping[str, str] = dataclasses.field(default_factory=lambda: {
+    params: Mapping[str, Any] = dataclasses.field(default_factory=lambda: {
         'name': 'AdvancedNegotiator',
         'goal': 'Achieve optimal negotiation outcomes',
         'negotiation_style': 'integrative',
@@ -69,15 +69,46 @@ class Entity(prefab_lib.Prefab):
             Configured advanced negotiation agent
         """
         # Parse module list from params
-        modules_str = self.params.get('modules', '')
-        modules = [m.strip() for m in modules_str.split(',') if m.strip()]
+        modules_value = self.params.get('modules', '')
+        if isinstance(modules_value, str):
+            modules = [
+                module.strip() for module in modules_value.split(',')
+                if module.strip()
+            ]
+        elif isinstance(modules_value, Sequence):
+            modules = [
+                module.value if isinstance(module, ModuleType) else str(module).strip()
+                for module in modules_value
+            ]
+        else:
+            raise TypeError('modules must be a comma-separated string or sequence.')
+        valid_modules = {module.value for module in ModuleType}
+        unknown_modules = set(modules) - valid_modules
+        if unknown_modules:
+            raise ValueError(f'Unknown negotiation modules: {sorted(unknown_modules)}')
 
         # Parse module configs from JSON string
-        module_configs_str = self.params.get('module_configs', '{}')
-        try:
-            module_configs = json.loads(module_configs_str)
-        except json.JSONDecodeError:
-            module_configs = {}
+        module_configs_value = self.params.get('module_configs', '{}')
+        if isinstance(module_configs_value, Mapping):
+            module_configs = dict(module_configs_value)
+        elif isinstance(module_configs_value, str):
+            try:
+                module_configs = json.loads(module_configs_value)
+            except json.JSONDecodeError as error:
+                raise ValueError('module_configs must contain valid JSON.') from error
+        else:
+            raise TypeError('module_configs must be a mapping or JSON string.')
+        if not isinstance(module_configs, dict):
+            raise ValueError('module_configs JSON must decode to an object.')
+        invalid_configs = {
+            name for name, config in module_configs.items()
+            if not isinstance(config, Mapping)
+        }
+        if invalid_configs:
+            raise ValueError(
+                'Each module configuration must be an object: '
+                f'{sorted(invalid_configs)}'
+            )
 
         # Build extra components for selected modules
         extra_components = {}
@@ -95,7 +126,7 @@ class Entity(prefab_lib.Prefab):
                 adaptation_level=config.get('adaptation_level', 0.7),
                 detect_culture=config.get('detect_culture', True),
             )
-            extra_components['CulturalAdaptation'] = cultural
+            extra_components[MODULE_COMPONENT_NAMES[ModuleType.CULTURAL_ADAPTATION]] = cultural
 
         if has_module(ModuleType.TEMPORAL_STRATEGY):
             config = module_configs.get(ModuleType.TEMPORAL_STRATEGY.value, {})
@@ -105,7 +136,7 @@ class Entity(prefab_lib.Prefab):
                 reputation_weight=config.get('reputation_weight', 0.3),
                 relationship_investment_threshold=config.get('relationship_investment_threshold', 0.6),
             )
-            extra_components['TemporalStrategy'] = temporal
+            extra_components[MODULE_COMPONENT_NAMES[ModuleType.TEMPORAL_STRATEGY]] = temporal
 
         if has_module(ModuleType.SWARM_INTELLIGENCE):
             config = module_configs.get(ModuleType.SWARM_INTELLIGENCE.value, {})
@@ -115,7 +146,7 @@ class Entity(prefab_lib.Prefab):
                 max_iterations=config.get('max_iterations', 3),
                 enable_sub_agents=config.get('enable_sub_agents', None),
             )
-            extra_components['SwarmIntelligence'] = swarm
+            extra_components[MODULE_COMPONENT_NAMES[ModuleType.SWARM_INTELLIGENCE]] = swarm
 
         if has_module(ModuleType.UNCERTAINTY_AWARE):
             config = module_configs.get(ModuleType.UNCERTAINTY_AWARE.value, {})
@@ -124,8 +155,9 @@ class Entity(prefab_lib.Prefab):
                 confidence_threshold=config.get('confidence_threshold', 0.7),
                 risk_tolerance=config.get('risk_tolerance', 0.3),
                 information_gathering_budget=config.get('information_gathering_budget', 0.1),
+                seed=config.get('seed'),
             )
-            extra_components['UncertaintyAware'] = uncertainty
+            extra_components[MODULE_COMPONENT_NAMES[ModuleType.UNCERTAINTY_AWARE]] = uncertainty
 
         if has_module(ModuleType.STRATEGY_EVOLUTION):
             config = module_configs.get(ModuleType.STRATEGY_EVOLUTION.value, {})
@@ -135,8 +167,9 @@ class Entity(prefab_lib.Prefab):
                 mutation_rate=config.get('mutation_rate', 0.1),
                 crossover_rate=config.get('crossover_rate', 0.7),
                 learning_rate=config.get('learning_rate', 0.01),
+                seed=config.get('seed'),
             )
-            extra_components['StrategyEvolution'] = evolution
+            extra_components[MODULE_COMPONENT_NAMES[ModuleType.STRATEGY_EVOLUTION]] = evolution
 
         if has_module(ModuleType.THEORY_OF_MIND):
             config = module_configs.get(ModuleType.THEORY_OF_MIND.value, {})
@@ -146,7 +179,7 @@ class Entity(prefab_lib.Prefab):
                 emotion_sensitivity=config.get('emotion_sensitivity', 0.7),
                 empathy_level=config.get('empathy_level', 0.8),
             )
-            extra_components['TheoryOfMind'] = tom
+            extra_components[MODULE_COMPONENT_NAMES[ModuleType.THEORY_OF_MIND]] = tom
 
         # Update params to include extra components
         enhanced_params = dict(self.params)
@@ -167,8 +200,8 @@ def build_agent(
     negotiation_style: str = 'integrative',
     reservation_value: float = 0.0,
     ethical_constraints: str = 'Be honest and fair. Respect cultural differences.',
-    modules: list = None,
-    module_configs: dict = None,
+    modules: Optional[Sequence[str | ModuleType]] = None,
+    module_configs: Optional[Mapping[str, Any]] = None,
     **kwargs
 ) -> entity_agent_with_logging.EntityAgentWithLogging:
     """Convenience function to build an advanced negotiation agent.
@@ -222,7 +255,10 @@ def build_agent(
         'negotiation_style': negotiation_style,
         'reservation_value': str(reservation_value),
         'ethical_constraints': ethical_constraints,
-        'modules': ','.join(modules),
+        'modules': ','.join(
+            module.value if isinstance(module, ModuleType) else module
+            for module in modules
+        ),
         'module_configs': json.dumps(module_configs),
     }
     params.update(kwargs)

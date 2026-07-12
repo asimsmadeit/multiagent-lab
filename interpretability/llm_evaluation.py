@@ -21,9 +21,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 from unittest import mock
 
-from concordia_mini.associative_memory import basic_associative_memory
-from concordia_mini.language_model import language_model
-from concordia_mini.typing import entity as entity_lib
+from concordia.associative_memory import basic_associative_memory
+from concordia.language_model import language_model
+from concordia.typing import entity as entity_lib
 
 from negotiation import advanced_negotiator
 from negotiation import base_negotiator
@@ -65,8 +65,9 @@ def create_ollama_model(model_name: str = 'llama2'):
     Args:
         model_name: Model to use (must be pulled locally)
     """
-    from concordia_mini.language_model import ollama_model
-    return ollama_model.OllamaModel(model_name=model_name)
+    from concordia.contrib.language_models.ollama import ollama_model
+
+    return ollama_model.OllamaLanguageModel(model_name=model_name)
 
 
 def create_remote_ollama_model(
@@ -108,8 +109,8 @@ def create_remote_ollama_model(
     host_url = f"http://{host_ip}:{port}"
 
     # Create a custom Ollama model that connects to remote host
-    from concordia_mini.language_model import language_model as lm_base
-    from concordia_mini.utils import sampling
+    from concordia.language_model import language_model as lm_base
+    from concordia.utils import sampling
     import ollama
 
     class RemoteOllamaModel(lm_base.LanguageModel):
@@ -129,6 +130,8 @@ def create_remote_ollama_model(
             max_tokens: int = 5000,
             terminators = (),
             temperature: float = 0.5,
+            top_p: float = 0.95,
+            top_k: int = 64,
             timeout: float = 60,
             seed: int | None = None,
         ) -> str:
@@ -138,6 +141,8 @@ def create_remote_ollama_model(
                 system=self._system_message,
                 options={
                     'temperature': temperature,
+                    'top_p': top_p,
+                    'top_k': top_k,
                     'num_predict': max_tokens,
                     'seed': seed if seed is not None else -1,
                 },
@@ -154,12 +159,24 @@ def create_remote_ollama_model(
             *,
             seed: int | None = None,
         ):
-            # Simple implementation - generate and match
+            # Generate once, then prefer an exact response mention or a
+            # conventional letter choice. Concordia 2.4 no longer exposes the
+            # old fuzzy `find_best_matching_response` helper.
             sample = self.sample_text(prompt, max_tokens=256, seed=seed)
-            idx, response, score = sampling.find_best_matching_response(
-                sample, responses
+            normalized = sample.strip().lower()
+            for idx, response in enumerate(responses):
+                if response.strip().lower() in normalized:
+                    return idx, response, {'match_score': 1.0}
+
+            extracted = sampling.extract_choice_response(normalized)
+            if extracted is not None and len(extracted) == 1:
+                idx = ord(extracted.lower()) - ord('a')
+                if 0 <= idx < len(responses):
+                    return idx, responses[idx], {'match_score': 1.0}
+
+            raise lm_base.InvalidResponseError(
+                f"Could not map Ollama response to a choice: {sample!r}"
             )
-            return idx, response, {'sample': sample, 'score': score}
 
     return RemoteOllamaModel(model_name=model_name, host=host_url)
 
@@ -380,7 +397,6 @@ class LLMAgentRunner:
                 print(f"  Trial {trial_id + 1}/{config.num_trials}...", end=" ", flush=True)
 
             trial_metrics = self._run_single_trial(config, trial_id)
-            experiment.add_trial(trial_metrics)
 
             if verbose:
                 outcome = trial_metrics.outcome_type

@@ -2,11 +2,12 @@
 
 import dataclasses
 import datetime
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-from concordia_mini.typing import entity_component
-from concordia_mini.typing import entity as entity_lib
+from concordia.typing import entity_component
+from concordia.typing import entity as entity_lib
 
 
 @dataclasses.dataclass
@@ -21,11 +22,17 @@ class RelationshipRecord:
     outcome_history: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
     reputation_score: float = 0.5  # 0-1, starts neutral
 
-    def update_interaction(self, value: float, outcome: Dict[str, Any]) -> None:
+    def update_interaction(
+        self,
+        value: float,
+        outcome: Dict[str, Any],
+        *,
+        now: Optional[datetime.datetime] = None,
+    ) -> None:
         """Update relationship record with new interaction."""
         self.interaction_count += 1
         self.total_value_exchanged += abs(value)
-        self.last_interaction = datetime.datetime.now()
+        self.last_interaction = now or datetime.datetime.now()
         self.outcome_history.append(outcome)
 
         # Update trust based on outcome
@@ -34,11 +41,16 @@ class RelationshipRecord:
         else:
             self.trust_score = max(0.0, self.trust_score - 0.1)
 
-    def get_relationship_strength(self) -> float:
+    def get_relationship_strength(
+        self,
+        *,
+        now: Optional[datetime.datetime] = None,
+    ) -> float:
         """Calculate overall relationship strength."""
         recency_factor = 1.0
         if self.last_interaction:
-            days_since = (datetime.datetime.now() - self.last_interaction).days
+            current_time = now or datetime.datetime.now()
+            days_since = max(0, (current_time - self.last_interaction).days)
             recency_factor = np.exp(-days_since / 30)  # Decay over 30 days
 
         interaction_factor = min(1.0, self.interaction_count / 10)
@@ -67,6 +79,7 @@ class TemporalStrategy(entity_component.ContextComponent):
         discount_factor: float = 0.9,
         reputation_weight: float = 0.3,
         relationship_investment_threshold: float = 0.6,
+        clock: Callable[[], datetime.datetime] = datetime.datetime.now,
     ):
         """Initialize temporal strategy component.
 
@@ -75,11 +88,20 @@ class TemporalStrategy(entity_component.ContextComponent):
             discount_factor: Future value discount (0-1)
             reputation_weight: Importance of reputation (0-1)
             relationship_investment_threshold: When to invest in relationships
+            clock: Injectable timestamp source for deterministic runs
         """
+        for name, value in (
+            ('discount_factor', discount_factor),
+            ('reputation_weight', reputation_weight),
+            ('relationship_investment_threshold', relationship_investment_threshold),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f'{name} must be between 0 and 1.')
         self._model = model
         self._discount_factor = discount_factor
         self._reputation_weight = reputation_weight
         self._investment_threshold = relationship_investment_threshold
+        self._clock = clock
 
         # State tracking
         self._relationships: Dict[str, RelationshipRecord] = {}
@@ -120,17 +142,23 @@ Provide analysis in this format:
         }
 
         for line in lines:
-            if 'Interaction type:' in line:
-                analysis['interaction_type'] = line.split(':')[1].strip()
-            elif 'Current phase:' in line:
-                analysis['current_phase'] = line.split(':')[1].strip()
-            elif 'Future potential:' in line:
-                analysis['future_potential'] = line.split(':')[1].strip()
-            elif 'Time horizon:' in line:
-                analysis['time_horizon'] = line.split(':')[1].strip()
-            elif 'Key temporal factors:' in line:
+            normalized = line.strip().lstrip('-').strip()
+            label, separator, value = normalized.partition(':')
+            if not separator:
+                continue
+            label = label.strip().lower()
+            value = value.strip().lower()
+            if label == 'interaction type' and value in {'one-time', 'repeated', 'long-term'}:
+                analysis['interaction_type'] = value
+            elif label == 'current phase' and value in {'opening', 'middle', 'closing'}:
+                analysis['current_phase'] = value
+            elif label == 'future potential' and value in {'low', 'medium', 'high'}:
+                analysis['future_potential'] = value
+            elif label == 'time horizon' and value in {'short', 'medium', 'long'}:
+                analysis['time_horizon'] = value
+            elif label == 'key temporal factors':
                 analysis['temporal_factors'] = [
-                    f.strip() for f in line.split(':')[1].split(',')
+                    factor.strip() for factor in value.split(',') if factor.strip()
                 ]
 
         return analysis
@@ -152,7 +180,9 @@ Provide analysis in this format:
         short_term = immediate_value
 
         # Medium-term value (relationship building)
-        relationship_multiplier = 1.0 + (0.5 * relationship.get_relationship_strength())
+        relationship_multiplier = 1.0 + (
+            0.5 * relationship.get_relationship_strength(now=self._clock())
+        )
         medium_term = immediate_value * relationship_multiplier * self._discount_factor
 
         # Long-term value (reputation and network effects)
@@ -181,7 +211,7 @@ Provide analysis in this format:
         )
 
         # Factors for investment decision
-        strength = relationship.get_relationship_strength()
+        strength = relationship.get_relationship_strength(now=self._clock())
         interaction_frequency = relationship.interaction_count
         trust_level = relationship.trust_score
 
@@ -194,9 +224,14 @@ Provide analysis in this format:
 
         return investment_score >= self._investment_threshold
 
-    def _generate_temporal_strategy(self, context: str) -> str:
+    def _generate_temporal_strategy(
+        self,
+        context: str,
+        analysis: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Generate strategy considering temporal factors."""
-        analysis = self._analyze_temporal_context(context)
+        if analysis is None:
+            analysis = self._analyze_temporal_context(context)
 
         # Create phase-specific guidance
         phase_strategies = {
@@ -268,11 +303,10 @@ Key Principles:
         # Get current context
         context = action_spec.call_to_action
 
-        # Generate temporal strategy
-        strategy = self._generate_temporal_strategy(context)
+        analysis = self._analyze_temporal_context(context)
+        strategy = self._generate_temporal_strategy(context, analysis)
 
         # Update phase tracking
-        analysis = self._analyze_temporal_context(context)
         current_phase = analysis['current_phase']
         if current_phase != self._current_phase:
             self._phase_history.append(self._current_phase)
@@ -322,7 +356,10 @@ Format: impact_type|promises|reputation|value"""
         # Decay old relationships
         for relationship in self._relationships.values():
             if relationship.last_interaction:
-                days_since = (datetime.datetime.now() - relationship.last_interaction).days
+                days_since = max(
+                    0,
+                    (self._clock() - relationship.last_interaction).days,
+                )
                 if days_since > 90:  # 3 months
                     # Slowly decay trust for inactive relationships
                     relationship.trust_score *= 0.99
@@ -345,10 +382,16 @@ Format: name|outcome|indicators"""
         response = self._model.sample_text(prompt)
         parts = response.split('|')
 
-        if len(parts) >= 1 and parts[0].strip():
+        if (parts and parts[0].strip() and
+                parts[0].strip().lower() not in {'unknown', 'none', 'n/a'}):
             counterpart = parts[0].strip()
             if counterpart not in self._relationships:
                 self._relationships[counterpart] = RelationshipRecord(counterpart)
+
+    def pre_observe(self, observation: str) -> str:
+        """Feed entity observations into temporal relationship tracking."""
+        self.observe(observation)
+        return ""
 
     def get_state(self) -> Dict[str, Any]:
         """Get component state."""
@@ -357,27 +400,54 @@ Format: name|outcome|indicators"""
                 name: {
                     'trust_score': rec.trust_score,
                     'interaction_count': rec.interaction_count,
-                    'relationship_strength': rec.get_relationship_strength(),
+                    'total_value_exchanged': rec.total_value_exchanged,
+                    'last_interaction': (
+                        rec.last_interaction.isoformat()
+                        if rec.last_interaction is not None else None
+                    ),
+                    'concession_history': list(rec.concession_history),
+                    'outcome_history': list(rec.outcome_history),
+                    'reputation_score': rec.reputation_score,
                 }
                 for name, rec in self._relationships.items()
             },
             'global_reputation': self._global_reputation,
             'current_phase': self._current_phase,
             'phase_history': self._phase_history,
+            'temporal_plans': {
+                name: dataclasses.asdict(plan)
+                for name, plan in self._temporal_plans.items()
+            },
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Set component state."""
         self._global_reputation = state.get('global_reputation', 0.7)
         self._current_phase = state.get('current_phase', 'opening')
-        self._phase_history = state.get('phase_history', [])
+        self._phase_history = [str(phase) for phase in state.get('phase_history', [])]
+        self._temporal_plans = {
+            str(name): TemporalPlan(**data)
+            for name, data in state.get('temporal_plans', {}).items()
+        }
 
-        # Restore relationships (simplified)
+        self._relationships = {}
         for name, data in state.get('relationships', {}).items():
-            if name not in self._relationships:
-                self._relationships[name] = RelationshipRecord(name)
-            self._relationships[name].trust_score = data.get('trust_score', 0.5)
-            self._relationships[name].interaction_count = data.get('interaction_count', 0)
+            last_interaction = data.get('last_interaction')
+            self._relationships[name] = RelationshipRecord(
+                counterpart_name=name,
+                interaction_count=int(data.get('interaction_count', 0)),
+                total_value_exchanged=float(data.get('total_value_exchanged', 0.0)),
+                trust_score=float(data.get('trust_score', 0.5)),
+                last_interaction=(
+                    datetime.datetime.fromisoformat(last_interaction)
+                    if last_interaction else None
+                ),
+                concession_history=[
+                    float(value) for value in data.get('concession_history', [])
+                ],
+                outcome_history=list(data.get('outcome_history', [])),
+                reputation_score=float(data.get('reputation_score', 0.5)),
+            )
 
     def get_action_attempt(
         self,
@@ -423,7 +493,7 @@ Strategic Considerations:
 - Global reputation level: {self._global_reputation:.2f}
 
 Phase-Specific Guidance:
-{self._generate_temporal_strategy(situation_context)}
+{self._generate_temporal_strategy(situation_context, temporal_analysis)}
 
 Generate a negotiation action that:
 1. Aligns with the {temporal_analysis['current_phase']} phase requirements

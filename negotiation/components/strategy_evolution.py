@@ -7,8 +7,29 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from collections import deque
 
-from concordia_mini.typing import entity_component
-from concordia_mini.typing import entity as entity_lib
+from concordia.typing import entity_component
+from concordia.typing import entity as entity_lib
+from negotiation.utils.parsing import parse_named_floats, signals_agreement
+
+
+def _listify(value: Any) -> Any:
+    """Convert tuple-heavy RNG state to a JSON-safe tree."""
+    if isinstance(value, tuple):
+        return [_listify(item) for item in value]
+    if isinstance(value, list):
+        return [_listify(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _listify(item) for key, item in value.items()}
+    return value
+
+
+def _tuplify(value: Any) -> Any:
+    """Restore Python's tuple-based ``random.Random`` state."""
+    if isinstance(value, list):
+        return tuple(_tuplify(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _tuplify(item) for key, item in value.items()}
+    return value
 
 
 @dataclasses.dataclass
@@ -36,10 +57,16 @@ class StrategyGenome:
     context_specialization: List[str]
     generation: int = 0
 
-    def mutate(self, mutation_rate: float = 0.1) -> 'StrategyGenome':
+    def mutate(
+        self,
+        mutation_rate: float = 0.1,
+        *,
+        rng: Optional[random.Random] = None,
+    ) -> 'StrategyGenome':
         """Create a mutated version of this strategy."""
+        rng = rng or random.Random()
         new_genome = StrategyGenome(
-            strategy_id=f"{self.strategy_id}_mut_{random.randint(1000, 9999)}",
+            strategy_id=f"{self.strategy_id}_mut_{rng.randint(1000, 9999)}",
             tactics=self.tactics.copy(),
             parameters=self.parameters.copy(),
             weights=self.weights.copy(),
@@ -50,23 +77,30 @@ class StrategyGenome:
 
         # Parameter mutation
         for param in new_genome.parameters:
-            if random.random() < mutation_rate:
-                noise = random.gauss(0, 0.1)
+            if rng.random() < mutation_rate:
+                noise = rng.gauss(0, 0.1)
                 new_genome.parameters[param] = max(0.01, min(1.0,
                     new_genome.parameters[param] + noise))
 
         # Weight mutation
         for weight in new_genome.weights:
-            if random.random() < mutation_rate:
-                noise = random.gauss(0, 0.05)
+            if rng.random() < mutation_rate:
+                noise = rng.gauss(0, 0.05)
                 new_genome.weights[weight] = max(0.01, min(1.0,
                     new_genome.weights[weight] + noise))
 
+        total_weight = sum(new_genome.weights.values())
+        if total_weight > 0:
+            new_genome.weights = {
+                key: value / total_weight
+                for key, value in new_genome.weights.items()
+            }
+
         # Tactic mutation (add/remove/modify)
-        if random.random() < mutation_rate:
-            mutation_type = random.choice(['add', 'remove', 'modify'])
+        if rng.random() < mutation_rate:
+            mutation_type = rng.choice(['add', 'remove', 'modify'])
             if mutation_type == 'add' and len(new_genome.tactics) < 10:
-                new_tactic = random.choice([
+                new_tactic = rng.choice([
                     'collaborative_framing', 'value_stacking', 'deadline_pressure',
                     'anchoring_high', 'anchoring_low', 'information_gathering',
                     'rapport_building', 'alternative_creation', 'package_deals',
@@ -75,21 +109,27 @@ class StrategyGenome:
                 if new_tactic not in new_genome.tactics:
                     new_genome.tactics.append(new_tactic)
             elif mutation_type == 'remove' and len(new_genome.tactics) > 3:
-                new_genome.tactics.remove(random.choice(new_genome.tactics))
+                new_genome.tactics.remove(rng.choice(new_genome.tactics))
             elif mutation_type == 'modify':
                 # Modify order
-                random.shuffle(new_genome.tactics)
+                rng.shuffle(new_genome.tactics)
 
         return new_genome
 
-    def crossover(self, other: 'StrategyGenome') -> Tuple['StrategyGenome', 'StrategyGenome']:
+    def crossover(
+        self,
+        other: 'StrategyGenome',
+        *,
+        rng: Optional[random.Random] = None,
+    ) -> Tuple['StrategyGenome', 'StrategyGenome']:
         """Create offspring through crossover with another strategy."""
+        rng = rng or random.Random()
         # Blend parameters
         child1_params = {}
         child2_params = {}
         for param in self.parameters:
             if param in other.parameters:
-                alpha = random.random()
+                alpha = rng.random()
                 child1_params[param] = alpha * self.parameters[param] + (1-alpha) * other.parameters[param]
                 child2_params[param] = (1-alpha) * self.parameters[param] + alpha * other.parameters[param]
             else:
@@ -101,7 +141,7 @@ class StrategyGenome:
         child2_weights = {}
         for weight in self.weights:
             if weight in other.weights:
-                alpha = random.random()
+                alpha = rng.random()
                 child1_weights[weight] = alpha * self.weights[weight] + (1-alpha) * other.weights[weight]
                 child2_weights[weight] = (1-alpha) * self.weights[weight] + alpha * other.weights[weight]
             else:
@@ -109,30 +149,40 @@ class StrategyGenome:
                 child2_weights[weight] = self.weights[weight]
 
         # Combine tactics
-        combined_tactics = list(set(self.tactics + other.tactics))
-        random.shuffle(combined_tactics)
+        combined_tactics = sorted(set(self.tactics + other.tactics))
+        for weights in (child1_weights, child2_weights):
+            total = sum(weights.values())
+            if total > 0:
+                for key in weights:
+                    weights[key] /= total
+
+        rng.shuffle(combined_tactics)
 
         split_point = len(combined_tactics) // 2
         child1_tactics = combined_tactics[:split_point]
         child2_tactics = combined_tactics[split_point:]
 
         child1 = StrategyGenome(
-            strategy_id=f"cross_{self.strategy_id}_{other.strategy_id}_{random.randint(1000,9999)}",
+            strategy_id=f"cross_{self.strategy_id}_{other.strategy_id}_{rng.randint(1000,9999)}",
             tactics=child1_tactics,
             parameters=child1_params,
             weights=child1_weights,
             fitness_history=[],
-            context_specialization=list(set(self.context_specialization + other.context_specialization)),
+            context_specialization=sorted(set(
+                self.context_specialization + other.context_specialization
+            )),
             generation=max(self.generation, other.generation) + 1
         )
 
         child2 = StrategyGenome(
-            strategy_id=f"cross_{other.strategy_id}_{self.strategy_id}_{random.randint(1000,9999)}",
+            strategy_id=f"cross_{other.strategy_id}_{self.strategy_id}_{rng.randint(1000,9999)}",
             tactics=child2_tactics,
             parameters=child2_params,
             weights=child2_weights,
             fitness_history=[],
-            context_specialization=list(set(self.context_specialization + other.context_specialization)),
+            context_specialization=sorted(set(
+                self.context_specialization + other.context_specialization
+            )),
             generation=max(self.generation, other.generation) + 1
         )
 
@@ -164,18 +214,25 @@ class PerformanceMetrics:
 class ExperienceReplayBuffer:
     """Intelligent experience replay for continual learning."""
 
-    def __init__(self, max_size: int = 1000):
+    def __init__(
+        self,
+        max_size: int = 1000,
+        rng: Optional[np.random.Generator] = None,
+    ):
+        if max_size < 1:
+            raise ValueError('max_size must be at least 1.')
         self.buffer = deque(maxlen=max_size)
         self.importance_scores = deque(maxlen=max_size)
+        self._rng = rng or np.random.default_rng()
 
     def add_experience(self, episode: NegotiationEpisode, importance: float = 1.0):
         """Add experience with importance weighting."""
         self.buffer.append(episode)
-        self.importance_scores.append(importance)
+        self.importance_scores.append(max(0.0, float(importance)))
 
     def sample_strategic(self, n_samples: int, current_context: str) -> List[NegotiationEpisode]:
         """Sample experiences strategically for learning."""
-        if len(self.buffer) == 0:
+        if len(self.buffer) == 0 or n_samples <= 0:
             return []
 
         n_samples = min(n_samples, len(self.buffer))
@@ -188,11 +245,16 @@ class ExperienceReplayBuffer:
 
         # Sample mix of relevant and diverse experiences
         relevant_indices = np.argsort(relevance_scores)[-n_samples//2:]
-        diverse_indices = np.random.choice(
+        importance = np.asarray(self.importance_scores, dtype=float)
+        probability = (
+            importance / importance.sum()
+            if importance.sum() > 0 else None
+        )
+        diverse_indices = self._rng.choice(
             len(self.buffer),
             size=n_samples//2,
             replace=False,
-            p=np.array(list(self.importance_scores)) / sum(self.importance_scores)
+            p=probability,
         )
 
         selected_indices = list(relevant_indices) + list(diverse_indices)
@@ -222,6 +284,7 @@ class StrategyEvolution(entity_component.ContextComponent):
         mutation_rate: float = 0.1,
         crossover_rate: float = 0.7,
         learning_rate: float = 0.01,
+        seed: Optional[int] = None,
     ):
         """Initialize strategy evolution component.
 
@@ -231,19 +294,33 @@ class StrategyEvolution(entity_component.ContextComponent):
             mutation_rate: Probability of mutation
             crossover_rate: Probability of crossover
             learning_rate: Meta-learning rate
+            seed: Optional seed for reproducible strategy initialization
         """
+        if population_size < 1:
+            raise ValueError('population_size must be at least 1.')
+        if not 0.0 <= mutation_rate <= 1.0:
+            raise ValueError('mutation_rate must be between 0 and 1.')
+        if not 0.0 <= crossover_rate <= 1.0:
+            raise ValueError('crossover_rate must be between 0 and 1.')
+        if learning_rate <= 0.0:
+            raise ValueError('learning_rate must be positive.')
         self._model = model
         self._population_size = population_size
         self._mutation_rate = mutation_rate
         self._crossover_rate = crossover_rate
         self._learning_rate = learning_rate
+        self._rng = random.Random(seed)
+        self._np_rng = np.random.default_rng(seed)
 
         # Strategy population
         self._strategy_population: List[StrategyGenome] = []
         self._current_strategy: Optional[StrategyGenome] = None
 
         # Experience management
-        self._experience_buffer = ExperienceReplayBuffer(max_size=1000)
+        self._experience_buffer = ExperienceReplayBuffer(
+            max_size=1000,
+            rng=self._np_rng,
+        )
         self._current_episode: Optional[NegotiationEpisode] = None
 
         # Learning state
@@ -271,25 +348,25 @@ class StrategyEvolution(entity_component.ContextComponent):
 
         for i in range(self._population_size):
             # Create diverse initial strategies
-            tactics = random.sample(base_tactics, random.randint(3, 6))
+            tactics = self._rng.sample(base_tactics, self._rng.randint(3, 6))
 
             # Random parameters
             parameters = {
-                'aggressiveness': random.uniform(0.2, 0.8),
-                'flexibility': random.uniform(0.3, 0.9),
-                'patience': random.uniform(0.2, 0.8),
-                'risk_tolerance': random.uniform(0.1, 0.7),
-                'creativity': random.uniform(0.3, 0.9)
+                'aggressiveness': self._rng.uniform(0.2, 0.8),
+                'flexibility': self._rng.uniform(0.3, 0.9),
+                'patience': self._rng.uniform(0.2, 0.8),
+                'risk_tolerance': self._rng.uniform(0.1, 0.7),
+                'creativity': self._rng.uniform(0.3, 0.9)
             }
 
             # Random weights
             weights = {
-                'deal_value': random.uniform(0.2, 0.5),
-                'relationship_quality': random.uniform(0.1, 0.4),
-                'negotiation_speed': random.uniform(0.05, 0.2),
-                'fairness': random.uniform(0.1, 0.3),
-                'creativity': random.uniform(0.05, 0.2),
-                'robustness': random.uniform(0.1, 0.3)
+                'deal_value': self._rng.uniform(0.2, 0.5),
+                'relationship_quality': self._rng.uniform(0.1, 0.4),
+                'negotiation_speed': self._rng.uniform(0.05, 0.2),
+                'fairness': self._rng.uniform(0.1, 0.3),
+                'creativity': self._rng.uniform(0.05, 0.2),
+                'robustness': self._rng.uniform(0.1, 0.3)
             }
 
             # Normalize weights
@@ -309,7 +386,7 @@ class StrategyEvolution(entity_component.ContextComponent):
             self._strategy_population.append(strategy)
 
         # Select initial strategy
-        self._current_strategy = random.choice(self._strategy_population)
+        self._current_strategy = self._rng.choice(self._strategy_population)
 
     def _analyze_negotiation_context(self, context: str) -> Dict[str, float]:
         """Analyze context for meta-learning features."""
@@ -339,14 +416,10 @@ Format: stakes:X.X relationship:X.X time_pressure:X.X competitive:X.X complexity
             'uncertainty': 0.5
         }
 
-        for line in response.split('\n'):
-            for feature in context_features.keys():
-                if f"{feature}:" in line.lower():
-                    try:
-                        value = float(line.split(':')[1].strip())
-                        context_features[feature] = max(0.0, min(1.0, value))
-                    except (ValueError, IndexError):
-                        pass
+        context_features.update(parse_named_floats(
+            response,
+            {feature: (0.0, 1.0) for feature in context_features},
+        ))
 
         return context_features
 
@@ -371,8 +444,8 @@ Format: stakes:X.X relationship:X.X time_pressure:X.X competitive:X.X complexity
             strategy_scores.append((strategy, combined_score))
 
         # Select best strategy with some exploration
-        if random.random() < 0.1:  # 10% exploration
-            return random.choice(self._strategy_population)
+        if self._rng.random() < 0.1:  # 10% exploration
+            return self._rng.choice(self._strategy_population)
         else:  # 90% exploitation
             return max(strategy_scores, key=lambda x: x[1])[0]
 
@@ -409,9 +482,15 @@ Format: stakes:X.X relationship:X.X time_pressure:X.X competitive:X.X complexity
 
         return (match_score + tactic_match) / 2.0
 
-    def _generate_evolution_guidance(self, context: str, strategy: StrategyGenome) -> str:
+    def _generate_evolution_guidance(
+        self,
+        context: str,
+        strategy: StrategyGenome,
+        context_features: Optional[Dict[str, float]] = None,
+    ) -> str:
         """Generate strategy guidance based on evolution and context."""
-        context_features = self._analyze_negotiation_context(context)
+        if context_features is None:
+            context_features = self._analyze_negotiation_context(context)
 
         guidance = f"""🧬 Strategy Evolution Guidance
 
@@ -463,7 +542,7 @@ Format: stakes:X.X relationship:X.X time_pressure:X.X competitive:X.X complexity
             return
 
         # Calculate fitness for all strategies
-        strategy_fitness = {}
+        strategy_fitness: List[Tuple[StrategyGenome, float]] = []
         for strategy in self._strategy_population:
             if strategy.fitness_history:
                 # Recent performance weighted more heavily
@@ -472,14 +551,18 @@ Format: stakes:X.X relationship:X.X time_pressure:X.X competitive:X.X complexity
                 fitness = np.average(strategy.fitness_history, weights=weights)
             else:
                 fitness = 0.1  # Low fitness for untested strategies
-            strategy_fitness[strategy] = fitness
+            strategy_fitness.append((strategy, float(fitness)))
 
         # Selection: tournament selection
         new_population = []
         elite_count = max(2, self._population_size // 10)  # Keep top performers
 
         # Elitism: keep best strategies
-        sorted_strategies = sorted(strategy_fitness.items(), key=lambda x: x[1], reverse=True)
+        sorted_strategies = sorted(
+            strategy_fitness,
+            key=lambda item: item[1],
+            reverse=True,
+        )
         for strategy, _ in sorted_strategies[:elite_count]:
             new_population.append(strategy)
 
@@ -489,21 +572,31 @@ Format: stakes:X.X relationship:X.X time_pressure:X.X competitive:X.X complexity
             parent1 = self._tournament_selection(strategy_fitness, tournament_size=3)
             parent2 = self._tournament_selection(strategy_fitness, tournament_size=3)
 
-            if random.random() < self._crossover_rate:
-                child1, child2 = parent1.crossover(parent2)
+            if self._rng.random() < self._crossover_rate:
+                child1, child2 = parent1.crossover(parent2, rng=self._rng)
                 new_population.extend([child1, child2])
             else:
                 # Mutation only
-                new_population.append(parent1.mutate(self._mutation_rate))
+                new_population.append(parent1.mutate(
+                    self._mutation_rate,
+                    rng=self._rng,
+                ))
 
         # Trim to population size
         self._strategy_population = new_population[:self._population_size]
         self._generation_count += 1
 
-    def _tournament_selection(self, fitness_dict: Dict[StrategyGenome, float], tournament_size: int = 3) -> StrategyGenome:
+    def _tournament_selection(
+        self,
+        fitness_pairs: List[Tuple[StrategyGenome, float]],
+        tournament_size: int = 3,
+    ) -> StrategyGenome:
         """Select strategy using tournament selection."""
-        tournament = random.sample(list(fitness_dict.keys()), min(tournament_size, len(fitness_dict)))
-        return max(tournament, key=lambda s: fitness_dict[s])
+        tournament = self._rng.sample(
+            fitness_pairs,
+            min(tournament_size, len(fitness_pairs)),
+        )
+        return max(tournament, key=lambda item: item[1])[0]
 
     def get_action_attempt(
         self,
@@ -519,22 +612,22 @@ Format: stakes:X.X relationship:X.X time_pressure:X.X competitive:X.X complexity
         # Select best strategy for current context
         selected_strategy = self._select_strategy_for_context(context_features)
         
-        # Update current strategy
-        if selected_strategy != self._current_strategy:
+        # Keep one strategy attribution for the complete negotiation episode.
+        if self._current_episode is None and selected_strategy != self._current_strategy:
             self._current_strategy = selected_strategy
         
-        # Start episode tracking
-        self._current_episode = NegotiationEpisode(
-            context=situation_context,
-            strategy_used=self._current_strategy.strategy_id,
-            actions_taken=[],
-            counterpart_responses=[],
-            outcome_value=0.0,
-            relationship_impact=0.0,
-            duration=0,
-            success_metrics={},
-            lessons_learned=[]
-        )
+        if self._current_episode is None:
+            self._current_episode = NegotiationEpisode(
+                context=situation_context,
+                strategy_used=self._current_strategy.strategy_id,
+                actions_taken=[],
+                counterpart_responses=[],
+                outcome_value=0.0,
+                relationship_impact=0.0,
+                duration=0,
+                success_metrics={},
+                lessons_learned=[]
+            )
         
         # Generate action based on evolved strategy
         strategy = self._current_strategy
@@ -612,24 +705,28 @@ Action:"""
         selected_strategy = self._select_strategy_for_context(context_features)
 
         # Update current strategy if different
-        if selected_strategy != self._current_strategy:
+        if self._current_episode is None and selected_strategy != self._current_strategy:
             self._current_strategy = selected_strategy
 
-        # Start new episode tracking
-        self._current_episode = NegotiationEpisode(
-            context=context,
-            strategy_used=self._current_strategy.strategy_id,
-            actions_taken=[],
-            counterpart_responses=[],
-            outcome_value=0.0,
-            relationship_impact=0.0,
-            duration=0,
-            success_metrics={},
-            lessons_learned=[]
-        )
+        if self._current_episode is None:
+            self._current_episode = NegotiationEpisode(
+                context=context,
+                strategy_used=self._current_strategy.strategy_id,
+                actions_taken=[],
+                counterpart_responses=[],
+                outcome_value=0.0,
+                relationship_impact=0.0,
+                duration=0,
+                success_metrics={},
+                lessons_learned=[]
+            )
 
         # Generate evolution-based guidance
-        guidance = self._generate_evolution_guidance(context, self._current_strategy)
+        guidance = self._generate_evolution_guidance(
+            context,
+            self._current_strategy,
+            context_features,
+        )
 
         return f"\n{guidance}"
 
@@ -647,12 +744,23 @@ Action:"""
             self._current_episode.counterpart_responses.append(observation)
 
             # Simple outcome assessment from observation
-            if any(word in observation.lower() for word in ['agree', 'accept', 'deal', 'success']):
-                self._current_episode.outcome_value = 0.8
-                self._current_episode.relationship_impact = 0.7
+            if signals_agreement(observation):
+                self._finalize_episode({
+                    'value': 0.8,
+                    'relationship': 0.7,
+                    'fairness': 0.6,
+                })
             elif any(word in observation.lower() for word in ['reject', 'no deal', 'failed']):
-                self._current_episode.outcome_value = 0.2
-                self._current_episode.relationship_impact = 0.3
+                self._finalize_episode({
+                    'value': 0.2,
+                    'relationship': 0.3,
+                    'fairness': 0.5,
+                })
+
+    def pre_observe(self, observation: str) -> str:
+        """Feed entity observations into the strategy-learning lifecycle."""
+        self.observe(observation)
+        return ""
 
     def _finalize_episode(self, final_outcome: Dict[str, float]):
         """Finalize current episode and update learning."""
@@ -673,9 +781,16 @@ Action:"""
             robustness=final_outcome.get('robustness', 0.5)
         )
 
-        # Update strategy fitness
-        fitness = performance.weighted_fitness(self._current_strategy.weights)
-        self._current_strategy.fitness_history.append(fitness)
+        # Attribute the outcome to the strategy that started the episode.
+        episode_strategy = next(
+            (
+                strategy for strategy in self._strategy_population
+                if strategy.strategy_id == self._current_episode.strategy_used
+            ),
+            self._current_strategy,
+        )
+        fitness = performance.weighted_fitness(episode_strategy.weights)
+        episode_strategy.fitness_history.append(fitness)
 
         # Add to experience buffer
         importance = max(0.1, abs(fitness - 0.5) * 2)  # Extreme outcomes are more important
@@ -706,28 +821,91 @@ Action:"""
         self._current_episode = None
 
     def get_state(self) -> Dict[str, Any]:
-        """Get component state."""
+        """Return a complete, JSON-safe learning snapshot."""
         return {
             'generation_count': self._generation_count,
             'total_negotiations': self._total_negotiations,
-            'population_size': len(self._strategy_population),
-            'current_strategy': {
-                'id': self._current_strategy.strategy_id if self._current_strategy else None,
-                'generation': self._current_strategy.generation if self._current_strategy else 0,
-                'fitness_history': self._current_strategy.fitness_history if self._current_strategy else [],
-                'tactics': self._current_strategy.tactics if self._current_strategy else []
-            },
+            'population': [
+                dataclasses.asdict(strategy)
+                for strategy in self._strategy_population
+            ],
+            'current_strategy_id': (
+                self._current_strategy.strategy_id
+                if self._current_strategy else None
+            ),
+            'current_episode': (
+                dataclasses.asdict(self._current_episode)
+                if self._current_episode else None
+            ),
             'learning_rate': self._learning_rate,
-            'experience_buffer_size': len(self._experience_buffer.buffer),
-            'avg_recent_performance': np.mean([p.weighted_fitness({'deal_value': 0.4, 'relationship_quality': 0.3, 'fairness': 0.3})
-                                             for p in self._performance_history[-5:]]) if len(self._performance_history) >= 5 else 0.0
+            'experiences': [
+                dataclasses.asdict(episode)
+                for episode in self._experience_buffer.buffer
+            ],
+            'experience_importance': [
+                float(value)
+                for value in self._experience_buffer.importance_scores
+            ],
+            'performance_history': [
+                dataclasses.asdict(performance)
+                for performance in self._performance_history
+            ],
+            'context_adaptation_weights': dict(self._context_adaptation_weights),
+            'random_state': _listify(self._rng.getstate()),
+            'numpy_random_state': _listify(self._np_rng.bit_generator.state),
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
-        """Set component state."""
-        self._generation_count = state.get('generation_count', 0)
-        self._total_negotiations = state.get('total_negotiations', 0)
-        self._learning_rate = state.get('learning_rate', 0.01)
+        """Restore a snapshot produced by :meth:`get_state`."""
+        if not isinstance(state, dict):
+            raise TypeError('Strategy evolution state must be a mapping.')
+        self._generation_count = int(state.get('generation_count', 0))
+        self._total_negotiations = int(state.get('total_negotiations', 0))
+        self._learning_rate = float(state.get('learning_rate', self._learning_rate))
+        population_data = state.get('population')
+        if population_data is not None:
+            self._strategy_population = [
+                StrategyGenome(**data) for data in population_data
+            ]
+            self._population_size = len(self._strategy_population)
+        current_id = state.get('current_strategy_id')
+        self._current_strategy = next(
+            (
+                strategy for strategy in self._strategy_population
+                if strategy.strategy_id == current_id
+            ),
+            self._strategy_population[0] if self._strategy_population else None,
+        )
+        episode = state.get('current_episode')
+        self._current_episode = NegotiationEpisode(**episode) if episode else None
+        self._performance_history = [
+            PerformanceMetrics(**data)
+            for data in state.get('performance_history', [])
+        ]
+        self._context_adaptation_weights = {
+            str(name): float(value)
+            for name, value in state.get(
+                'context_adaptation_weights',
+                self._context_adaptation_weights,
+            ).items()
+        }
+        max_size = self._experience_buffer.buffer.maxlen or 1000
+        self._experience_buffer = ExperienceReplayBuffer(
+            max_size=max_size,
+            rng=self._np_rng,
+        )
+        for episode_data, importance in zip(
+            state.get('experiences', []),
+            state.get('experience_importance', []),
+        ):
+            self._experience_buffer.add_experience(
+                NegotiationEpisode(**episode_data),
+                float(importance),
+            )
+        if 'random_state' in state:
+            self._rng.setstate(_tuplify(state['random_state']))
+        if 'numpy_random_state' in state:
+            self._np_rng.bit_generator.state = state['numpy_random_state']
 
     def update(self) -> None:
         """Update strategy evolution component."""

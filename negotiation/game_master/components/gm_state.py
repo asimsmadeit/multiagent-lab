@@ -16,9 +16,10 @@
 
 import dataclasses
 import datetime
+from collections.abc import Callable
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from concordia_mini.typing import entity_component
+from concordia.typing import entity_component
 
 
 @dataclasses.dataclass
@@ -74,19 +75,26 @@ class NegotiationStateTracker(entity_component.ContextComponent):
       max_rounds: int = 20,
       enable_deadlines: bool = True,
       track_relationships: bool = True,
+      clock: Callable[[], datetime.datetime] = datetime.datetime.now,
   ):
     """Initialize negotiation state tracker.
 
-    Args:
+        Args:
       initial_phase: Starting phase of negotiations
       max_rounds: Maximum rounds before forced termination
       enable_deadlines: Whether to enforce time limits
       track_relationships: Whether to track relationship changes
+      clock: Injectable timestamp source for deterministic runs
     """
+    if max_rounds < 1:
+      raise ValueError('max_rounds must be at least 1.')
+    if initial_phase not in {'opening', 'bargaining', 'closing'}:
+      raise ValueError('initial_phase must be opening, bargaining, or closing.')
     self._initial_phase = initial_phase
     self._max_rounds = max_rounds
     self._enable_deadlines = enable_deadlines
     self._track_relationships = track_relationships
+    self._clock = clock
 
     # Active negotiations
     self._negotiations: Dict[str, NegotiationState] = {}
@@ -105,9 +113,13 @@ class NegotiationStateTracker(entity_component.ContextComponent):
       deadline: Optional[datetime.datetime] = None,
   ) -> NegotiationState:
     """Start a new negotiation."""
+    if negotiation_id in self._negotiations:
+      raise ValueError(f"Negotiation already exists: {negotiation_id}")
+    if len(participants) < 2 or len(set(participants)) != len(participants):
+      raise ValueError('A negotiation requires at least two unique participants.')
     state = NegotiationState(
         negotiation_id=negotiation_id,
-        participants=participants,
+        participants=list(participants),
         phase=self._initial_phase,
         current_round=0,
         offers_history=[],
@@ -142,14 +154,20 @@ class NegotiationStateTracker(entity_component.ContextComponent):
       raise ValueError(f"Unknown negotiation: {negotiation_id}")
 
     state = self._negotiations[negotiation_id]
+    if state.phase in {'completed', 'failed'}:
+      raise ValueError(f"Negotiation is already terminated: {negotiation_id}")
+    if offerer not in state.participants or recipient not in state.participants:
+      raise ValueError('Offerer and recipient must be negotiation participants.')
+    if offerer == recipient:
+      raise ValueError('Offerer and recipient must be different participants.')
 
     # Create offer
     offer = NegotiationOffer(
         offerer=offerer,
         recipient=recipient,
         offer_type=offer_type,
-        terms=terms,
-        timestamp=datetime.datetime.now(),
+        terms=dict(terms),
+        timestamp=self._clock(),
         round_number=state.current_round,
     )
 
@@ -174,14 +192,26 @@ class NegotiationStateTracker(entity_component.ContextComponent):
       raise ValueError(f"Unknown negotiation: {negotiation_id}")
 
     state = self._negotiations[negotiation_id]
+    if state.phase in {'completed', 'failed'}:
+      raise ValueError(f"Negotiation is already terminated: {negotiation_id}")
+    if offer not in state.offers_history:
+      raise ValueError('Offer does not belong to this negotiation.')
+    if acceptor not in state.participants:
+      raise ValueError('Acceptor must be a negotiation participant.')
+    if acceptor != offer.recipient:
+      raise ValueError('Only the intended recipient can accept an offer.')
+    if offer.is_rejected:
+      raise ValueError('A rejected offer cannot be accepted.')
+    if offer.is_accepted:
+      raise ValueError('Offer is already accepted.')
     offer.is_accepted = True
 
     # Record agreement
     state.agreements[f"round_{offer.round_number}"] = {
-        'terms': offer.terms,
+        'terms': dict(offer.terms),
         'offerer': offer.offerer,
         'acceptor': acceptor,
-        'timestamp': datetime.datetime.now(),
+        'timestamp': self._clock(),
     }
 
     # Update phase
@@ -204,6 +234,19 @@ class NegotiationStateTracker(entity_component.ContextComponent):
     if negotiation_id not in self._negotiations:
       raise ValueError(f"Unknown negotiation: {negotiation_id}")
 
+    state = self._negotiations[negotiation_id]
+    if state.phase in {'completed', 'failed'}:
+      raise ValueError(f"Negotiation is already terminated: {negotiation_id}")
+    if offer not in state.offers_history:
+      raise ValueError('Offer does not belong to this negotiation.')
+    if rejector not in state.participants:
+      raise ValueError('Rejector must be a negotiation participant.')
+    if rejector != offer.recipient:
+      raise ValueError('Only the intended recipient can reject an offer.')
+    if offer.is_accepted:
+      raise ValueError('An accepted offer cannot be rejected.')
+    if offer.is_rejected:
+      raise ValueError('Offer is already rejected.')
     offer.is_rejected = True
     offer.rejection_reason = reason
 
@@ -222,6 +265,8 @@ class NegotiationStateTracker(entity_component.ContextComponent):
       raise ValueError(f"Unknown negotiation: {negotiation_id}")
 
     state = self._negotiations[negotiation_id]
+    if state.phase in {'completed', 'failed'}:
+      return
     state.current_round += 1
 
     # Check max rounds
@@ -243,6 +288,8 @@ class NegotiationStateTracker(entity_component.ContextComponent):
       raise ValueError(f"Unknown negotiation: {negotiation_id}")
 
     state = self._negotiations[negotiation_id]
+    if state.phase in {'completed', 'failed'}:
+      return
     state.phase = 'completed' if success else 'failed'
     state.termination_reason = reason
 
@@ -300,25 +347,25 @@ class NegotiationStateTracker(entity_component.ContextComponent):
 
     return context
 
-  def post_act(self, action_attempt: str) -> None:
+  def post_act(self, action_attempt: str) -> str:
     """Process actions that might affect negotiation state."""
     # This would parse action_attempt to update state
     # In practice, the game master would call our methods directly
-    pass
+    return ""
 
-  def pre_observe(self, observation: str) -> None:
+  def pre_observe(self, observation: str) -> str:
     """Process observations."""
-    pass
+    return ""
 
-  def post_observe(self) -> None:
+  def post_observe(self) -> str:
     """Post-observation processing."""
-    pass
+    return ""
 
   def update(self) -> None:
     """Update internal state."""
     # Check deadlines if enabled
     if self._enable_deadlines:
-      current_time = datetime.datetime.now()
+      current_time = self._clock()
       for neg_id, state in self._negotiations.items():
         if state.deadline and current_time > state.deadline:
           if state.phase not in ['completed', 'failed']:
@@ -333,13 +380,97 @@ class NegotiationStateTracker(entity_component.ContextComponent):
     """Component name."""
     return 'NegotiationStateTracker'
 
-  def get_state(self) -> str:
+  def get_state(self) -> Dict[str, Any]:
     """Get component state for saving."""
-    return f"{self._completed_negotiations}|{self._failed_negotiations}"
+    return {
+        'negotiations': {
+            negotiation_id: {
+                'participants': list(state.participants),
+                'phase': state.phase,
+                'current_round': state.current_round,
+                'offers_history': [
+                    {
+                        **dataclasses.asdict(offer),
+                        'timestamp': offer.timestamp.isoformat(),
+                    }
+                    for offer in state.offers_history
+                ],
+                'agreements': {
+                    key: {
+                        **agreement,
+                        'timestamp': (
+                            agreement['timestamp'].isoformat()
+                            if isinstance(agreement.get('timestamp'), datetime.datetime)
+                            else agreement.get('timestamp')
+                        ),
+                    }
+                    for key, agreement in state.agreements.items()
+                },
+                'active_offer_index': (
+                    state.offers_history.index(state.active_offer)
+                    if state.active_offer in state.offers_history else None
+                ),
+                'deadline': state.deadline.isoformat() if state.deadline else None,
+                'termination_reason': state.termination_reason,
+            }
+            for negotiation_id, state in self._negotiations.items()
+        },
+        'relationships': [
+            {'participants': list(participants), 'score': score}
+            for participants, score in self._relationships.items()
+        ],
+        'completed_negotiations': self._completed_negotiations,
+        'failed_negotiations': self._failed_negotiations,
+    }
 
-  def set_state(self, state: str) -> None:
+  def set_state(self, state: Dict[str, Any] | str) -> None:
     """Restore component state."""
-    if '|' in state:
+    if isinstance(state, str) and '|' in state:
       completed, failed = state.split('|', 1)
       self._completed_negotiations = int(completed)
       self._failed_negotiations = int(failed)
+      return
+    if not isinstance(state, dict):
+      raise TypeError('Negotiation tracker state must be a mapping.')
+    self._negotiations = {}
+    for negotiation_id, raw in state.get('negotiations', {}).items():
+      offers = [
+          NegotiationOffer(
+              offerer=str(offer['offerer']),
+              recipient=str(offer['recipient']),
+              offer_type=str(offer['offer_type']),
+              terms=dict(offer.get('terms', {})),
+              timestamp=datetime.datetime.fromisoformat(offer['timestamp']),
+              round_number=int(offer['round_number']),
+              is_accepted=bool(offer.get('is_accepted', False)),
+              is_rejected=bool(offer.get('is_rejected', False)),
+              rejection_reason=offer.get('rejection_reason'),
+          )
+          for offer in raw.get('offers_history', [])
+      ]
+      active_index = raw.get('active_offer_index')
+      agreements = {}
+      for key, agreement in raw.get('agreements', {}).items():
+        restored = dict(agreement)
+        timestamp = restored.get('timestamp')
+        if timestamp:
+          restored['timestamp'] = datetime.datetime.fromisoformat(timestamp)
+        agreements[key] = restored
+      deadline = raw.get('deadline')
+      self._negotiations[negotiation_id] = NegotiationState(
+          negotiation_id=negotiation_id,
+          participants=[str(p) for p in raw.get('participants', [])],
+          phase=str(raw.get('phase', self._initial_phase)),
+          current_round=int(raw.get('current_round', 0)),
+          offers_history=offers,
+          agreements=agreements,
+          active_offer=(offers[int(active_index)] if active_index is not None else None),
+          deadline=datetime.datetime.fromisoformat(deadline) if deadline else None,
+          termination_reason=raw.get('termination_reason'),
+      )
+    self._relationships = {
+        tuple(sorted(str(p) for p in item['participants'])): float(item['score'])
+        for item in state.get('relationships', [])
+    }
+    self._completed_negotiations = int(state.get('completed_negotiations', 0))
+    self._failed_negotiations = int(state.get('failed_negotiations', 0))

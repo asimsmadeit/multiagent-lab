@@ -161,6 +161,69 @@ class GeneralizationResult:
         }
 
 
+def _train_test_indices(
+    X: np.ndarray,
+    y: np.ndarray,
+    random_state: int,
+    groups: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return row or group-aware split indices.
+
+    Negotiation turns from the same trial must remain on one side of a split.
+    ``groups=None`` preserves the public functions' legacy row-split behavior.
+    """
+    if len(X) != len(y):
+        raise ValueError("X and y must contain the same number of samples")
+    if len(y) < 2:
+        raise ValueError("At least two samples are required for a train/test split")
+
+    indices = np.arange(len(y))
+    if groups is not None:
+        from sklearn.model_selection import GroupShuffleSplit
+
+        groups = np.asarray(groups)
+        if len(groups) != len(y):
+            raise ValueError("groups must have one value per sample")
+        if len(np.unique(groups)) < 2:
+            raise ValueError("group-aware splitting requires at least two groups")
+        splitter = GroupShuffleSplit(
+            n_splits=100, test_size=0.2, random_state=random_state
+        )
+        binary_y = (np.asarray(y) > 0.5).astype(int)
+        require_both_classes = len(np.unique(binary_y)) > 1
+        first_split = None
+        for train_idx, test_idx in splitter.split(X, y, groups=groups):
+            if first_split is None:
+                first_split = (train_idx, test_idx)
+            if not require_both_classes:
+                return train_idx, test_idx
+            if (
+                len(np.unique(binary_y[train_idx])) > 1
+                and len(np.unique(binary_y[test_idx])) > 1
+            ):
+                return train_idx, test_idx
+        if require_both_classes:
+            raise ValueError(
+                "Could not create a group-disjoint split containing both label "
+                "classes in train and test"
+            )
+        if first_split is not None:
+            return first_split
+        raise ValueError("Could not create a group-aware train/test split")
+
+    binary_y = (np.asarray(y) > 0.5).astype(int)
+    min_class_count = (
+        min(np.bincount(binary_y)) if len(np.unique(binary_y)) > 1 else 0
+    )
+    stratify_arg = binary_y if min_class_count >= 2 else None
+    return train_test_split(
+        indices,
+        test_size=0.2,
+        random_state=random_state,
+        stratify=stratify_arg,
+    )
+
+
 def train_ridge_probe(
     X: np.ndarray,
     y: np.ndarray,
@@ -169,7 +232,8 @@ def train_ridge_probe(
     n_components: int = 30,
     random_state: int = 42,
     normalize: bool = True,
-) -> Tuple[Ridge, ProbeResult]:
+    groups: Optional[np.ndarray] = None,
+) -> Tuple[Any, ProbeResult]:
     """Train a Ridge regression probe.
 
     Args:
@@ -185,41 +249,24 @@ def train_ridge_probe(
         Tuple of (trained Ridge probe, ProbeResult with metrics)
     """
 
-    # Split data
-    # Stratify by binary label if both classes have enough members, else skip
-    binary_y = (y > 0.5).astype(int)
-    min_class_count = min(np.bincount(binary_y)) if len(np.unique(binary_y)) > 1 else 0
-    stratify_arg = binary_y if min_class_count >= 2 else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state,
-        stratify=stratify_arg
+    train_idx, test_idx = _train_test_indices(
+        X, y, random_state=random_state, groups=groups
     )
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
 
-    # Normalize: fit on train only to prevent data leakage
+    # Return the fitted preprocessing and estimator as one object so callers
+    # cannot accidentally feed raw activations to a Ridge fitted in PCA space.
+    from sklearn.pipeline import Pipeline
+    probe_steps = []
     if normalize:
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
-
-    # Optional PCA to reduce overfitting
+        probe_steps.append(('scaler', StandardScaler()))
     if use_pca:
         n_comp = min(n_components, X_train.shape[0] - 1, X_train.shape[1])
-        pca = PCA(n_components=n_comp)
-        X_train = pca.fit_transform(X_train)
-        X_test = pca.transform(X_test)
-        # Use already-fitted PCA to transform full X (no data leakage)
-        if normalize:
-            X_pca = pca.transform(scaler.transform(X))
-        else:
-            X_pca = pca.transform(X)
-    else:
-        if normalize:
-            X_pca = scaler.transform(X)
-        else:
-            X_pca = X
-
-    # Train probe
-    probe = Ridge(alpha=alpha)
+        if n_comp >= 1:
+            probe_steps.append(('pca', PCA(n_components=n_comp)))
+    probe_steps.append(('ridge', Ridge(alpha=alpha)))
+    probe = Pipeline(probe_steps)
     probe.fit(X_train, y_train)
 
     # Evaluate
@@ -230,16 +277,32 @@ def train_ridge_probe(
     test_r2 = r2_score(y_test, test_pred)
 
     # Cross-validation (Pipeline ensures scaler/PCA are re-fit per fold, no leakage)
-    from sklearn.pipeline import Pipeline
     cv_steps = []
     if normalize:
         cv_steps.append(('scaler', StandardScaler()))
     if use_pca:
         # Account for CV fold size: each fold trains on (cv-1)/cv of the data
-        max_pca = int(X.shape[0] * 4 / 5) - 1  # 5-fold CV → 80% training
+        # Two-fold CV is the smallest possible training fold. This conservative
+        # bound also keeps PCA valid for small grouped datasets.
+        max_pca = max(1, X.shape[0] // 2 - 1)
         cv_steps.append(('pca', PCA(n_components=min(n_components, max_pca, X.shape[1]))))
     cv_steps.append(('ridge', Ridge(alpha=alpha)))
-    cv_scores = cross_val_score(Pipeline(cv_steps), X, y, cv=5, scoring='r2')
+    try:
+        if groups is not None:
+            from sklearn.model_selection import GroupKFold
+
+            n_splits = min(5, len(np.unique(groups)))
+            cv = GroupKFold(n_splits=n_splits)
+            cv_scores = cross_val_score(
+                Pipeline(cv_steps), X, y, cv=cv, groups=groups, scoring='r2'
+            )
+        else:
+            n_splits = min(5, len(y))
+            cv_scores = cross_val_score(
+                Pipeline(cv_steps), X, y, cv=n_splits, scoring='r2'
+            )
+    except ValueError:
+        cv_scores = np.array([])
 
     # Binary metrics
     binary_pred = (test_pred > 0.5).astype(int)
@@ -276,7 +339,8 @@ def train_logistic_probe(
     val_fraction: float = 0.25,
     use_pca: bool = True,
     n_components: int = 100,
-) -> Tuple[LogisticRegression, ProbeResult]:
+    groups: Optional[np.ndarray] = None,
+) -> Tuple[Any, ProbeResult]:
     """Train a Logistic Regression probe for binary deception classification.
 
     This is the recommended probe type for binary deception detection per
@@ -301,46 +365,70 @@ def train_logistic_probe(
 
     # Check we have both classes
     if len(np.unique(y_binary)) < 2:
-        return LogisticRegression(), ProbeResult(
+        from sklearn.dummy import DummyClassifier
+
+        probe = DummyClassifier(
+            strategy='constant', constant=int(y_binary[0])
+        ).fit(X, y_binary)
+        return probe, ProbeResult(
             layer=-1, label_type="", r2_score=0.0, accuracy=0.5,
             auc=0.5, train_r2=0.0, test_r2=0.0, cross_val_scores=[]
         )
 
     # Split data
-    min_class = min(np.bincount(y_binary)) if len(np.unique(y_binary)) > 1 else 0
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y_binary, test_size=0.2, random_state=random_state,
-        stratify=y_binary if min_class >= 2 else None
+    train_idx, test_idx = _train_test_indices(
+        X, y_binary, random_state=random_state, groups=groups
     )
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y_binary[train_idx], y_binary[test_idx]
+    train_groups = np.asarray(groups)[train_idx] if groups is not None else None
 
-    # Normalize: fit on train only
-    scaler = None
-    if normalize:
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
+    from sklearn.pipeline import Pipeline
 
-    # PCA for dimensionality reduction (speeds up logistic on high-dim data)
-    pca = None
-    if use_pca:
-        n_comp = min(n_components, X_train.shape[0] - 1, X_train.shape[1])
-        pca = PCA(n_components=n_comp)
-        X_train = pca.fit_transform(X_train)
-        X_test = pca.transform(X_test)
+    def build_pipeline(c_value: float, n_fit_rows: int) -> Pipeline:
+        steps = []
+        if normalize:
+            steps.append(('scaler', StandardScaler()))
+        if use_pca:
+            n_comp = min(n_components, n_fit_rows - 1, X.shape[1])
+            if n_comp >= 1:
+                steps.append(('pca', PCA(n_components=n_comp)))
+        steps.append(('lr', LogisticRegression(
+            C=c_value, max_iter=5000,
+            random_state=random_state, solver='lbfgs',
+        )))
+        return Pipeline(steps)
 
     # Tune C on validation set if requested
     if tune_C:
-        min_c = min(np.bincount(y_train)) if len(np.unique(y_train)) > 1 else 0
-        X_tr, X_val, y_tr, y_val = train_test_split(
-            X_train, y_train, test_size=val_fraction,
-            random_state=random_state, stratify=y_train if min_c >= 2 else None
-        )
+        if train_groups is not None:
+            from sklearn.model_selection import GroupShuffleSplit
+            inner = GroupShuffleSplit(
+                n_splits=100, test_size=val_fraction, random_state=random_state
+            )
+            inner_splits = inner.split(X_train, y_train, groups=train_groups)
+            try:
+                tr_idx, val_idx = next(
+                    (tr, val) for tr, val in inner_splits
+                    if len(np.unique(y_train[tr])) > 1
+                    and len(np.unique(y_train[val])) > 1
+                )
+            except StopIteration as exc:
+                raise ValueError(
+                    "Could not create a class-balanced group validation split"
+                ) from exc
+            X_tr, X_val = X_train[tr_idx], X_train[val_idx]
+            y_tr, y_val = y_train[tr_idx], y_train[val_idx]
+        else:
+            min_c = min(np.bincount(y_train)) if len(np.unique(y_train)) > 1 else 0
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_train, y_train, test_size=val_fraction,
+                random_state=random_state,
+                stratify=y_train if min_c >= 2 else None,
+            )
         best_C, best_val_auc = C, 0.0
         for c_candidate in [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]:
-            clf = LogisticRegression(
-                C=c_candidate, penalty='l2', max_iter=5000,
-                random_state=random_state, solver='lbfgs'
-            )
+            clf = build_pipeline(c_candidate, len(X_tr))
             clf.fit(X_tr, y_tr)
             try:
                 val_auc = roc_auc_score(y_val, clf.predict_proba(X_val)[:, 1])
@@ -350,11 +438,8 @@ def train_logistic_probe(
                 best_C, best_val_auc = c_candidate, val_auc
         C = best_C
 
-    # Train probe
-    probe = LogisticRegression(
-        C=C, penalty='l2', max_iter=5000,
-        random_state=random_state, solver='lbfgs'
-    )
+    # Train the final preprocessing + classifier pipeline on outer-train only.
+    probe = build_pipeline(C, len(X_train))
     probe.fit(X_train, y_train)
 
     # Evaluate
@@ -362,7 +447,6 @@ def train_logistic_probe(
     test_proba = probe.predict_proba(X_test)[:, 1]
     test_pred = probe.predict(X_test)
 
-    train_acc = accuracy_score(y_train, probe.predict(X_train))
     test_acc = accuracy_score(y_test, test_pred)
 
     try:
@@ -376,20 +460,36 @@ def train_logistic_probe(
         train_auc = 0.5
 
     # Cross-validation (Pipeline ensures scaler/PCA are re-fit per fold, no leakage)
-    from sklearn.pipeline import Pipeline
     y_all_binary = (np.array(y) > 0.5).astype(int)
     try:
-        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=random_state)
+        if groups is not None:
+            from sklearn.model_selection import StratifiedGroupKFold
+            n_splits = min(5, len(np.unique(groups)))
+            cv = StratifiedGroupKFold(
+                n_splits=n_splits, shuffle=True, random_state=random_state
+            )
+        else:
+            min_class_count = min(np.bincount(y_all_binary))
+            n_splits = min(5, min_class_count)
+            if n_splits < 2:
+                raise ValueError("Insufficient class counts for cross-validation")
+            cv = StratifiedKFold(
+                n_splits=n_splits, shuffle=True, random_state=random_state
+            )
         cv_steps = []
-        if scaler is not None:
+        if normalize:
             cv_steps.append(('scaler', StandardScaler()))
-        if pca is not None:
-            # Account for CV fold size: each fold trains on (cv-1)/cv of the data
-            max_pca = int(X.shape[0] * 4 / 5) - 1
-            cv_steps.append(('pca', PCA(n_components=min(pca.n_components_, max_pca))))
-        cv_steps.append(('lr', LogisticRegression(C=C, penalty='l2', max_iter=5000, solver='lbfgs')))
+        if use_pca:
+            max_pca = max(1, X.shape[0] // 2 - 1)
+            cv_steps.append(('pca', PCA(
+                n_components=min(n_components, max_pca, X.shape[1])
+            )))
+        cv_steps.append(('lr', LogisticRegression(
+            C=C, max_iter=5000, solver='lbfgs'
+        )))
         cv_scores = cross_val_score(
-            Pipeline(cv_steps), X, y_all_binary, cv=cv, scoring='roc_auc'
+            Pipeline(cv_steps), X, y_all_binary, cv=cv, scoring='roc_auc',
+            groups=groups,
         )
     except ValueError:
         cv_scores = np.array([0.5])
@@ -486,6 +586,7 @@ def train_mass_mean_probe(
     threshold: float = 0.5,
     random_state: int = 42,
     normalize: bool = True,
+    groups: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, ProbeResult]:
     """
     Train a mass-mean direction probe (Marks & Tegmark method).
@@ -513,12 +614,12 @@ def train_mass_mean_probe(
         )
 
     # Split FIRST to prevent data leakage in direction computation
-    min_class = min(np.bincount(binary_y)) if len(np.unique(binary_y)) > 1 else 0
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=random_state,
-        stratify=binary_y if min_class >= 2 else None
+    train_idx, test_idx = _train_test_indices(
+        X, y, random_state=random_state, groups=groups
     )
-    binary_y_train = (y_train > 0.5).astype(bool)
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    binary_y_train = (y_train > threshold).astype(bool)
 
     # Center activations by subtracting mean (Marks & Tegmark method)
     # Fit on train only
@@ -556,8 +657,8 @@ def train_mass_mean_probe(
     test_r2 = r2_score(y_test, test_pred)
 
     # Binary metrics
-    binary_pred = (test_pred > 0.5).astype(int)
-    binary_true = (y_test > 0.5).astype(int)
+    binary_pred = (test_pred > threshold).astype(int)
+    binary_true = (y_test > threshold).astype(int)
 
     accuracy = accuracy_score(binary_true, binary_pred)
 
@@ -656,14 +757,17 @@ def sanity_check_random_labels(
     X: np.ndarray,
     y: np.ndarray,
     n_shuffles: int = 5,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Sanity check: probes on shuffled labels should give R² near 0."""
     shuffle_r2s = []
+    rng = np.random.default_rng(0)
 
     for seed in range(n_shuffles):
-        np.random.seed(seed)
-        y_shuffled = np.random.permutation(y)
-        _, result = train_ridge_probe(X, y_shuffled)
+        y_shuffled = rng.permutation(y)
+        _, result = train_ridge_probe(
+            X, y_shuffled, random_state=seed, groups=groups
+        )
         shuffle_r2s.append(result.r2_score)
 
     return {
@@ -677,9 +781,10 @@ def sanity_check_random_labels(
 def sanity_check_train_test_gap(
     X: np.ndarray,
     y: np.ndarray,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
     """Check for overfitting."""
-    _, result = train_ridge_probe(X, y)
+    _, result = train_ridge_probe(X, y, groups=groups)
 
     gap = result.train_r2 - result.test_r2
 
@@ -713,6 +818,7 @@ def train_probes_per_layer(
     alpha: float = 100.0,
     use_pca: bool = True,
     n_components: int = 30,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[int, Dict[str, float]]:
     """
     Train separate probes on each layer to find optimal layer for deception detection.
@@ -764,7 +870,8 @@ def train_probes_per_layer(
 
         try:
             _, probe_result = train_ridge_probe(
-                X, y, alpha=alpha, use_pca=use_pca, n_components=n_components
+                X, y, alpha=alpha, use_pca=use_pca,
+                n_components=n_components, groups=groups,
             )
             results[layer_key] = {
                 'auc': probe_result.auc,
@@ -1198,6 +1305,7 @@ def compute_cross_mode_transfer(
     alpha: float = 100.0,
     use_pca: bool = True,
     n_components: int = 30,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """RQ1: Compute bidirectional cross-mode transfer between instructed and emergent.
 
@@ -1226,6 +1334,10 @@ def compute_cross_mode_transfer(
         and interpretation including asymmetry analysis
     """
     mode_labels = np.array(mode_labels)
+    if len(mode_labels) != len(y) or len(X) != len(y):
+        raise ValueError("X, y, and mode_labels must be sample-aligned")
+    if groups is not None and len(groups) != len(y):
+        raise ValueError("groups must have one value per sample")
 
     # Split by mode
     instructed_mask = mode_labels == "instructed"
@@ -1263,6 +1375,15 @@ def compute_cross_mode_transfer(
     # for backward compatibility.
     y_instructed_binary = (y_instructed > 0.5).astype(float)
     y_emergent_binary = (y_emergent > 0.5).astype(float)
+    if (
+        len(np.unique(y_instructed_binary)) < 2
+        or len(np.unique(y_emergent_binary)) < 2
+    ):
+        return {
+            "error": "Both modes require honest and deceptive samples",
+            "n_instructed": int(n_instructed),
+            "n_emergent": int(n_emergent),
+        }
 
     # Apply PCA on training data (instructed)
     if use_pca:
@@ -1330,11 +1451,17 @@ def compute_cross_mode_transfer(
     # Also compute within-mode performance for comparison
     # Guard: within-mode datasets may be too small or imbalanced for train/test split
     try:
-        _, instructed_result = train_ridge_probe(X_instructed, y_instructed, alpha=alpha)
+        instructed_groups = np.asarray(groups)[instructed_mask] if groups is not None else None
+        _, instructed_result = train_ridge_probe(
+            X_instructed, y_instructed, alpha=alpha, groups=instructed_groups
+        )
     except ValueError:
         instructed_result = None
     try:
-        _, emergent_result = train_ridge_probe(X_emergent, y_emergent, alpha=alpha)
+        emergent_groups = np.asarray(groups)[emergent_mask] if groups is not None else None
+        _, emergent_result = train_ridge_probe(
+            X_emergent, y_emergent, alpha=alpha, groups=emergent_groups
+        )
     except ValueError:
         emergent_result = None
 
@@ -1393,28 +1520,36 @@ def analyze_implicit_encoding(
     gm_labels: np.ndarray,
     agent_labels: np.ndarray,
     alpha: float = 100.0,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """RQ2: Compare GM vs Agent label predictability to detect implicit encoding.
+    """Compare actual-deception and perceived-counterpart label predictability.
 
-    If GM labels are more predictable than agent self-reports, the model
-    encodes deception information it doesn't "acknowledge" in its outputs.
+    ``agent_labels`` are Theory-of-Mind estimates about the counterpart. They
+    are not self-reports about the acting agent, so this comparison cannot by
+    itself establish hidden self-knowledge or self-awareness.
 
     Args:
         X: Feature matrix [N, d_model]
         gm_labels: Ground truth deception labels [N]
-        agent_labels: Agent self-report labels [N]
+        agent_labels: Acting agent's estimate of counterpart deception [N]
         alpha: Ridge regularization
 
     Returns:
         Dict with comparison metrics and significance
     """
     # Train probes on each label type
-    _, gm_result = train_ridge_probe(X, gm_labels, alpha=alpha)
-    _, agent_result = train_ridge_probe(X, agent_labels, alpha=alpha)
+    _, gm_result = train_ridge_probe(
+        X, gm_labels, alpha=alpha, groups=groups
+    )
+    _, agent_result = train_ridge_probe(
+        X, agent_labels, alpha=alpha, groups=groups
+    )
 
     # Also train mass-mean probes
-    _, gm_mm_result = train_mass_mean_probe(X, gm_labels)
-    _, agent_mm_result = train_mass_mean_probe(X, agent_labels)
+    _, gm_mm_result = train_mass_mean_probe(X, gm_labels, groups=groups)
+    _, agent_mm_result = train_mass_mean_probe(
+        X, agent_labels, groups=groups
+    )
 
     # Compute gap
     auc_gap = gm_result.auc - agent_result.auc
@@ -1422,13 +1557,13 @@ def analyze_implicit_encoding(
 
     # Interpretation
     if auc_gap > 0.10:
-        interpretation = "STRONG implicit encoding - GM >> Agent (agent hides deception internally)"
+        interpretation = "STRONG label-source divergence - actual behavior is more decodable"
     elif auc_gap > 0.05:
-        interpretation = "MODERATE implicit encoding - GM > Agent"
+        interpretation = "MODERATE label-source divergence - actual behavior is more decodable"
     elif auc_gap > -0.05:
-        interpretation = "SIMILAR encoding - GM ≈ Agent (agent is self-aware)"
+        interpretation = "SIMILAR decodability across actual and counterpart-perception labels"
     else:
-        interpretation = "Agent labels MORE predictable - unusual pattern"
+        interpretation = "Counterpart-perception labels are more decodable"
 
     return {
         "gm_auc": float(gm_result.auc),
@@ -1440,6 +1575,8 @@ def analyze_implicit_encoding(
         "auc_gap": float(auc_gap),
         "r2_gap": float(r2_gap),
         "gm_wins": bool(auc_gap > 0),
+        "supports_self_awareness_claim": False,
+        "agent_label_semantics": "perceived counterpart deception, not self-report",
         "interpretation": interpretation,
     }
 
@@ -1449,6 +1586,7 @@ def analyze_round_trajectory(
     y: np.ndarray,
     round_nums: List[int],
     alpha: float = 100.0,
+    groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """RQ-MA1: Analyze how deception encoding changes over negotiation rounds.
 
@@ -1465,6 +1603,10 @@ def analyze_round_trajectory(
         Dict with per-round metrics and trajectory analysis
     """
     round_nums = np.array(round_nums)
+    if len(round_nums) != len(y):
+        raise ValueError("round_nums must have one value per sample")
+    if groups is not None and len(groups) != len(y):
+        raise ValueError("groups must have one value per sample")
     unique_rounds = sorted(set(round_nums))
 
     if len(unique_rounds) < 3:
@@ -1496,7 +1638,10 @@ def analyze_round_trajectory(
             }
             continue
 
-        _, result = train_ridge_probe(X_r, y_r, alpha=alpha)
+        round_groups = np.asarray(groups)[mask] if groups is not None else None
+        _, result = train_ridge_probe(
+            X_r, y_r, alpha=alpha, groups=round_groups
+        )
         per_round_results[r_key] = {
             "auc": float(result.auc),
             "r2": float(result.r2_score),
@@ -1557,9 +1702,24 @@ def analyze_dyadic_pairs(
     Returns:
         Dict with dyadic analysis metrics
     """
-    counterpart_idxs = np.array(counterpart_idxs)
     n_samples = len(y)
+    if len(X) != n_samples:
+        raise ValueError("X and y must contain the same number of samples")
+    if len(counterpart_idxs) != n_samples:
+        raise ValueError("counterpart_idxs must have one value per sample")
 
+    def coerce_index(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            if np.isnan(value):
+                return None
+        except TypeError:
+            pass
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
     # Identify valid pairs (both agents have samples). Deduplicate reciprocal
     # links: if sample i has counterpart j and sample j has counterpart i, the
     # pair is the same dyad and must only be counted once, otherwise downstream
@@ -1567,17 +1727,19 @@ def analyze_dyadic_pairs(
     valid_pairs = []
     seen_pairs = set()
     for i in range(n_samples):
-        cp_idx = counterpart_idxs[i]
-        if cp_idx is None or (hasattr(cp_idx, 'item') and np.isnan(cp_idx)):
+        cp_idx = coerce_index(counterpart_idxs[i])
+        if cp_idx is None:
             continue
-        if hasattr(cp_idx, 'item'):
-            cp_idx = int(cp_idx)
         if 0 <= cp_idx < n_samples and cp_idx != i:
+            if coerce_index(counterpart_idxs[cp_idx]) != i:
+                continue
             pair_key = (min(i, cp_idx), max(i, cp_idx))
             if pair_key in seen_pairs:
                 continue
+            if np.isclose(y[i], y[cp_idx]):
+                continue
             seen_pairs.add(pair_key)
-            valid_pairs.append((i, cp_idx))
+            valid_pairs.append(pair_key)
 
     if len(valid_pairs) < 10:
         return {
@@ -1694,13 +1856,15 @@ def _train_probe_grouped(
 
     Returns (auc, r2). Either may be None if the split is degenerate.
     """
-    from sklearn.model_selection import GroupShuffleSplit
-
     if len(np.unique(groups)) < 2:
         return None, None
 
-    gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=random_state)
-    train_idx, test_idx = next(gss.split(X, y, groups=groups))
+    try:
+        train_idx, test_idx = _train_test_indices(
+            X, y, random_state=random_state, groups=groups
+        )
+    except ValueError:
+        return None, None
 
     X_train, X_test = X[train_idx], X[test_idx]
     y_train, y_test = y[train_idx], y[test_idx]
@@ -1729,7 +1893,7 @@ def _train_probe_grouped(
             auc = float(roc_auc_score(binary_test, y_pred))
         except ValueError:
             auc = None
-    r2 = float(r2_score(y_test, y_pred))
+    r2 = float(r2_score(y_test, y_pred)) if len(y_test) >= 2 else None
     return auc, r2
 
 
@@ -1757,18 +1921,47 @@ def analyze_outcome_prediction(
     Returns:
         Dict with outcome prediction metrics
     """
+    if not (
+        len(X) == len(y) == len(round_nums) == len(trial_ids) == len(trial_outcomes)
+    ):
+        raise ValueError(
+            "X, y, round_nums, trial_ids, and trial_outcomes must be sample-aligned"
+        )
+
     round_nums = np.array(round_nums)
     trial_ids_arr = np.array([str(t) for t in trial_ids])
-    # Convert string outcomes to numeric (1=success, 0=failure)
-    SUCCESS_OUTCOMES = {"agreement", "deal", "success", "accepted", "true", "True"}
-    trial_outcomes_raw = trial_outcomes
+    success_outcomes = {"agreement", "deal", "success", "accepted", "true", "1"}
+    failure_outcomes = {
+        "no_agreement", "no deal", "no_deal", "failure", "failed",
+        "rejected", "false", "0",
+    }
+
+    def normalize_outcome(value: Any) -> Optional[float]:
+        if isinstance(value, (bool, np.bool_)):
+            return float(value)
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            if np.isnan(value):
+                return None
+            if value in (0, 1):
+                return float(value)
+            return None
+        normalized = str(value).strip().lower()
+        if normalized in success_outcomes:
+            return 1.0
+        if normalized in failure_outcomes:
+            return 0.0
+        return None
+
+    normalized_outcomes = [normalize_outcome(value) for value in trial_outcomes]
+    known_outcome_mask = np.array(
+        [value is not None for value in normalized_outcomes], dtype=bool
+    )
     trial_outcomes = np.array([
-        1.0 if (str(o) in SUCCESS_OUTCOMES or o is True or o == 1) else 0.0
-        for o in trial_outcomes_raw
+        value if value is not None else np.nan for value in normalized_outcomes
     ])
 
     # Filter to early rounds (1-2)
-    early_mask = round_nums <= 2
+    early_mask = (round_nums >= 0) & (round_nums <= 2) & known_outcome_mask
     n_early = early_mask.sum()
 
     if n_early < 20:
@@ -1798,7 +1991,12 @@ def analyze_outcome_prediction(
     )
 
     # Also try late rounds for comparison
-    late_mask = round_nums >= max(round_nums) - 1
+    valid_round_nums = round_nums[known_outcome_mask & (round_nums >= 0)]
+    late_mask = (
+        known_outcome_mask
+        & (round_nums >= 0)
+        & (round_nums >= valid_round_nums.max() - 1)
+    ) if len(valid_round_nums) else np.zeros(len(round_nums), dtype=bool)
     n_late = late_mask.sum()
     trials_late = trial_ids_arr[late_mask] if n_late else np.array([])
     if (
@@ -1834,6 +2032,76 @@ def analyze_outcome_prediction(
 # MAIN ANALYSIS
 # =============================================================================
 
+def _sample_keep_mask(
+    metadata: List[Dict[str, Any]],
+    n_samples: int,
+) -> Tuple[np.ndarray, Dict[str, int]]:
+    """Build the negotiation/QC mask for an aligned serialized dataset."""
+    if metadata and len(metadata) != n_samples:
+        raise ValueError(
+            f"metadata has {len(metadata)} rows, expected {n_samples}"
+        )
+    if not metadata:
+        return np.ones(n_samples, dtype=bool), {
+            "probe_rounds": 0,
+            "qc_failures": 0,
+        }
+
+    keep = np.ones(n_samples, dtype=bool)
+    probe_rounds = 0
+    qc_failures = 0
+    for i, row in enumerate(metadata):
+        sample_type = row.get('sample_type')
+        round_num = row.get('round_num')
+        is_negotiation = (
+            sample_type == 'negotiation'
+            if sample_type is not None
+            else round_num is None or round_num >= 0
+        )
+        if not is_negotiation:
+            keep[i] = False
+            probe_rounds += 1
+            continue
+
+        flags = row.get('qc_flags')
+        if flags is None and row.get('full_response') is not None:
+            from interpretability.core.qc_filter import classify_response
+            flags = classify_response(row['full_response'])
+        if flags:
+            keep[i] = False
+            qc_failures += 1
+
+    return keep, {
+        "probe_rounds": probe_rounds,
+        "qc_failures": qc_failures,
+    }
+
+
+def _remap_counterpart_indices(
+    counterpart_idxs: List[Optional[int]],
+    keep_mask: np.ndarray,
+) -> List[Optional[int]]:
+    """Filter counterpart links and remap surviving old indices."""
+    if len(counterpart_idxs) != len(keep_mask):
+        raise ValueError("counterpart_idxs must align with keep_mask")
+    old_to_new = {
+        old_idx: new_idx
+        for new_idx, old_idx in enumerate(np.flatnonzero(keep_mask))
+    }
+    remapped = []
+    for old_idx in np.flatnonzero(keep_mask):
+        counterpart_idx = counterpart_idxs[old_idx]
+        if counterpart_idx is None:
+            remapped.append(None)
+            continue
+        try:
+            counterpart_idx = int(counterpart_idx)
+        except (TypeError, ValueError, OverflowError):
+            remapped.append(None)
+            continue
+        remapped.append(old_to_new.get(counterpart_idx))
+    return remapped
+
 def run_full_analysis(data_path: str) -> Dict[str, Any]:
     """Run complete probe training and analysis."""
 
@@ -1859,54 +2127,71 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     print(f"Loaded {len(gm_labels)} samples")
     print(f"Layers available: {list(activations.keys())}")
 
-    # === 2026-04-21 audit fix: filter out pre_verification and post_plausibility probes ===
-    # These single-shot probe turns were being mixed into probe-training data.
-    # Filter here using sample_type (new field) with a fallback to round_num for
-    # legacy .pt files that pre-date the field.
-    round_nums_meta = [m.get('round_num') for m in metadata] if metadata else None
-    sample_types = [m.get('sample_type') for m in metadata] if metadata else None
-
-    def _is_negotiation(i: int) -> bool:
-        if sample_types and sample_types[i] is not None:
-            return sample_types[i] == 'negotiation'
-        if round_nums_meta and round_nums_meta[i] is not None:
-            return round_nums_meta[i] >= 0
-        return True  # unknown; keep
-
     n_total = len(gm_labels)
-    keep_mask = np.array([_is_negotiation(i) for i in range(n_total)], dtype=bool)
-    n_probe = int((~keep_mask).sum())
-    if n_probe > 0:
-        print(f"  Filtering out {n_probe} probe-round samples "
-              f"(pre_verification + post_plausibility) — {100*n_probe/n_total:.1f}% of data")
-        # Apply filter to every aligned array
+    for key in ('agent_labels', 'scenario'):
+        if len(labels[key]) != n_total:
+            raise ValueError(
+                f"Label array '{key}' has {len(labels[key])} rows, expected {n_total}"
+            )
+    for layer_key, tensor in activations.items():
+        if tensor.shape[0] != n_total:
+            raise ValueError(
+                f"Activation layer {layer_key} has {tensor.shape[0]} rows, "
+                f"expected {n_total}"
+            )
+    for key, values in labels.items():
+        if values is not None and hasattr(values, '__len__') and len(values) != n_total:
+            raise ValueError(
+                f"Label array '{key}' has {len(values)} rows, expected {n_total}"
+            )
+
+    keep_mask, filter_counts = _sample_keep_mask(metadata, n_total)
+    n_dropped = int((~keep_mask).sum())
+    original_counterparts = labels.get('counterpart_idxs')
+    if n_dropped > 0:
+        print(
+            f"  Filtering out {filter_counts['probe_rounds']} probe-round and "
+            f"{filter_counts['qc_failures']} failed-QC samples"
+        )
+        keep_indices = np.flatnonzero(keep_mask).tolist()
         for layer_key in list(activations.keys()):
-            activations[layer_key] = activations[layer_key][keep_mask]
+            activations[layer_key] = activations[layer_key][keep_indices]
         gm_labels = gm_labels[keep_mask]
         agent_labels = agent_labels[keep_mask]
         scenarios = [s for s, k in zip(scenarios, keep_mask) if k]
         if metadata:
             metadata = [m for m, k in zip(metadata, keep_mask) if k]
-        # Re-bind labels dict (used by downstream analyses that pull from it).
-        # The save_dataset writer uses plural key names: round_nums, trial_ids,
-        # counterpart_idxs, trial_outcomes, pod_ids, mode_labels. Filter every
-        # aligned array so cross-mode and dyadic analyses do not crash with a
-        # shape mismatch.
-        labels['gm_labels'] = gm_labels.tolist() if hasattr(gm_labels, 'tolist') else gm_labels
-        labels['agent_labels'] = agent_labels.tolist() if hasattr(agent_labels, 'tolist') else agent_labels
-        labels['scenario'] = scenarios
-        for key in ('mode_labels', 'round_nums', 'trial_ids',
-                    'counterpart_idxs', 'trial_outcomes', 'pod_ids',
-                    # Older/alternate singular names kept for safety.
-                    'round_num', 'trial_id', 'counterpart_idx',
-                    'trial_outcome', 'experiment_mode'):
-            if key in labels:
-                arr = labels[key]
-                if arr is None:
-                    continue
-                if hasattr(arr, '__len__') and len(arr) == n_total:
-                    labels[key] = [v for v, k in zip(arr, keep_mask) if k]
+        for key, values in list(labels.items()):
+            if values is not None and hasattr(values, '__len__'):
+                labels[key] = [v for v, k in zip(values, keep_mask) if k]
+        if original_counterparts is not None:
+            labels['counterpart_idxs'] = _remap_counterpart_indices(
+                original_counterparts, keep_mask
+            )
         print(f"  Remaining: {len(gm_labels)} negotiation samples")
+
+    if len(gm_labels) == 0:
+        raise ValueError("No negotiation samples remain after sample-type/QC filtering")
+
+    labels['gm_labels'] = gm_labels.tolist()
+    labels['agent_labels'] = agent_labels.tolist()
+    labels['scenario'] = scenarios
+
+    trial_ids_for_split = labels.get('trial_ids', [])
+    pod_ids_for_split = labels.get('pod_ids', [])
+    analysis_groups = None
+    split_unit = "row (legacy dataset without trial_ids)"
+    if len(trial_ids_for_split) == len(gm_labels):
+        if len(pod_ids_for_split) == len(gm_labels):
+            analysis_groups = np.array([
+                f"{pod}:{trial}" for pod, trial in zip(
+                    pod_ids_for_split, trial_ids_for_split
+                )
+            ])
+            split_unit = "pod_id+trial_id"
+        else:
+            analysis_groups = np.asarray(trial_ids_for_split).astype(str)
+            split_unit = "trial_id"
 
     results = {
         "sanity_checks": {},
@@ -1915,6 +2200,8 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         "generalization": {},
         "deception_rates": {},
         "best_probe": None,
+        "filtering": filter_counts,
+        "split_unit": split_unit,
     }
 
     # Deception rates
@@ -1929,7 +2216,17 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print(f"  {scenario}: {rate*100:.1f}%")
 
     # Choose primary layer (mid-layer)
-    layers = sorted(activations.keys())
+    layers = sorted(
+        [key for key in activations if str(key).isdigit()],
+        key=lambda key: int(key),
+    )
+    if not layers:
+        raise ValueError("Dataset has no last-token numeric activation layers")
+    non_primary_layers = [key for key in activations if key not in layers]
+    if non_primary_layers:
+        results['supplemental_activation_keys'] = [
+            str(key) for key in non_primary_layers
+        ]
     mid_layer = layers[len(layers) // 2]
     X_mid = activations[mid_layer].float().numpy()
 
@@ -1953,7 +2250,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
 
     # Check 2: Random labels
     print("\n2. Random Labels Check")
-    random_check = sanity_check_random_labels(X_mid, gm_labels)
+    random_check = sanity_check_random_labels(
+        X_mid, gm_labels, groups=analysis_groups
+    )
     results["sanity_checks"]["random_labels"] = random_check
     status = "PASSED" if random_check["passed"] else "FAILED"
     print(f"   Shuffled R²: {random_check['mean_shuffled_r2']:.3f} +/- {random_check['std_shuffled_r2']:.3f}")
@@ -1961,7 +2260,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
 
     # Check 3: Train-test gap
     print("\n3. Train-Test Gap Check")
-    gap_check = sanity_check_train_test_gap(X_mid, gm_labels)
+    gap_check = sanity_check_train_test_gap(
+        X_mid, gm_labels, groups=analysis_groups
+    )
     results["sanity_checks"]["train_test_gap"] = gap_check
     status = "PASSED" if gap_check["passed"] else "FAILED"
     print(f"   Train R²: {gap_check['train_r2']:.3f}, Test R²: {gap_check['test_r2']:.3f}, Gap: {gap_check['gap']:.3f}")
@@ -1982,12 +2283,16 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         X = activations[layer].float().numpy()
 
         # Train probe on GM labels
-        _, gm_result = train_ridge_probe(X, gm_labels)
+        _, gm_result = train_ridge_probe(
+            X, gm_labels, groups=analysis_groups
+        )
         gm_result.layer = layer
         gm_result.label_type = "gm"
 
         # Train probe on agent labels
-        _, agent_result = train_ridge_probe(X, agent_labels)
+        _, agent_result = train_ridge_probe(
+            X, agent_labels, groups=analysis_groups
+        )
         agent_result.layer = layer
         agent_result.label_type = "agent"
 
@@ -2027,18 +2332,24 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     print(f"{'='*60}")
     print("This compares probe performance on:")
     print("  GM labels:    Ground truth - is agent ACTUALLY deceiving?")
-    print("  Agent labels: Self-report - does agent THINK it's deceiving?")
+    print("  Agent labels: acting agent's estimate of COUNTERPART deception")
     print("-" * 60)
-    print("If GM >> Agent: Model encodes deception it doesn't acknowledge")
+    print("This comparison does not measure self-report or self-awareness.")
     print("-" * 60)
 
     X_best = activations[best_layer].float().numpy()
 
-    _, gm_result = train_ridge_probe(X_best, gm_labels)
-    _, agent_result = train_ridge_probe(X_best, agent_labels)
+    _, gm_result = train_ridge_probe(
+        X_best, gm_labels, groups=analysis_groups
+    )
+    _, agent_result = train_ridge_probe(
+        X_best, agent_labels, groups=analysis_groups
+    )
 
     # Mass-mean probe
-    _, gm_mm_result = train_mass_mean_probe(X_best, gm_labels)
+    _, gm_mm_result = train_mass_mean_probe(
+        X_best, gm_labels, groups=analysis_groups
+    )
 
     results["gm_vs_agent"] = {
         "gm_ridge_r2": float(gm_result.r2_score),
@@ -2048,6 +2359,8 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         "agent_auc": float(agent_result.auc),
         "gm_mass_mean_auc": float(gm_mm_result.auc),
         "gm_wins": bool(gm_result.r2_score > agent_result.r2_score),
+        "agent_label_semantics": "perceived counterpart deception, not self-report",
+        "supports_self_awareness_claim": False,
     }
 
     print(f"\nGM (Ground Truth) - What the agent IS doing:")
@@ -2056,16 +2369,14 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     print(f"  Mass-Mean R²: {gm_mm_result.r2_score:.3f}")
     print(f"  Mass-Mean AUC:{gm_mm_result.auc:.3f}")
 
-    print(f"\nAgent (Self-Report) - What the agent THINKS:")
+    print(f"\nAgent ToM - perceived COUNTERPART deception:")
     print(f"  Ridge R²:     {agent_result.r2_score:.3f}")
     print(f"  Ridge AUC:    {agent_result.auc:.3f}")
 
     if results["gm_vs_agent"]["gm_wins"]:
-        print(f"\n>> FINDING: GM labels more predictable than agent self-report!")
-        print(f"   Implication: Model encodes deception it doesn't 'acknowledge'.")
+        print(f"\n>> Actual-deception labels are more predictable than counterpart-belief labels.")
     else:
-        print(f"\n>> Agent labels equally/more predictable than GM.")
-        print(f"   Implication: Model is self-aware about its deception.")
+        print(f"\n>> Counterpart-belief labels are equally or more predictable.")
 
     # ==========================================================================
     # GENERALIZATION WITH AUC
@@ -2119,7 +2430,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print("  Transfer AUC >0.65: SAME representation")
         print("-" * 60)
 
-        cross_mode_results = compute_cross_mode_transfer(X_best, gm_labels, mode_labels)
+        cross_mode_results = compute_cross_mode_transfer(
+            X_best, gm_labels, mode_labels, groups=analysis_groups
+        )
         results["cross_mode_transfer"] = cross_mode_results
 
         if "error" not in cross_mode_results:
@@ -2151,24 +2464,24 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     # RQ2: IMPLICIT ENCODING ANALYSIS
     # ==========================================================================
     print(f"\n{'='*60}")
-    print("RQ2: IMPLICIT ENCODING ANALYSIS")
+    print("RQ2: LABEL-SOURCE REPRESENTATION ANALYSIS")
     print(f"{'='*60}")
-    print("Question: Does the model encode deception it doesn't explicitly")
-    print("          acknowledge? (Requires ToM for agent self-report)")
+    print("Question: How does decodability differ between acting-agent")
+    print("          behavior and its ToM estimate of the counterpart?")
     print("-" * 60)
     print("Interpretation Guide:")
-    print("  GM AUC >> Agent AUC: Model 'knows' it's deceiving but won't say")
-    print("  GM AUC ≈ Agent AUC: Model is self-aware about deception")
-    print("  Gap > 0.10: STRONG implicit encoding")
-    print("  Gap > 0.05: MODERATE implicit encoding")
+    print("  These are different targets; an AUC gap is label-source divergence.")
+    print("  It is not evidence of hidden self-knowledge or self-awareness.")
     print("-" * 60)
 
-    implicit_results = analyze_implicit_encoding(X_best, gm_labels, agent_labels)
+    implicit_results = analyze_implicit_encoding(
+        X_best, gm_labels, agent_labels, groups=analysis_groups
+    )
     results["implicit_encoding"] = implicit_results
 
     print(f"\n*** KEY RESULT: GM vs Agent Predictability ***")
     print(f"  GM (Ground Truth) AUC:    {implicit_results['gm_auc']:.3f}")
-    print(f"  Agent (Self-Report) AUC:  {implicit_results['agent_auc']:.3f}")
+    print(f"  Counterpart-belief AUC:   {implicit_results['agent_auc']:.3f}")
     print(f"  AUC Gap (GM - Agent):     {implicit_results['auc_gap']:.3f}")
     print(f"\n>> ANSWER: {implicit_results['interpretation']}")
 
@@ -2194,7 +2507,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         activations_np = {k: v.float().numpy() if hasattr(v, 'float') else v
                         for k, v in activations.items()}
 
-        trajectory_results = analyze_round_trajectory(activations_np, gm_labels, round_nums)
+        trajectory_results = analyze_round_trajectory(
+            activations_np, gm_labels, round_nums, groups=analysis_groups
+        )
         results["temporal_trajectory"] = trajectory_results
 
         if "error" not in trajectory_results:
@@ -2221,7 +2536,16 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     # RQ-MA2: DYADIC PAIR ANALYSIS
     # ==========================================================================
     counterpart_idxs = labels.get("counterpart_idxs", [])
-    if counterpart_idxs and any(idx is not None and idx >= 0 for idx in counterpart_idxs):
+    def has_valid_counterpart_index(values: List[Any]) -> bool:
+        for value in values:
+            try:
+                if value is not None and not np.isnan(value) and int(value) >= 0:
+                    return True
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return False
+
+    if counterpart_idxs and has_valid_counterpart_index(counterpart_idxs):
         print(f"\n{'='*60}")
         print("RQ-MA2: DYADIC PAIR ANALYSIS")
         print(f"{'='*60}")
@@ -2272,8 +2596,13 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print("  Links internal representations to behavioral outcomes")
         print("-" * 60)
 
+        outcome_group_ids = (
+            analysis_groups.tolist()
+            if analysis_groups is not None
+            else trial_ids
+        )
         outcome_results = analyze_outcome_prediction(
-            X_best, gm_labels, round_nums, trial_ids, trial_outcomes
+            X_best, gm_labels, round_nums, outcome_group_ids, trial_outcomes
         )
         results["outcome_prediction"] = outcome_results
 
@@ -2325,24 +2654,28 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         xm = results["cross_mode_transfer"]
         print(f"\nRQ1: Instructed vs Emergent Deception")
         print(f"  Q: Are they structurally different?")
-        print(f"  Transfer AUC: {xm['transfer_auc']:.3f}", end="")
-        if xm['transfer_auc'] < 0.55:
+        transfer_values = [
+            value for value in (
+                xm.get('forward_transfer_auc'),
+                xm.get('reverse_transfer_auc'),
+            ) if value is not None
+        ]
+        transfer_auc = float(np.mean(transfer_values)) if transfer_values else 0.5
+        print(f"  Mean bidirectional transfer AUC: {transfer_auc:.3f}", end="")
+        if transfer_auc < 0.55:
             print(" → DIFFERENT circuits (NOVEL)")
-        elif xm['transfer_auc'] > 0.65:
+        elif transfer_auc > 0.65:
             print(" → SAME representation")
         else:
             print(" → PARTIAL overlap")
 
-    # RQ2: Implicit encoding
+    # RQ2: Actual behavior vs counterpart-perception labels
     if "implicit_encoding" in results:
         ie = results["implicit_encoding"]
-        print(f"\nRQ2: Implicit Encoding")
-        print(f"  Q: Does model encode deception it doesn't acknowledge?")
-        print(f"  GM AUC: {ie['gm_auc']:.3f}, Agent AUC: {ie['agent_auc']:.3f}, Gap: {ie['auc_gap']:.3f}")
-        if ie['auc_gap'] > 0.05:
-            print(f"  → YES: Model 'knows' but doesn't 'say'")
-        else:
-            print(f"  → Model is self-aware")
+        print(f"\nRQ2: Label-Source Representation")
+        print("  Q: How do actual behavior and counterpart-perception decodability differ?")
+        print(f"  GM AUC: {ie['gm_auc']:.3f}, Counterpart-belief AUC: {ie['agent_auc']:.3f}, Gap: {ie['auc_gap']:.3f}")
+        print(f"  → {ie['interpretation']}")
 
     # RQ-MA1: Temporal trajectory
     if "temporal_trajectory" in results and not results["temporal_trajectory"].get("skipped"):
@@ -2473,7 +2806,7 @@ def plot_results(results: Dict, output_path: str = None):
         scenarios = sorted(rates.keys(), key=lambda x: rates[x])
         values = [rates[s] * 100 for s in scenarios]
 
-        colors = plt.cm.RdYlGn_r(np.linspace(0.2, 0.8, len(scenarios)))
+        colors = plt.get_cmap("RdYlGn_r")(np.linspace(0.2, 0.8, len(scenarios)))
         bars = ax4.barh(scenarios, values, color=colors)
 
         ax4.set_xlabel('Deception Rate (%)')

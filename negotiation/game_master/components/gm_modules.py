@@ -18,7 +18,7 @@ import abc
 import dataclasses
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from concordia_mini.typing import entity_component
+from concordia.typing import entity_component
 
 
 @dataclasses.dataclass
@@ -129,23 +129,36 @@ class NegotiationGMModule(entity_component.ContextComponent):
     """Set value in module state."""
     self._module_state[key] = value
 
+  def _get_base_state(self) -> Dict[str, Any]:
+    """Return lifecycle state shared by every negotiation GM module."""
+    return {
+        'enabled': self._enabled,
+        'module_state': dict(self._module_state),
+    }
+
+  def _set_base_state(self, state: Dict[str, Any]) -> None:
+    """Restore lifecycle state shared by every negotiation GM module."""
+    base = state.get('base', {})
+    self._enabled = bool(base.get('enabled', self._enabled))
+    self._module_state = dict(base.get('module_state', {}))
+
   def pre_act(self, action_spec) -> str:
     """Provide module context before action."""
     if not self._enabled:
       return ""
     return self.get_module_report()
 
-  def post_act(self, action_attempt: str) -> None:
+  def post_act(self, action_attempt: str) -> str:
     """Process module updates after action."""
-    pass
+    return ""
 
-  def pre_observe(self, observation: str) -> None:
+  def pre_observe(self, observation: str) -> str:
     """Process observations."""
-    pass
+    return ""
 
-  def post_observe(self) -> None:
+  def post_observe(self) -> str:
     """Post-observation processing."""
-    pass
+    return ""
 
   def update(self) -> None:
     """Update internal state."""
@@ -254,4 +267,4 @@ def suggest_gm_modules(agent_modules: Dict[str, Set[str]]) -> List[str]:
       if module in module_mapping:
         suggested.add(module_mapping[module])
 
-  return list(suggested)
+  return sorted(suggested)

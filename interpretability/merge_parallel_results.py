@@ -66,16 +66,22 @@ def merge_parallel_activations(
     all_metadata: List[Dict] = []
     all_sae_features: List[torch.Tensor] = []
     all_sae_top_features: List[List] = []
+    all_sae_available_mask: List[bool] = []
 
     # Track sample offsets for counterpart index remapping
     sample_offset = 0
-    counterpart_remap: Dict[tuple, int] = {}  # (pod_id, local_idx) -> global_idx
+    counterpart_remap: Dict[tuple, int] = {}  # (source_idx, local_idx) -> global_idx
 
     # Collect pod info for validation
     pod_infos = []
     total_samples = 0
+    source_indices: List[int] = []
+    expected_label_keys = None
+    expected_layer_keys = None
+    metadata_presence = None
+    sae_presence = None
 
-    for pod_file in pod_files:
+    for source_idx, pod_file in enumerate(pod_files):
         if verbose:
             print(f"\nLoading: {pod_file}")
 
@@ -93,6 +99,53 @@ def merge_parallel_activations(
         n_samples = len(data['labels']['gm_labels'])
         pod_id = pod_info.get('pod_id', 0)
 
+        label_keys = set(data['labels'])
+        layer_keys = set(data['activations'])
+        has_metadata = 'metadata' in data
+        has_sae = data.get('sae_features') is not None
+        if expected_label_keys is None:
+            expected_label_keys = label_keys
+            expected_layer_keys = layer_keys
+            metadata_presence = has_metadata
+            sae_presence = has_sae
+        if label_keys != expected_label_keys:
+            raise ValueError(
+                f"Label keys differ in {pod_file}: {sorted(label_keys)} != "
+                f"{sorted(expected_label_keys)}"
+            )
+        if layer_keys != expected_layer_keys:
+            raise ValueError(
+                f"Activation layers differ in {pod_file}: {sorted(layer_keys, key=str)} != "
+                f"{sorted(expected_layer_keys, key=str)}"
+            )
+        if has_metadata != metadata_presence:
+            raise ValueError("All pod files must consistently include metadata")
+        if has_sae != sae_presence:
+            raise ValueError("All pod files must consistently include SAE features")
+
+        for key, values in data['labels'].items():
+            if len(values) != n_samples:
+                raise ValueError(
+                    f"{pod_file}: label '{key}' has {len(values)} rows, "
+                    f"expected {n_samples}"
+                )
+        for layer, tensor in data['activations'].items():
+            if tensor.shape[0] != n_samples:
+                raise ValueError(
+                    f"{pod_file}: layer {layer} has {tensor.shape[0]} rows, "
+                    f"expected {n_samples}"
+                )
+        if has_metadata and len(data['metadata']) != n_samples:
+            raise ValueError(
+                f"{pod_file}: metadata has {len(data['metadata'])} rows, "
+                f"expected {n_samples}"
+            )
+        if has_sae and data['sae_features'].shape[0] != n_samples:
+            raise ValueError(
+                f"{pod_file}: SAE features have {data['sae_features'].shape[0]} "
+                f"rows, expected {n_samples}"
+            )
+
         if verbose:
             print(f"  Pod ID: {pod_id}")
             print(f"  Samples: {n_samples}")
@@ -102,7 +155,8 @@ def merge_parallel_activations(
         # Maps (pod_id, local_sample_idx) -> global_sample_idx
         for local_idx in range(n_samples):
             global_idx = sample_offset + local_idx
-            counterpart_remap[(pod_id, local_idx)] = global_idx
+            counterpart_remap[(source_idx, local_idx)] = global_idx
+        source_indices.extend([source_idx] * n_samples)
 
         # Merge activations (concatenate along sample dimension)
         for layer, tensor in data['activations'].items():
@@ -114,6 +168,12 @@ def merge_parallel_activations(
                 all_labels[key].extend(values)
             elif isinstance(values, np.ndarray):
                 all_labels[key].extend(values.tolist())
+            elif hasattr(values, 'tolist'):
+                all_labels[key].extend(values.tolist())
+            else:
+                raise TypeError(
+                    f"Unsupported label container for '{key}': {type(values).__name__}"
+                )
 
         # Merge metadata
         if 'metadata' in data:
@@ -123,7 +183,20 @@ def merge_parallel_activations(
         if 'sae_features' in data and data['sae_features'] is not None:
             all_sae_features.append(data['sae_features'])
         if 'sae_top_features' in data and data['sae_top_features'] is not None:
+            if len(data['sae_top_features']) != n_samples:
+                raise ValueError(
+                    f"{pod_file}: sae_top_features has "
+                    f"{len(data['sae_top_features'])} rows, expected {n_samples}"
+                )
             all_sae_top_features.extend(data['sae_top_features'])
+        if has_sae:
+            available_mask = data.get('sae_available_mask', [True] * n_samples)
+            if len(available_mask) != n_samples:
+                raise ValueError(
+                    f"{pod_file}: sae_available_mask has {len(available_mask)} "
+                    f"rows, expected {n_samples}"
+                )
+            all_sae_available_mask.extend(bool(v) for v in available_mask)
 
         # Update offset for next pod
         sample_offset += n_samples
@@ -140,17 +213,17 @@ def merge_parallel_activations(
             print(f"  Layer {layer}: {merged_activations[layer].shape}")
 
     # Remap counterpart_idxs to global indices
-    if 'counterpart_idxs' in all_labels and 'pod_ids' in all_labels:
-        pod_ids = all_labels['pod_ids']
+    if 'counterpart_idxs' in all_labels:
         original_idxs = all_labels['counterpart_idxs']
 
         remapped_idxs = []
-        for i, (pod_id, local_idx) in enumerate(zip(pod_ids, original_idxs)):
+        for source_idx, local_idx in zip(source_indices, original_idxs):
             if local_idx is None:
                 remapped_idxs.append(None)
             else:
-                # Look up global index for this (pod_id, local_idx) pair
-                global_idx = counterpart_remap.get((pod_id, local_idx))
+                # Namespace local indices by source file. Declared pod IDs are
+                # not guaranteed unique (legacy files often all used pod_id=0).
+                global_idx = counterpart_remap.get((source_idx, int(local_idx)))
                 if global_idx is not None:
                     remapped_idxs.append(global_idx)
                 else:
@@ -159,6 +232,9 @@ def merge_parallel_activations(
                     remapped_idxs.append(None)  # Can't link across pods
 
         all_labels['counterpart_idxs'] = remapped_idxs
+        if len(all_metadata) == total_samples:
+            for row, counterpart_idx in zip(all_metadata, remapped_idxs):
+                row['counterpart_idx'] = counterpart_idx
 
         # Count how many cross-pod references were lost
         n_lost = sum(1 for orig, new in zip(original_idxs, remapped_idxs)
@@ -202,8 +278,12 @@ def merge_parallel_activations(
     # Add merged SAE features if available
     if all_sae_features:
         try:
+            sae_dims = {tensor.shape[1:] for tensor in all_sae_features}
+            if len(sae_dims) != 1:
+                raise ValueError(f"SAE feature shapes differ: {sae_dims}")
             merged['sae_features'] = torch.cat(all_sae_features, dim=0)
             merged['sae_top_features'] = all_sae_top_features
+            merged['sae_available_mask'] = all_sae_available_mask
             if verbose:
                 print(f"  SAE features merged: {merged['sae_features'].shape}")
         except Exception as e:

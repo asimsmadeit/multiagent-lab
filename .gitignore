@@ -84,6 +84,11 @@ credentials.json
 # Markdown files (documentation generated locally)
 *.md
 **/*.md
+!AGENTS.md
+!README.md
+!examples/kaggle/README.md
+!implementation_plans/**/*.md
+!refactopring/**/*.md
 
 # Data files (too large for git)
 *.csv

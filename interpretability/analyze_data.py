@@ -187,7 +187,7 @@ def print_summary(data: Dict[str, Any], results: Dict[str, Any] = None):
             gva = results['gm_vs_agent']
             print(f"GM vs Agent - GM R²={gva.get('gm_ridge_r2', 0):.3f}, Agent R²={gva.get('agent_ridge_r2', 0):.3f}")
             if gva.get('gm_wins'):
-                print("  >> GM labels more predictable (implicit encoding detected)")
+                print("  >> Actual-deception labels are more predictable than counterpart-belief labels")
 
         if results.get('cross_mode_transfer'):
             cmt = results['cross_mode_transfer']

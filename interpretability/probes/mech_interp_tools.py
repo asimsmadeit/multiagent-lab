@@ -237,7 +237,13 @@ def extract_activations(
     if tokens.shape[1] > max_ctx:
         tokens = tokens[:, -max_ctx:]
     n_layers = model.cfg.n_layers
-    layers = layers or list(range(n_layers))
+    if layers is None:
+        layers = list(range(n_layers))
+    invalid_layers = [layer for layer in layers if layer < 0 or layer >= n_layers]
+    if invalid_layers:
+        raise ValueError(
+            f"Layer indices out of range for {n_layers}-layer model: {invalid_layers}"
+        )
 
     # Build filter for what to cache
     def name_filter(name: str) -> bool:
@@ -316,7 +322,7 @@ def load_gemma_scope_sae(
     from sae_lens import SAE
 
     release = f"gemma-scope-{model_size}-pt-{site}-canonical"
-    sae_id = f"layer_{layer}/width_{width}/canonical"
+    sae_id = f"layer_{layer}/width_{width}/{variant}"
 
     # New API returns just the SAE object
     sae = SAE.from_pretrained(
@@ -348,6 +354,9 @@ def extract_sae_features(
     Returns:
         SAEFeatures with feature activations
     """
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+
     # Handle different input shapes
     if activations.dim() == 1:
         activations = activations.unsqueeze(0).unsqueeze(0)
@@ -367,7 +376,9 @@ def extract_sae_features(
 
     # Get top features (last position, which is typically most relevant)
     last_pos_features = features[0, -1, :]
-    top_indices = torch.topk(last_pos_features, k=top_k).indices.tolist()
+    top_indices = torch.topk(
+        last_pos_features, k=min(top_k, last_pos_features.numel())
+    ).indices.tolist()
 
     # Build feature activation dict
     feature_acts = {
@@ -477,7 +488,10 @@ def extract_direction(
     if method == "difference":
         # Simple difference of means
         direction = X_positive.mean(axis=0) - X_negative.mean(axis=0)
-        direction = direction / np.linalg.norm(direction)
+        norm = np.linalg.norm(direction)
+        if norm < 1e-12:
+            raise ValueError("Cannot extract a direction from identical class means")
+        direction = direction / norm
         return direction
 
     elif method == "probe":
@@ -490,7 +504,10 @@ def extract_direction(
         probe.fit(X, y)
 
         direction = probe.coef_.flatten()
-        direction = direction / np.linalg.norm(direction)
+        norm = np.linalg.norm(direction)
+        if norm < 1e-12:
+            raise ValueError("Probe learned a zero-norm direction")
+        direction = direction / norm
         return direction
 
     else:
@@ -741,7 +758,7 @@ def visualize_probe_results(
 def run_full_analysis(
     model_name: str = "google/gemma-2-27b-it",
     text: str = "I promise to cooperate with you on this deal.",
-    layers_to_analyze: List[int] = [0, 23, 45],  # 27B model has 46 layers
+    layers_to_analyze: Optional[Tuple[int, ...]] = None,
     device: str = "cuda",
 ):
     """Run complete analysis pipeline on a text sample.
@@ -766,6 +783,12 @@ def run_full_analysis(
     )
     print(f"    ✓ Loaded {model.cfg.n_layers} layers, {model.cfg.d_model} dims")
 
+    sae_layer = min(31, model.cfg.n_layers - 1)
+    if layers_to_analyze is None:
+        layers_to_analyze = tuple(dict.fromkeys((
+            0, model.cfg.n_layers // 2, sae_layer, model.cfg.n_layers - 1,
+        )))
+
     # 2. Extract activations
     print(f"\n[2] Extracting activations for: '{text[:50]}...'")
     cache = extract_activations(model, text, layers=layers_to_analyze)
@@ -775,13 +798,15 @@ def run_full_analysis(
     # 3. Load SAE (layer 31 residual stream for 27B)
     print(f"\n[3] Loading Gemma Scope SAE")
     try:
-        sae, cfg = load_gemma_scope_sae(model_size="27b", layer=31, width="16k")
+        sae, cfg = load_gemma_scope_sae(
+            model_size="27b", layer=sae_layer, width="16k"
+        )
         print(f"    ✓ SAE loaded: {sae.cfg.d_sae} features")
 
         # 4. Get SAE features
         print(f"\n[4] Extracting SAE features")
-        layer_31_act = cache.residual_stream[31][0, -1, :]  # Last token
-        sae_features = extract_sae_features(sae, layer_31_act)
+        sae_activation = cache.residual_stream[sae_layer][0, -1, :]
+        sae_features = extract_sae_features(sae, sae_activation)
         print(f"    Sparsity: {sae_features.sparsity:.4f}")
         print(f"    Top features: {sae_features.top_features[:5]}")
 

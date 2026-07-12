@@ -38,7 +38,6 @@ Parallel Execution (3 pods):
 import argparse
 import json
 import os
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,9 +82,6 @@ def _sanitize_for_json(obj):
         return bool(obj)
     return obj
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent.parent))
-
 from interpretability import (
     # Core evaluation
     InterpretabilityRunner,
@@ -112,6 +108,7 @@ from interpretability import (
     activation_patching_test,
     ablation_test,
 )
+from interpretability.causal.causal_validation import filter_causal_samples
 
 
 def run_emergent_experiment(
@@ -666,12 +663,13 @@ def main():
         scenario_name=args.scenario_name,
         pod_id=pod_id,
     )
+    best_probe = probe_results.get("best_probe")
 
     # Causal validation (if enabled)
     causal_validated = False
     causal_results = None
 
-    if args.causal and probe_results.get("best_probe"):
+    if args.causal and isinstance(best_probe, dict):
         print(f"\n{'='*60}")
         print("CAUSAL VALIDATION")
         print(f"{'='*60}")
@@ -685,8 +683,16 @@ def main():
             k: v.float().numpy() if hasattr(v, 'numpy') else v
             for k, v in data["activations"].items()
         }
-        gm_labels = np.array(data["labels"]["gm_labels"])
-        best_layer = probe_results["best_probe"]["layer"]
+        label_data = data["labels"]
+        activations, gm_labels, sample_metadata, group_ids = filter_causal_samples(
+            activations,
+            label_data["gm_labels"],
+            data.get("metadata"),
+            round_nums=label_data.get("round_nums"),
+            trial_ids=label_data.get("trial_ids"),
+            pod_ids=label_data.get("pod_ids"),
+        )
+        best_layer = best_probe["layer"]
 
         # Generate test prompts for causal validation
         test_prompts = [
@@ -705,24 +711,28 @@ def main():
         # Run causal validation
         try:
             # Get the TransformerLens model from the runner
-            if hasattr(runner, 'tl_model') and runner.tl_model is not None:
-                tl_model = runner.tl_model
-            elif hasattr(runner.model, 'tl_model'):
-                tl_model = runner.model.tl_model
-            else:
+            tl_model = getattr(runner, 'tl_model', None)
+            if tl_model is None:
+                tl_model = getattr(runner.model, 'tl_model', None)
+            if tl_model is None:
                 print("Warning: Could not access TransformerLens model for causal validation")
-                tl_model = None
 
             if tl_model is not None:
                 # Pass metadata for matched cross-sample patching
-                sample_metadata = data.get("metadata", None)
+                sample_prompts = [
+                    row.get("full_prompt", "") for row in sample_metadata
+                ] if sample_metadata else []
+                if not all(sample_prompts):
+                    sample_prompts = None
                 causal_results = run_full_causal_validation(
                     model=tl_model,
                     activations=activations,
                     labels=gm_labels,
                     best_layer=best_layer,
                     test_prompts=test_prompts[:args.causal_samples],
+                    sample_prompts=sample_prompts,
                     metadata=sample_metadata,
+                    group_ids=group_ids,
                     verbose=True,
                 )
                 causal_validated = causal_results.get("overall_passed", False)
@@ -765,10 +775,10 @@ def main():
     print(f"Activations saved: {activations_path}")
     print(f"Output directory: {output_dir}")
 
-    if probe_results.get("best_probe"):
+    if isinstance(best_probe, dict):
         print(f"\nBest probe performance:")
-        print(f"  Layer: {probe_results['best_probe']['layer']}")
-        print(f"  R²: {probe_results['best_probe']['r2']:.3f}")
+        print(f"  Layer: {best_probe['layer']}")
+        print(f"  R²: {best_probe['r2']:.3f}")
 
     if probe_results.get("gm_vs_agent"):
         gm_vs_agent = probe_results["gm_vs_agent"]

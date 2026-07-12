@@ -1,9 +1,11 @@
 """Negotiation-specific instructions component."""
 
 import logging
-from typing import Optional
+import math
+from collections.abc import Mapping
+from typing import Any, Optional
 
-from concordia_mini.typing import entity_component
+from concordia.typing import entity_component
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,12 @@ class NegotiationInstructions(entity_component.ContextComponent):
             ethical_constraints: Optional ethical guidelines
             verbose: Whether to print debug information
         """
+        if negotiation_style not in {'cooperative', 'competitive', 'integrative'}:
+            raise ValueError(
+                'negotiation_style must be cooperative, competitive, or integrative.'
+            )
+        if not math.isfinite(reservation_value):
+            raise ValueError('reservation_value must be finite.')
         self._agent_name = agent_name
         self._goal = goal
         self._style = negotiation_style
@@ -199,13 +207,33 @@ class NegotiationInstructions(entity_component.ContextComponent):
         """Component name."""
         return 'NegotiationInstructions'
 
-    def get_state(self) -> str:
+    def get_state(self) -> dict[str, Any]:
         """Get the component state for saving/restoring."""
-        return f'{self._negotiation_phase}|{self._rounds_completed}'
+        return {
+            'negotiation_phase': self._negotiation_phase,
+            'rounds_completed': self._rounds_completed,
+            'last_offer_made': self._last_offer_made,
+            'last_offer_received': self._last_offer_received,
+        }
 
-    def set_state(self, state: str) -> None:
-        """Set the component state from a saved string."""
-        if '|' in state:
+    def set_state(self, state: Mapping[str, Any] | str) -> None:
+        """Set component state, accepting the legacy pipe format."""
+        if isinstance(state, str) and '|' in state:
             phase, rounds = state.split('|', 1)
             self._negotiation_phase = phase
             self._rounds_completed = int(rounds)
+            return
+        if not isinstance(state, Mapping):
+            raise TypeError('Instruction state must be a mapping or legacy string.')
+        self._negotiation_phase = str(
+            state.get('negotiation_phase', self._negotiation_phase)
+        )
+        self._rounds_completed = int(
+            state.get('rounds_completed', self._rounds_completed)
+        )
+        last_made = state.get('last_offer_made')
+        self._last_offer_made = str(last_made) if last_made is not None else None
+        last_received = state.get('last_offer_received')
+        self._last_offer_received = (
+            str(last_received) if last_received is not None else None
+        )

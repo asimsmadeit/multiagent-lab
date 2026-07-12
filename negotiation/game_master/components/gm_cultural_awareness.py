@@ -282,19 +282,38 @@ class CulturalAwarenessGM(gm_modules.NegotiationGMModule):
 
     return report
 
-  def get_state(self) -> str:
-    """Get the component state for saving/restoring."""
-    state_dict = {
-        'participants': len(self._participant_cultures),
-        'violations': len(self._violation_history),
-        'adaptations': sum(len(efforts) for efforts in self._adaptation_tracking.values()),
+  def get_state(self) -> Dict[str, Any]:
+    """Return complete cultural tracking state."""
+    return {
+        'base': self._get_base_state(),
+        'participant_cultures': dict(self._participant_cultures),
+        'cultural_incidents': [dict(item) for item in self._cultural_incidents],
+        'adaptation_tracking': {
+            participant: list(efforts)
+            for participant, efforts in self._adaptation_tracking.items()
+        },
     }
-    return str(state_dict)
 
-  def set_state(self, state: str) -> None:
-    """Set the component state from a saved string."""
-    # Since this tracks dynamic data, we only restore basic structure
-    pass
+  def set_state(self, state: Dict[str, Any]) -> None:
+    """Restore complete cultural tracking state."""
+    if not isinstance(state, dict):
+      raise TypeError('Cultural GM state must be a mapping.')
+    self._set_base_state(state)
+    cultures = {
+        str(participant): str(culture)
+        for participant, culture in state.get('participant_cultures', {}).items()
+    }
+    unknown = set(cultures.values()) - set(self.CULTURAL_PROFILES)
+    if unknown:
+      raise ValueError(f'Unknown cultures in saved state: {sorted(unknown)}')
+    self._participant_cultures = cultures
+    self._cultural_incidents = [
+        dict(item) for item in state.get('cultural_incidents', [])
+    ]
+    self._adaptation_tracking = {
+        str(participant): [str(effort) for effort in efforts]
+        for participant, efforts in state.get('adaptation_tracking', {}).items()
+    }
 
 
 # Register the module

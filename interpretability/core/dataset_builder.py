@@ -31,13 +31,14 @@ class ActivationSample:
 
     # Labels
     actual_deception: float  # GM ground truth
-    perceived_deception: float  # Agent self-report
+    perceived_deception: float  # Agent's estimate that its counterpart deceives
 
     # Scenario info
     scenario_type: Optional[str] = None
     emergent_scenario: Optional[str] = None
     emergent_ground_truth: Optional[bool] = None
     incentive_condition: Optional[str] = None
+    sample_type: str = "negotiation"
 
     # SAE features (optional)
     sae_features: Optional[Dict[int, float]] = None
@@ -94,11 +95,26 @@ class DatasetBuilder:
         all_gm_deception: List[float] = []
         all_agent_deception: List[float] = []
         all_scenarios: List[str] = []
-        all_sae_features: List[Dict[int, float]] = []
+        all_sae_features: List[Optional[Dict[int, float]]] = []
         all_sae_top_features: List[List[int]] = []
         metadata: List[Dict[str, Any]] = []
+        expected_layer_names = None
 
-        for sample in self.samples:
+        for sample_idx, sample in enumerate(self.samples):
+            layer_names = set(sample.activations)
+            if not layer_names:
+                raise ValueError(
+                    f"Sample {sample_idx} ({sample.trial_id}) has no activations"
+                )
+            if expected_layer_names is None:
+                expected_layer_names = layer_names
+            elif layer_names != expected_layer_names:
+                raise ValueError(
+                    "Activation layers are not aligned across samples: "
+                    f"sample {sample_idx} has {sorted(layer_names)}, expected "
+                    f"{sorted(expected_layer_names)}"
+                )
+
             # Organize activations by layer
             for layer_name, activation in sample.activations.items():
                 # Extract layer number from hook name
@@ -119,17 +135,18 @@ class DatasetBuilder:
                 gm_label = sample.actual_deception
             all_gm_deception.append(gm_label)
 
-            # Agent self-report label
+            # Agent belief about counterpart deception (not self-report)
             all_agent_deception.append(sample.perceived_deception)
 
             # Scenario name
-            scenario = sample.emergent_scenario or sample.scenario_type
+            scenario = sample.emergent_scenario or sample.scenario_type or "unknown"
             all_scenarios.append(scenario)
 
             # Metadata for each sample
             metadata.append({
                 'trial_id': sample.trial_id,
                 'round_num': sample.round_num,
+                'sample_type': sample.sample_type,
                 'agent_name': sample.agent_name,
                 'scenario': scenario,
                 'incentive_condition': sample.incentive_condition,
@@ -138,10 +155,10 @@ class DatasetBuilder:
                 'perceived_deception': sample.perceived_deception,
             })
 
-            # SAE features (if available)
-            if sample.sae_features is not None:
-                all_sae_features.append(sample.sae_features)
-                all_sae_top_features.append(sample.sae_top_features or [])
+            # Keep SAE rows aligned to the main sample axis. Missing features
+            # are represented by a zero row plus sae_available_mask=False.
+            all_sae_features.append(sample.sae_features)
+            all_sae_top_features.append(sample.sae_top_features or [])
 
         # Stack activations by layer: Dict[layer_num, Tensor[N, d_model]]
         stacked_activations = {}
@@ -160,15 +177,25 @@ class DatasetBuilder:
                 'model': model_name,
                 'layers': list(stacked_activations.keys()),
                 'n_samples': len(all_gm_deception),
-                'has_sae': len(all_sae_features) > 0,
+                'has_sae': any(f is not None for f in all_sae_features),
+                'label_semantics': {
+                    'gm_labels': 'acting-agent deception ground truth',
+                    'agent_labels': 'acting agent estimate of counterpart deception',
+                },
             },
             'metadata': metadata,
         }
 
-        # Add SAE features if available
-        if all_sae_features:
+        # Add SAE features if at least one row contains a populated sparse map.
+        # Empty maps alone do not reveal the SAE width and cannot define a tensor.
+        populated = [f for f in all_sae_features if f]
+        dataset['config']['has_sae'] = bool(populated)
+        if populated:
             try:
-                max_idx = max(max(f.keys()) for f in all_sae_features if f)
+                feature_indices = [idx for features in populated for idx in features]
+                if any(not isinstance(idx, int) or idx < 0 for idx in feature_indices):
+                    raise ValueError("SAE feature indices must be non-negative integers")
+                max_idx = max(feature_indices)
                 sae_dim = max_idx + 1
 
                 sae_tensor = torch.zeros(len(all_sae_features), sae_dim)
@@ -179,6 +206,9 @@ class DatasetBuilder:
 
                 dataset['sae_features'] = sae_tensor
                 dataset['sae_top_features'] = all_sae_top_features
+                dataset['sae_available_mask'] = [
+                    features is not None for features in all_sae_features
+                ]
                 dataset['config']['sae_dim'] = sae_dim
             except Exception as e:
                 logger.warning("Could not save SAE features: %s", e)
@@ -200,7 +230,7 @@ class DatasetBuilder:
         logger.info("Activation dim: %d", d_model)
         logger.info("GM deception rate: %.1f%%", np.mean(all_gm_deception) * 100)
 
-        if all_sae_features:
+        if any(bool(f) for f in all_sae_features):
             logger.info("SAE features: %d samples, dim=%s",
                        len(all_sae_features), dataset['config'].get('sae_dim', 'N/A'))
         else:
