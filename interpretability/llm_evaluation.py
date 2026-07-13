@@ -111,7 +111,13 @@ def create_remote_ollama_model(
     # Create a custom Ollama model that connects to remote host
     from concordia.language_model import language_model as lm_base
     from concordia.utils import sampling
-    import ollama
+    try:
+        import ollama
+    except ImportError as exc:
+        raise ImportError(
+            "Remote Ollama support requires the optional API dependencies. "
+            "Install them with `python -m pip install -e '.[apis]'`."
+        ) from exc
 
     class RemoteOllamaModel(lm_base.LanguageModel):
         """Ollama model connecting to a remote host (e.g., RunPod, Lambda Labs)."""
@@ -194,9 +200,10 @@ class LLMAgentConfig:
     random_seed: Optional[int] = None
 
 
-def create_mock_model():
-    """Create a mock language model for testing."""
+def create_mock_model(rng: Optional[random.Random] = None):
+    """Create a mock language model backed by an isolated random generator."""
     model = mock.create_autospec(language_model.LanguageModel, instance=True)
+    owned_rng = rng if rng is not None else random.Random()
 
     call_count = [0]
 
@@ -206,14 +213,14 @@ def create_mock_model():
 
         # Fishery scenario responses
         if 'fish' in prompt_lower or 'boat' in prompt_lower or 'deploy' in prompt_lower:
-            boats = random.randint(3, 10)
+            boats = owned_rng.randint(3, 10)
             responses = [
                 f"I'll deploy {boats} boats this round to balance sustainability with profit.",
                 f"Sending out {boats} boats. I'm committed to respecting the quota.",
                 f"I propose we each limit to {boats} boats for sustainability.",
                 f"Deploying {boats} boats as a moderate approach."
             ]
-            return random.choice(responses)
+            return owned_rng.choice(responses)
 
         # Treaty scenario responses
         elif 'treaty' in prompt_lower or 'climate' in prompt_lower or 'emissions' in prompt_lower:
@@ -223,7 +230,7 @@ def create_mock_model():
                 "I cannot support this as written. We need modifications.",
                 "We could accept 30% reduction if funding reaches $125B."
             ]
-            return random.choice(responses)
+            return owned_rng.choice(responses)
 
         # Gameshow scenario responses
         elif 'vote' in prompt_lower or 'alliance' in prompt_lower or 'eliminate' in prompt_lower:
@@ -233,19 +240,19 @@ def create_mock_model():
                 "I'll support my allies in this vote.",
                 "I need to reconsider my alliances."
             ]
-            return random.choice(responses)
+            return owned_rng.choice(responses)
 
         # Cognitive module prompts
         elif 'emotion' in prompt_lower or 'feeling' in prompt_lower:
-            return random.choice(['confident', 'cautious', 'optimistic', 'concerned'])
+            return owned_rng.choice(['confident', 'cautious', 'optimistic', 'concerned'])
         elif 'trust' in prompt_lower:
-            return random.choice(['high trust', 'moderate trust', 'low trust', 'building trust'])
+            return owned_rng.choice(['high trust', 'moderate trust', 'low trust', 'building trust'])
         elif 'cultural' in prompt_lower:
-            return random.choice(['direct approach', 'indirect approach', 'relationship-focused'])
+            return owned_rng.choice(['direct approach', 'indirect approach', 'relationship-focused'])
         elif 'strategy' in prompt_lower:
-            return random.choice(['cooperative', 'competitive', 'integrative', 'adaptive'])
+            return owned_rng.choice(['cooperative', 'competitive', 'integrative', 'adaptive'])
         elif 'uncertain' in prompt_lower:
-            return random.choice(['confident estimate', 'high uncertainty', 'need more information'])
+            return owned_rng.choice(['confident estimate', 'high uncertainty', 'need more information'])
 
         # Default response
         else:
@@ -270,7 +277,8 @@ class LLMAgentRunner:
             model: Language model (uses mock if None)
             output_dir: Directory for saving results
         """
-        self.model = model or create_mock_model()
+        self._rng = random.Random()
+        self.model = model if model is not None else create_mock_model(self._rng)
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
@@ -303,7 +311,8 @@ class LLMAgentRunner:
         name: str,
         goal: str,
         modules: List[str],
-        module_configs: Dict[str, Dict]
+        module_configs: Dict[str, Dict],
+        trial_seed: int,
     ):
         """Create a negotiation agent with specified modules."""
         memory_bank = self._create_memory_bank()
@@ -317,6 +326,7 @@ class LLMAgentRunner:
                 goal=goal,
                 modules=modules,
                 module_configs=module_configs,
+                trial_seed=trial_seed,
             )
         else:
             # Use base negotiator (no modules)
@@ -381,9 +391,8 @@ class LLMAgentRunner:
             print(f"Trials: {config.num_trials}")
             print(f"{'='*60}\n")
 
-        # Set random seed
-        if config.random_seed is not None:
-            random.seed(config.random_seed)
+        # Reset only this runner's stochastic stream; never perturb callers.
+        self._rng.seed(config.random_seed)
 
         # Initialize experiment metrics
         experiment = self.metrics_collector.start_experiment(
@@ -426,12 +435,18 @@ class LLMAgentRunner:
 
         # Create actual agents for each role
         agents = {}
+        component_trial_seed = (
+            trial_id
+            if config.random_seed is None
+            else config.random_seed + trial_id
+        )
         for role in agent_roles:
             agent = self._create_agent(
                 name=role.name,
                 goal=role.goal_description,
                 modules=config.modules,
-                module_configs=config.module_configs
+                module_configs=config.module_configs,
+                trial_seed=component_trial_seed,
             )
             agents[role.name] = agent
 

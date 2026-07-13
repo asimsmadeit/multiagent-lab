@@ -5,9 +5,19 @@ Label noise sensitivity analysis (optimized).
 Precomputes PCA/scaling once, then only retrains ridge per noise level.
 """
 
+# NumPy exposes RandomState at runtime; Pylint cannot infer the lazy namespace.
+# pylint: disable=no-member
+
+import argparse
 import json
 import numpy as np
 from pathlib import Path
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    load_activation_input,
+    prefer_safe_activation_path,
+)
 
 BASE = Path(__file__).parent / "experiment_results"
 FILES = {
@@ -21,9 +31,11 @@ NOISE_LEVELS = [0.0, 0.02, 0.05, 0.09, 0.10, 0.15, 0.20]
 N_SEEDS = 30
 
 
-def load_data(filepath, layer=14):
-    import torch
-    data = torch.load(filepath, map_location="cpu", weights_only=False)
+def load_data(filepath, layer=14, *, trust_legacy_pt=False):
+    data = load_activation_input(
+        filepath,
+        trust_legacy_pt=trust_legacy_pt,
+    )
     activations = data["activations"][layer].float().numpy()
     gm_labels = data["labels"]["gm_labels"]
     mode_labels = data["labels"]["mode_labels"]
@@ -47,7 +59,7 @@ def load_data(filepath, layer=14):
     return activations, labels
 
 
-def run_scenario(name, filepath):
+def run_scenario(name, filepath, *, trust_legacy_pt=False):
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
     from sklearn.linear_model import RidgeClassifier
@@ -58,7 +70,7 @@ def run_scenario(name, filepath):
     print(f"\n{'='*60}")
     print(f"Loading {name}...")
     t0 = time.time()
-    X, y = load_data(filepath)
+    X, y = load_data(filepath, trust_legacy_pt=trust_legacy_pt)
     print(f"  Loaded: n={len(y)}, deception_rate={y.mean():.3f} ({time.time()-t0:.1f}s)")
 
     # Fixed train/test split on clean labels
@@ -177,13 +189,21 @@ def make_figure(all_results, output_path):
     print(f"\nFigure: {output_path} and {pdf_path}")
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
     all_results = {}
     for sc, fp in FILES.items():
+        fp = prefer_safe_activation_path(fp)
         if not fp.exists():
             print(f"SKIP {sc}: not found")
             continue
-        all_results[sc] = run_scenario(sc, fp)
+        all_results[sc] = run_scenario(
+            sc,
+            fp,
+            trust_legacy_pt=args.trust_legacy_pt,
+        )
 
     out = str(BASE / "label_noise_sensitivity.json")
     with open(out, "w") as f:

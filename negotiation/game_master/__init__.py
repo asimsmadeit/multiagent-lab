@@ -15,6 +15,9 @@
 """Negotiation game master prefab and components."""
 
 from negotiation.game_master import negotiation
+from negotiation.game_master.adjudication import NegotiationAdjudicator
 
 # Export the main negotiation game master
 NegotiationGameMaster = negotiation.NegotiationGameMaster
+
+__all__ = ["NegotiationAdjudicator", "NegotiationGameMaster"]

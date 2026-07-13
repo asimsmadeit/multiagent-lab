@@ -18,7 +18,12 @@ from negotiation.components import swarm_intelligence
 from negotiation.components import uncertainty_aware
 from negotiation.components import strategy_evolution
 from negotiation.components import theory_of_mind
+from negotiation.components.config import resolve_module_configs
 from negotiation.constants import MODULE_COMPONENT_NAMES, ModuleType
+from negotiation.profiles import AgentProfile
+
+
+AGENT_PROFILE = AgentProfile.ADVANCED.value
 
 
 @dataclasses.dataclass
@@ -51,6 +56,7 @@ class Entity(prefab_lib.Prefab):
         'ethical_constraints': 'Be honest and fair. Respect cultural differences.',
         'modules': '',  # Comma-separated list of module names
         'module_configs': '{}',  # JSON string of module configurations
+        'trial_seed': 0,
         'extra_components': {},
     })
 
@@ -71,21 +77,28 @@ class Entity(prefab_lib.Prefab):
         # Parse module list from params
         modules_value = self.params.get('modules', '')
         if isinstance(modules_value, str):
-            modules = [
+            module_names = [
                 module.strip() for module in modules_value.split(',')
                 if module.strip()
             ]
         elif isinstance(modules_value, Sequence):
-            modules = [
+            module_names = [
                 module.value if isinstance(module, ModuleType) else str(module).strip()
                 for module in modules_value
             ]
         else:
             raise TypeError('modules must be a comma-separated string or sequence.')
-        valid_modules = {module.value for module in ModuleType}
-        unknown_modules = set(modules) - valid_modules
-        if unknown_modules:
-            raise ValueError(f'Unknown negotiation modules: {sorted(unknown_modules)}')
+        try:
+            modules = tuple(ModuleType(name) for name in module_names)
+        except ValueError as error:
+            unknown_modules = set(module_names).difference(
+                module.value for module in ModuleType
+            )
+            raise ValueError(
+                f'Unknown negotiation modules: {sorted(unknown_modules)}'
+            ) from error
+        if len(set(modules)) != len(modules):
+            raise ValueError('Negotiation modules cannot contain duplicates.')
 
         # Parse module configs from JSON string
         module_configs_value = self.params.get('module_configs', '{}')
@@ -100,84 +113,69 @@ class Entity(prefab_lib.Prefab):
             raise TypeError('module_configs must be a mapping or JSON string.')
         if not isinstance(module_configs, dict):
             raise ValueError('module_configs JSON must decode to an object.')
-        invalid_configs = {
-            name for name, config in module_configs.items()
-            if not isinstance(config, Mapping)
-        }
-        if invalid_configs:
-            raise ValueError(
-                'Each module configuration must be an object: '
-                f'{sorted(invalid_configs)}'
-            )
+        trial_seed = self.params.get('trial_seed')
+        resolved_configs, seed_provenance = resolve_module_configs(
+            modules,
+            module_configs,
+            trial_seed=trial_seed,
+            actor_id=str(self.params.get('name', 'AdvancedNegotiator')),
+        )
 
         # Build extra components for selected modules
         extra_components = {}
 
         # Helper to check module membership (works with strings or ModuleType)
         def has_module(module_type: ModuleType) -> bool:
-            return module_type.value in modules or module_type in modules
+            return module_type in modules
 
         # Add selected modules
         if has_module(ModuleType.CULTURAL_ADAPTATION):
-            config = module_configs.get(ModuleType.CULTURAL_ADAPTATION.value, {})
+            config = resolved_configs[ModuleType.CULTURAL_ADAPTATION]
             cultural = cultural_adaptation.CulturalAdaptation(
                 model=model,
-                own_culture=config.get('own_culture', 'western_business'),
-                adaptation_level=config.get('adaptation_level', 0.7),
-                detect_culture=config.get('detect_culture', True),
+                **dataclasses.asdict(config),
             )
             extra_components[MODULE_COMPONENT_NAMES[ModuleType.CULTURAL_ADAPTATION]] = cultural
 
         if has_module(ModuleType.TEMPORAL_STRATEGY):
-            config = module_configs.get(ModuleType.TEMPORAL_STRATEGY.value, {})
+            config = resolved_configs[ModuleType.TEMPORAL_STRATEGY]
             temporal = temporal_strategy.TemporalStrategy(
                 model=model,
-                discount_factor=config.get('discount_factor', 0.9),
-                reputation_weight=config.get('reputation_weight', 0.3),
-                relationship_investment_threshold=config.get('relationship_investment_threshold', 0.6),
+                **dataclasses.asdict(config),
             )
             extra_components[MODULE_COMPONENT_NAMES[ModuleType.TEMPORAL_STRATEGY]] = temporal
 
         if has_module(ModuleType.SWARM_INTELLIGENCE):
-            config = module_configs.get(ModuleType.SWARM_INTELLIGENCE.value, {})
+            config = resolved_configs[ModuleType.SWARM_INTELLIGENCE]
             swarm = swarm_intelligence.SwarmIntelligence(
                 model=model,
-                consensus_threshold=config.get('consensus_threshold', 0.7),
-                max_iterations=config.get('max_iterations', 3),
-                enable_sub_agents=config.get('enable_sub_agents', None),
+                **dataclasses.asdict(config),
             )
             extra_components[MODULE_COMPONENT_NAMES[ModuleType.SWARM_INTELLIGENCE]] = swarm
 
         if has_module(ModuleType.UNCERTAINTY_AWARE):
-            config = module_configs.get(ModuleType.UNCERTAINTY_AWARE.value, {})
+            config = resolved_configs[ModuleType.UNCERTAINTY_AWARE]
             uncertainty = uncertainty_aware.UncertaintyAware(
                 model=model,
-                confidence_threshold=config.get('confidence_threshold', 0.7),
-                risk_tolerance=config.get('risk_tolerance', 0.3),
-                information_gathering_budget=config.get('information_gathering_budget', 0.1),
-                seed=config.get('seed'),
+                **dataclasses.asdict(config),
+                seed_provenance=seed_provenance[ModuleType.UNCERTAINTY_AWARE],
             )
             extra_components[MODULE_COMPONENT_NAMES[ModuleType.UNCERTAINTY_AWARE]] = uncertainty
 
         if has_module(ModuleType.STRATEGY_EVOLUTION):
-            config = module_configs.get(ModuleType.STRATEGY_EVOLUTION.value, {})
+            config = resolved_configs[ModuleType.STRATEGY_EVOLUTION]
             evolution = strategy_evolution.StrategyEvolution(
                 model=model,
-                population_size=config.get('population_size', 20),
-                mutation_rate=config.get('mutation_rate', 0.1),
-                crossover_rate=config.get('crossover_rate', 0.7),
-                learning_rate=config.get('learning_rate', 0.01),
-                seed=config.get('seed'),
+                **dataclasses.asdict(config),
+                seed_provenance=seed_provenance[ModuleType.STRATEGY_EVOLUTION],
             )
             extra_components[MODULE_COMPONENT_NAMES[ModuleType.STRATEGY_EVOLUTION]] = evolution
 
         if has_module(ModuleType.THEORY_OF_MIND):
-            config = module_configs.get(ModuleType.THEORY_OF_MIND.value, {})
+            config = resolved_configs[ModuleType.THEORY_OF_MIND]
             tom = theory_of_mind.TheoryOfMind(
                 model=model,
-                max_recursion_depth=config.get('max_recursion_depth', 3),
-                emotion_sensitivity=config.get('emotion_sensitivity', 0.7),
-                empathy_level=config.get('empathy_level', 0.8),
+                **dataclasses.asdict(config),
             )
             extra_components[MODULE_COMPONENT_NAMES[ModuleType.THEORY_OF_MIND]] = tom
 
@@ -202,6 +200,7 @@ def build_agent(
     ethical_constraints: str = 'Be honest and fair. Respect cultural differences.',
     modules: Optional[Sequence[str | ModuleType]] = None,
     module_configs: Optional[Mapping[str, Any]] = None,
+    trial_seed: int | None = 0,
     **kwargs
 ) -> entity_agent_with_logging.EntityAgentWithLogging:
     """Convenience function to build an advanced negotiation agent.
@@ -259,7 +258,8 @@ def build_agent(
             module.value if isinstance(module, ModuleType) else module
             for module in modules
         ),
-        'module_configs': json.dumps(module_configs),
+        'module_configs': dict(module_configs),
+        'trial_seed': trial_seed,
     }
     params.update(kwargs)
     

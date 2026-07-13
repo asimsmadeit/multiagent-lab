@@ -325,6 +325,12 @@ class NegotiationStateTracker(entity_component.ContextComponent):
 
     return summary
 
+  def get_negotiation(self, negotiation_id: str) -> NegotiationState:
+    """Return the live state for an explicitly named negotiation."""
+    if negotiation_id not in self._negotiations:
+      raise ValueError(f"Unknown negotiation: {negotiation_id}")
+    return self._negotiations[negotiation_id]
+
   def get_relationship_status(self, participant1: str, participant2: str) -> float:
     """Get relationship score between two participants."""
     key = tuple(sorted([participant1, participant2]))

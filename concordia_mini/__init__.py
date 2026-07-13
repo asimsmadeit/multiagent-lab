@@ -12,4 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Deprecated compatibility package for pre-Concordia-2.4 imports.
+
+Live negotiation and interpretability code uses :mod:`concordia`.  This
+vendored package remains temporarily importable only so documented legacy
+imports fail gradually during the release-cycle removal window.
+"""
+
+import warnings
+
+
+warnings.warn(
+    "concordia_mini is deprecated; import from the pinned `concordia` package "
+    "instead. This compatibility package will be removed after the documented "
+    "release-cycle gate.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 

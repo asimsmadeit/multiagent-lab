@@ -1,278 +1,181 @@
 #!/usr/bin/env python3
-"""
-Aggregate Results from Parallel Cluster Runs
+"""Aggregate parallel activation pods into one validated safe dataset.
 
-Combines activation files and results from multiple scenario runs
-into a single unified dataset for probe training.
-
-Usage:
-    python scripts/aggregate_results.py --input-dir ./cluster_results/20250128_123456
-    python scripts/aggregate_results.py --input-dir ./cluster_results/20250128_123456 --train-probes
+The output is a checksummed JSON manifest plus non-executable NPZ arrays.
+Legacy ``.pt`` inputs are accepted only with ``--trust-legacy-pt``.
 """
 
-import os
-import sys
-import json
+from __future__ import annotations
+
 import argparse
+from collections import Counter
+import json
 from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Any, Optional
+import sys
+from typing import Any
 
-# Load .env file
-try:
-    from dotenv import load_dotenv
-    env_path = Path(__file__).parent.parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-except ImportError:
-    pass
-
-import torch
 import numpy as np
 
+from interpretability.data import load_activation_dataset
+from interpretability.merge_parallel_results import merge_parallel_activations
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    prefer_safe_activation_path,
+)
 
-def find_activation_files(input_dir: Path) -> List[Path]:
-    """Find all activation .pt files in subdirectories."""
-    files = []
+
+def find_activation_files(input_dir: Path) -> list[Path]:
+    """Find pod artifacts, preferring safe manifests over sibling ``.pt`` files."""
+    files: set[Path] = set()
     for subdir in input_dir.iterdir():
-        if subdir.is_dir():
-            for pt_file in subdir.glob("*.pt"):
-                files.append(pt_file)
-            for pt_file in subdir.glob("**/*.pt"):
-                files.append(pt_file)
-    return list(set(files))
-
-
-def load_activation_file(path: Path) -> Dict[str, Any]:
-    """Load a single activation file."""
-    data = torch.load(path, map_location="cpu")
-    return data
-
-
-def merge_activations(files: List[Path]) -> Dict[str, Any]:
-    """Merge multiple activation files into one."""
-    print(f"\nMerging {len(files)} activation files...")
-
-    merged = {
-        "activations": {},
-        "labels": {
-            "gm_labels": [],
-            "agent_labels": [],
-        },
-        "metadata": [],
-        "scenarios": [],
-    }
-
-    total_samples = 0
-
-    for path in files:
-        print(f"  Loading {path.name}...")
-        try:
-            data = load_activation_file(path)
-        except Exception as e:
-            print(f"    Error loading {path}: {e}")
+        if not subdir.is_dir():
             continue
-
-        # Get number of samples in this file
-        n_samples = len(data.get("metadata", []))
-        if n_samples == 0:
-            # Try to infer from activations
-            acts = data.get("activations", {})
-            if acts:
-                first_layer = list(acts.keys())[0]
-                n_samples = len(acts[first_layer])
-
-        print(f"    Found {n_samples} samples")
-
-        # Merge activations
-        for layer, acts in data.get("activations", {}).items():
-            if layer not in merged["activations"]:
-                merged["activations"][layer] = []
-
-            if isinstance(acts, torch.Tensor):
-                acts = acts.numpy()
-            merged["activations"][layer].append(acts)
-
-        # Merge labels
-        labels = data.get("labels", {})
-        if "gm_labels" in labels:
-            gm = labels["gm_labels"]
-            if isinstance(gm, torch.Tensor):
-                gm = gm.numpy()
-            merged["labels"]["gm_labels"].extend(gm.tolist() if hasattr(gm, 'tolist') else list(gm))
-
-        if "agent_labels" in labels:
-            agent = labels["agent_labels"]
-            if isinstance(agent, torch.Tensor):
-                agent = agent.numpy()
-            merged["labels"]["agent_labels"].extend(agent.tolist() if hasattr(agent, 'tolist') else list(agent))
-
-        # Merge metadata
-        merged["metadata"].extend(data.get("metadata", []))
-
-        # Track scenarios
-        scenario = path.parent.name.split("_")[0]  # Extract scenario from dir name
-        merged["scenarios"].extend([scenario] * n_samples)
-
-        total_samples += n_samples
-
-    # Convert lists to arrays
-    for layer in merged["activations"]:
-        merged["activations"][layer] = np.concatenate(merged["activations"][layer], axis=0)
-
-    merged["labels"]["gm_labels"] = np.array(merged["labels"]["gm_labels"])
-    merged["labels"]["agent_labels"] = np.array(merged["labels"]["agent_labels"])
-
-    print(f"\nMerged total: {total_samples} samples")
-    print(f"Layers: {list(merged['activations'].keys())}")
-    print(f"Scenarios: {list(set(merged['scenarios']))}")
-
-    return merged
+        files.update(subdir.rglob("*activation*.json"))
+        files.update(
+            prefer_safe_activation_path(path)
+            for path in subdir.rglob("*.pt")
+        )
+    return sorted(files)
 
 
-def save_merged(merged: Dict[str, Any], output_path: Path) -> None:
-    """Save merged activations."""
-    # Convert numpy arrays to torch tensors for saving
-    save_data = {
-        "activations": {
-            layer: torch.from_numpy(acts)
-            for layer, acts in merged["activations"].items()
-        },
-        "labels": {
-            "gm_labels": torch.from_numpy(merged["labels"]["gm_labels"]),
-            "agent_labels": torch.from_numpy(merged["labels"]["agent_labels"]),
-        },
-        "metadata": merged["metadata"],
-        "scenarios": merged["scenarios"],
-    }
+def _relocate_safe_bundle(manifest_path: Path, output_path: Path) -> Path:
+    """Move a freshly generated safe bundle to the requested base name."""
+    destination = (
+        output_path.with_suffix(".json")
+        if output_path.suffix == ""
+        else output_path
+    )
+    if destination.suffix != ".json":
+        raise ValueError("merged activation output must use a .json manifest")
+    if manifest_path.resolve() == destination.resolve():
+        return manifest_path
 
-    torch.save(save_data, output_path)
-    print(f"\nSaved merged activations to {output_path}")
+    outer_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    array_name = outer_manifest.get("array_file")
+    if not isinstance(array_name, str) or not array_name:
+        raise ValueError("generated activation manifest has no array_file")
+    source_array = manifest_path.with_name(array_name)
+    destination_array = destination.with_suffix(".npz")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_array.replace(destination_array)
+    outer_manifest["array_file"] = destination_array.name
+    destination.write_text(
+        json.dumps(outer_manifest, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.unlink()
+    return destination
 
 
-def print_summary(merged: Dict[str, Any]) -> None:
-    """Print summary statistics."""
+def aggregate_activation_files(
+    files: list[Path],
+    output_path: Path,
+    *,
+    trust_legacy_pt: bool = False,
+) -> tuple[dict[str, Any], Path]:
+    """Validate, merge, save, and reload activation pods."""
+    generated = Path(merge_parallel_activations(
+        [str(path) for path in files],
+        output_dir=str(output_path.parent),
+        verbose=True,
+        trusted_legacy=trust_legacy_pt,
+    ))
+    saved = _relocate_safe_bundle(generated, output_path)
+    return load_activation_dataset(saved), saved
+
+
+def print_summary(merged: dict[str, Any]) -> None:
+    """Print aligned sample, scenario, label, and activation dimensions."""
+    labels = merged["labels"]
+    gm_labels = np.asarray(labels["gm_labels"], dtype=float)
+    scenarios = labels.get("scenario", ["unknown"] * len(gm_labels))
+
     print("\n" + "=" * 60)
     print("DATASET SUMMARY")
     print("=" * 60)
-
-    n_samples = len(merged["labels"]["gm_labels"])
-    print(f"Total samples: {n_samples}")
-
-    # Scenario breakdown
-    from collections import Counter
-    scenario_counts = Counter(merged["scenarios"])
+    print(f"Total samples: {len(gm_labels)}")
     print("\nSamples per scenario:")
-    for scenario, count in sorted(scenario_counts.items()):
+    for scenario, count in sorted(Counter(scenarios).items()):
         print(f"  {scenario}: {count}")
+    print("\nGM labels:")
+    print(f"  Mean: {gm_labels.mean():.3f}")
+    deceptive = gm_labels > 0.5
+    print(f"  Deceptive (>0.5): {deceptive.sum()} ({100 * deceptive.mean():.1f}%)")
+    print(f"  Honest (<=0.5): {(~deceptive).sum()} ({100 * (~deceptive).mean():.1f}%)")
 
-    # Label distribution
-    gm = merged["labels"]["gm_labels"]
-    print(f"\nGM labels:")
-    print(f"  Mean: {gm.mean():.3f}")
-    print(f"  Deceptive (>0.5): {(gm > 0.5).sum()} ({100*(gm > 0.5).mean():.1f}%)")
-    print(f"  Honest (<=0.5): {(gm <= 0.5).sum()} ({100*(gm <= 0.5).mean():.1f}%)")
-
-    # Layer info
-    print(f"\nActivation layers: {sorted(merged['activations'].keys())}")
-    first_layer = list(merged["activations"].keys())[0]
-    d_model = merged["activations"][first_layer].shape[1]
-    print(f"Model dimension: {d_model}")
+    layers = merged["activations"]
+    print(f"\nActivation layers: {sorted(layers)}")
+    first_layer = next(iter(layers.values()))
+    print(f"Model dimension: {first_layer.shape[1]}")
 
 
-def train_probes_on_merged(merged: Dict[str, Any], output_dir: Path) -> None:
-    """Train probes on merged data."""
-    print("\n" + "=" * 60)
-    print("TRAINING PROBES")
-    print("=" * 60)
+def train_probes_on_merged(data_path: Path, output_dir: Path) -> None:
+    """Run the public probe pipeline against the saved safe dataset."""
+    from interpretability.probes.train_probes import run_full_analysis
 
-    try:
-        from interpretability.probes.train_probes import run_full_analysis
-    except ImportError:
-        print("Error: Could not import probe training functions")
-        print("Make sure you're in the project directory and it's installed")
-        return
-
-    results = run_full_analysis(
-        activations_by_layer=merged["activations"],
-        labels={
-            "gm_labels": merged["labels"]["gm_labels"],
-            "agent_labels": merged["labels"]["agent_labels"],
-        },
-        scenarios=merged["scenarios"],
-        output_dir=str(output_dir),
-    )
-
-    # Save results
+    results = run_full_analysis(str(data_path))
     results_path = output_dir / "probe_results.json"
-    with open(results_path, "w") as f:
-        # Convert numpy types for JSON
-        def convert(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            if isinstance(obj, (np.float32, np.float64)):
-                return float(obj)
-            if isinstance(obj, (np.int32, np.int64)):
-                return int(obj)
-            return obj
 
-        json.dump(results, f, indent=2, default=convert)
+    def convert(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"cannot serialize {type(value).__name__}")
 
+    results_path.write_text(
+        json.dumps(results, indent=2, default=convert) + "\n",
+        encoding="utf-8",
+    )
     print(f"\nProbe results saved to {results_path}")
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Aggregate results from parallel cluster runs",
     )
     parser.add_argument(
         "--input-dir",
-        type=str,
         required=True,
-        help="Directory containing scenario subdirectories with .pt files",
+        help="Directory containing scenario subdirectories with activation pods",
     )
     parser.add_argument(
         "--output",
-        type=str,
         default=None,
-        help="Output path for merged .pt file (default: input_dir/merged_activations.pt)",
+        help="Safe .json output (default: INPUT_DIR/merged_activations.json)",
     )
     parser.add_argument(
         "--train-probes",
         action="store_true",
-        help="Train probes on merged data",
+        help="Train probes on the merged safe dataset",
     )
-
-    args = parser.parse_args()
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
 
     input_dir = Path(args.input_dir)
     if not input_dir.exists():
-        print(f"Error: Input directory not found: {input_dir}")
-        sys.exit(1)
-
-    output_path = Path(args.output) if args.output else input_dir / "merged_activations.pt"
-
-    # Find activation files
+        parser.error(f"input directory not found: {input_dir}")
+    output_path = (
+        Path(args.output)
+        if args.output
+        else input_dir / "merged_activations.json"
+    )
     files = find_activation_files(input_dir)
     if not files:
-        print(f"No .pt files found in {input_dir}")
-        sys.exit(1)
+        parser.error(f"no activation pods found in {input_dir}")
 
     print(f"Found {len(files)} activation files")
-
-    # Merge
-    merged = merge_activations(files)
-
-    # Summary
+    merged, saved = aggregate_activation_files(
+        files,
+        output_path,
+        trust_legacy_pt=args.trust_legacy_pt,
+    )
     print_summary(merged)
-
-    # Save
-    save_merged(merged, output_path)
-
-    # Optionally train probes
+    print(f"\nSaved merged activations to {saved}")
     if args.train_probes:
-        train_probes_on_merged(merged, input_dir)
+        train_probes_on_merged(saved, input_dir)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

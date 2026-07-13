@@ -36,14 +36,19 @@ side-by-side comparison table.
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-from huggingface_hub import hf_hub_download
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+)
 
 HF_REPO = 'sycorpia/multiagent-lab-data'
 
@@ -87,7 +92,12 @@ def _is_negotiation(md):
     return rn is None or rn >= 0
 
 
-def load_directions(model: str, config: str) -> Dict[Tuple[str, str], np.ndarray]:
+def load_directions(
+    model: str,
+    config: str,
+    *,
+    trust_legacy_pt: bool = False,
+) -> Dict[Tuple[str, str], np.ndarray]:
     """Load mass-mean deception directions for a given (model, config) over all scenarios.
 
     Returns dict {(scenario, mode): unit_norm_direction}.
@@ -99,8 +109,8 @@ def load_directions(model: str, config: str) -> Dict[Tuple[str, str], np.ndarray
             continue
         path = RUNS[key]
         print(f"  Loading {path}", flush=True)
-        fp = hf_hub_download(HF_REPO, path, repo_type='dataset')
-        data = torch.load(fp, weights_only=False)
+        fp = download_activation_input(HF_REPO, path)
+        data = load_activation_input(fp, trust_legacy_pt=trust_legacy_pt)
         md = data.get('metadata', [])
         labels = data['labels']
         acts = data['activations']
@@ -236,7 +246,10 @@ def cross_compare(d_g_a: np.ndarray, d_p_a: Optional[np.ndarray],
     return out
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
     out_dir = Path('experiment_results/paper_numbers')
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -252,7 +265,11 @@ def main():
 
     for model, config in targets:
         print(f"\n=== {model} ({config}) ===")
-        dirs = load_directions(model, config)
+        dirs = load_directions(
+            model,
+            config,
+            trust_legacy_pt=args.trust_legacy_pt,
+        )
         if not dirs:
             print(f"  no directions loaded")
             continue

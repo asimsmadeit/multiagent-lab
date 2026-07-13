@@ -8,6 +8,7 @@ import numpy as np
 
 from concordia.typing import entity_component
 from concordia.typing import entity as entity_lib
+from negotiation.components.contracts import ComponentDiagnosticContract
 
 
 @dataclasses.dataclass
@@ -35,10 +36,10 @@ class RelationshipRecord:
         self.last_interaction = now or datetime.datetime.now()
         self.outcome_history.append(outcome)
 
-        # Update trust based on outcome
-        if outcome.get('promises_kept', True):
+        # Update trust only when the outcome contains explicit evidence.
+        if outcome.get('promises_kept') is True:
             self.trust_score = min(1.0, self.trust_score + 0.05)
-        else:
+        elif outcome.get('promises_kept') is False:
             self.trust_score = max(0.0, self.trust_score - 0.1)
 
     def get_relationship_strength(
@@ -72,6 +73,21 @@ class TemporalPlan:
 
 class TemporalStrategy(entity_component.ContextComponent):
     """Component for temporal planning and relationship management in negotiations."""
+
+    DIAGNOSTIC_CONTRACT = ComponentDiagnosticContract(
+        inputs=('action_spec.call_to_action', 'action attempt', 'counterpart observation'),
+        outputs=('temporal analysis', 'relationship guidance', 'relationship records'),
+        state_fields=(
+            'discount_factor', 'reputation_weight',
+            'relationship_investment_threshold', 'relationships',
+            'global_reputation', 'current_phase', 'phase_history',
+            'temporal_plans',
+        ),
+        extra_model_calls={
+            'pre_act': 1, 'post_act': 1, 'pre_observe': 1, 'post_observe': 0,
+        },
+        logging_fields=('current_phase', 'global_reputation', 'counterpart'),
+    )
 
     def __init__(
         self,
@@ -368,16 +384,17 @@ Format: impact_type|promises|reputation|value"""
         self,
         observation: str,
     ) -> None:
-        """Process observations for temporal insights."""
-        # Extract counterpart info if mentioned
+        """Populate a counterpart record from one explicit extraction."""
         prompt = f"""From this observation, extract:
 1. Counterpart name (if mentioned):
-2. Any outcomes or values mentioned:
-3. Relationship indicators (trust, future plans, etc):
+2. Outcome category:
+3. Relationship indicators (including promise kept/broken):
+4. Numeric value exchanged, or unknown:
+5. Numeric concession amount, or unknown:
 
 Observation: {observation}
 
-Format: name|outcome|indicators"""
+Format exactly: name|outcome|indicators|numeric_value_or_unknown|numeric_concession_or_unknown"""
 
         response = self._model.sample_text(prompt)
         parts = response.split('|')
@@ -387,6 +404,54 @@ Format: name|outcome|indicators"""
             counterpart = parts[0].strip()
             if counterpart not in self._relationships:
                 self._relationships[counterpart] = RelationshipRecord(counterpart)
+            outcome_text = parts[1].strip() if len(parts) > 1 else 'unknown'
+            indicators = parts[2].strip() if len(parts) > 2 else ''
+            value = self._parse_optional_number(parts[3] if len(parts) > 3 else '')
+            concession = self._parse_optional_number(
+                parts[4] if len(parts) > 4 else ''
+            )
+            normalized = f'{outcome_text} {indicators}'.casefold()
+            outcome: Dict[str, Any] = {
+                'outcome': outcome_text,
+                'indicators': indicators,
+                'source_observation': observation,
+                'extraction_method': 'temporal-observation/1',
+            }
+            if any(phrase in normalized for phrase in (
+                'promise broken', 'broke promise', 'did not keep promise'
+            )):
+                outcome['promises_kept'] = False
+            elif any(phrase in normalized for phrase in (
+                'promise kept', 'kept promise'
+            )):
+                outcome['promises_kept'] = True
+            relationship = self._relationships[counterpart]
+            relationship.update_interaction(
+                value or 0.0,
+                outcome,
+                now=self._clock(),
+            )
+            if concession is not None:
+                relationship.concession_history.append(concession)
+            if 'reputation positive' in normalized:
+                relationship.reputation_score = min(
+                    1.0, relationship.reputation_score + 0.05
+                )
+            elif 'reputation negative' in normalized:
+                relationship.reputation_score = max(
+                    0.0, relationship.reputation_score - 0.1
+                )
+
+    @staticmethod
+    def _parse_optional_number(value: str) -> Optional[float]:
+        normalized = value.strip().replace('$', '').replace(',', '')
+        if normalized.casefold() in {'', 'unknown', 'none', 'n/a'}:
+            return None
+        try:
+            parsed = float(normalized)
+        except ValueError:
+            return None
+        return parsed if np.isfinite(parsed) else None
 
     def pre_observe(self, observation: str) -> str:
         """Feed entity observations into temporal relationship tracking."""
@@ -396,6 +461,9 @@ Format: name|outcome|indicators"""
     def get_state(self) -> Dict[str, Any]:
         """Get component state."""
         return {
+            'discount_factor': self._discount_factor,
+            'reputation_weight': self._reputation_weight,
+            'relationship_investment_threshold': self._investment_threshold,
             'relationships': {
                 name: {
                     'trust_score': rec.trust_score,
@@ -422,6 +490,29 @@ Format: name|outcome|indicators"""
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Set component state."""
+        if not isinstance(state, dict):
+            raise TypeError('Temporal strategy state must be a mapping.')
+        configuration = {
+            'discount_factor': float(
+                state.get('discount_factor', self._discount_factor)
+            ),
+            'reputation_weight': float(
+                state.get('reputation_weight', self._reputation_weight)
+            ),
+            'relationship_investment_threshold': float(
+                state.get(
+                    'relationship_investment_threshold', self._investment_threshold
+                )
+            ),
+        }
+        for name, value in configuration.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f'{name} must be between 0 and 1.')
+        self._discount_factor = configuration['discount_factor']
+        self._reputation_weight = configuration['reputation_weight']
+        self._investment_threshold = configuration[
+            'relationship_investment_threshold'
+        ]
         self._global_reputation = state.get('global_reputation', 0.7)
         self._current_phase = state.get('current_phase', 'opening')
         self._phase_history = [str(phase) for phase in state.get('phase_history', [])]

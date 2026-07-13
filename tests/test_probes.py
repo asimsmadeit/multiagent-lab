@@ -174,7 +174,8 @@ class TestGeneralizationAUC:
         compute_generalization_auc = train_probes_module.compute_generalization_auc
 
         X, y, scenarios = scenario_data
-        result = compute_generalization_auc(X, y, scenarios)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = compute_generalization_auc(X, y, scenarios, groups=groups)
 
         assert "by_scenario" in result
         assert "average_auc" in result
@@ -186,7 +187,8 @@ class TestGeneralizationAUC:
 
         X, y, scenarios = scenario_data
         unique_scenarios = set(scenarios)
-        result = compute_generalization_auc(X, y, scenarios)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = compute_generalization_auc(X, y, scenarios, groups=groups)
 
         for scenario in unique_scenarios:
             assert scenario in result["by_scenario"]
@@ -197,11 +199,39 @@ class TestGeneralizationAUC:
 
         X, y, scenarios = scenario_data
 
-        result1 = compute_generalization_auc(X, y, scenarios, random_state=42)
-        result2 = compute_generalization_auc(X, y, scenarios, random_state=42)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result1 = compute_generalization_auc(
+            X, y, scenarios, groups=groups, random_state=42
+        )
+        result2 = compute_generalization_auc(
+            X, y, scenarios, groups=groups, random_state=42
+        )
 
         # Results should be identical with same seed
         assert result1["average_auc"] == result2["average_auc"]
+
+    def test_rejects_connected_family_crossing_scenario_holdout(
+        self, scenario_data, train_probes_module
+    ):
+        """Mirrored families cannot appear in both LOSO train and test."""
+        compute_generalization_auc = train_probes_module.compute_generalization_auc
+        X, y, scenarios = scenario_data
+        groups = np.array([f"family-{index % 10}" for index in range(len(y))])
+
+        result = compute_generalization_auc(X, y, scenarios, groups=groups)
+
+        assert result["available_holdouts"] == 0
+        assert all(
+            row["available"] is False and row["crossing_group_ids"]
+            for row in result["by_scenario"].values()
+        )
+
+    def test_requires_connected_groups(self, scenario_data, train_probes_module):
+        compute_generalization_auc = train_probes_module.compute_generalization_auc
+        X, y, scenarios = scenario_data
+
+        with pytest.raises(ValueError, match="connected family/dyad groups"):
+            compute_generalization_auc(X, y, scenarios, groups=None)
 
 
 class TestProbeResult:
@@ -231,6 +261,36 @@ class TestProbeResult:
         assert d["auc"] == 0.8
         assert "cross_val_mean" in d
         assert "cross_val_std" in d
+
+
+def test_multi_seed_spread_is_not_reported_as_confidence_interval(
+    sample_data, train_probes_module, monkeypatch
+):
+    """Correlated split seeds are a sensitivity analysis, not independent N."""
+    ProbeResult = train_probes_module.ProbeResult
+
+    def fake_train(_X, _y, *, random_state, **_kwargs):
+        score = 0.6 + random_state / 100.0
+        return None, ProbeResult(
+            layer=-1,
+            label_type="gm",
+            r2_score=score,
+            accuracy=score,
+            auc=score,
+            train_r2=score,
+            test_r2=score,
+            cross_val_scores=[],
+        )
+
+    monkeypatch.setattr(train_probes_module, "train_logistic_probe", fake_train)
+    X, y = sample_data
+    result = train_probes_module.train_probe_multi_seed(
+        X, y, seeds=[1, 2], probe_type="logistic"
+    )
+
+    assert "auc_ci_95" not in result
+    assert result["auc_seed_range"] == pytest.approx((0.61, 0.62))
+    assert "not a confidence interval" in result["interval_interpretation"]
 
 
 if __name__ == "__main__":

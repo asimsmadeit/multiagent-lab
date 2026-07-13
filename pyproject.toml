@@ -54,3 +54,7 @@ run-deception-experiment = "interpretability.run_deception_experiment:main"
 
 [tool.setuptools.packages.find]
 include = ["concordia_mini*", "negotiation*", "interpretability*", "config*"]
+
+[tool.setuptools.package-data]
+config = ["reference_offline.json", "release_checksums.json"]
+"interpretability.data" = ["DATA_CARD.txt"]

@@ -229,9 +229,11 @@ def detect_agent_modules(agents: List[Any]) -> Dict[str, Set[str]]:
   for agent in agents:
     modules = set()
 
-    # Check agent's components
-    if hasattr(agent, '_context_components'):
-      for comp_name in agent._context_components:
+    # Concordia exposes a read-only public mapping; do not couple detection to
+    # the entity's private storage layout.
+    get_components = getattr(agent, 'get_all_context_components', None)
+    if callable(get_components):
+      for comp_name in get_components():
         if comp_name in module_indicators:
           modules.add(module_indicators[comp_name])
 

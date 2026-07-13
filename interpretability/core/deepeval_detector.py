@@ -18,12 +18,23 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union
 from enum import Enum
 
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
+from dotenv import load_dotenv as _load_dotenv
 
 logger = logging.getLogger(__name__)
+
+
+def load_deepeval_environment(
+    dotenv_path: Optional[str] = None,
+    *,
+    override: bool = False,
+) -> bool:
+    """Explicitly load evaluator credentials from a dotenv file.
+
+    Importing this module never mutates ``os.environ``. Applications that want
+    dotenv discovery can opt in by calling this function before constructing a
+    detector; already-exported environment variables continue to work normally.
+    """
+    return bool(_load_dotenv(dotenv_path=dotenv_path, override=override))
 
 
 class DeceptionCategory(Enum):

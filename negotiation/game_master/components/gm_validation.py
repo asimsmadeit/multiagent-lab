@@ -15,6 +15,8 @@
 """Negotiation validation and agreement enforcement component."""
 
 import dataclasses
+import datetime
+import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from concordia.typing import entity_component
@@ -47,7 +49,7 @@ class NegotiationValidator(entity_component.ContextComponent):
   This component:
   - Validates offers against predefined rules
   - Ensures BATNA compliance
-  - Checks agreement feasibility
+  - Checks implemented, typed domain feasibility constraints
   - Enforces agreed terms
   - Prevents invalid or impossible agreements
   """
@@ -256,14 +258,55 @@ class NegotiationValidator(entity_component.ContextComponent):
       terms: Dict[str, Any],
       context: Optional[Dict[str, Any]],
   ) -> List[str]:
-    """Check if the agreement is feasible to implement."""
+    """Check only implemented domain constraints; never infer feasibility."""
     issues = []
 
     if self._domain_type == 'contract':
-      # Check timeline feasibility
-      if 'start_date' in terms and 'duration' in terms:
-        # Add domain-specific feasibility checks
-        pass
+      duration = terms.get('duration')
+      try:
+        numeric_duration = float(duration)
+      except (TypeError, ValueError):
+        numeric_duration = float('nan')
+      if not math.isfinite(numeric_duration) or numeric_duration <= 0:
+        issues.append('Contract duration must be a positive finite number')
+      elif numeric_duration > self._constraints['max_duration']:
+        issues.append(
+            'Contract duration exceeds the supported maximum of '
+            f"{self._constraints['max_duration']} months"
+        )
+
+      start_date = terms.get('start_date')
+      parsed_start = None
+      if start_date is not None:
+        try:
+          parsed_start = datetime.date.fromisoformat(str(start_date))
+        except ValueError:
+          issues.append('Contract start_date must use ISO YYYY-MM-DD format')
+
+      if context:
+        available_duration = context.get('available_duration_months')
+        if available_duration is not None:
+          try:
+            numeric_available = float(available_duration)
+          except (TypeError, ValueError):
+            issues.append('available_duration_months must be numeric')
+          else:
+            if not math.isfinite(numeric_available) or numeric_available < 0:
+              issues.append('available_duration_months must be finite and non-negative')
+            elif (
+                math.isfinite(numeric_duration)
+                and numeric_duration > numeric_available
+            ):
+              issues.append('Contract duration exceeds documented availability')
+        earliest_start = context.get('earliest_start_date')
+        if parsed_start is not None and earliest_start is not None:
+          try:
+            parsed_earliest = datetime.date.fromisoformat(str(earliest_start))
+          except ValueError:
+            issues.append('earliest_start_date must use ISO YYYY-MM-DD format')
+          else:
+            if parsed_start < parsed_earliest:
+              issues.append('Contract starts before documented availability')
 
     return issues
 

@@ -21,6 +21,9 @@ Usage:
     python run_confound_controls.py --model meta-llama/Llama-3.1-8B-Instruct --layer 16
 """
 
+# NumPy exposes RandomState at runtime; Pylint cannot infer the lazy namespace.
+# pylint: disable=no-member
+
 import argparse
 import json
 import os
@@ -35,6 +38,13 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+    prefer_safe_activation_path,
+)
 
 
 # ---------- Configuration ----------
@@ -81,46 +91,61 @@ HF_FILES = {
 
 
 def ensure_file(data_dir, scenario_short, model_name="google/gemma-7b-it"):
-    """Return path to .pt file, downloading from HuggingFace if needed."""
+    """Return a safe manifest or configured legacy activation path."""
     short = MODEL_SHORT_NAMES.get(model_name, "")
     full_name = SCENARIO_FULL_NAMES.get(scenario_short, scenario_short)
 
     # 1. Model-specific file: {scenario_full}/activations_{model_short}_{scenario_full}.pt
     if short:
         model_specific = os.path.join(data_dir, full_name, f"activations_{short}_{full_name}.pt")
-        if os.path.exists(model_specific):
-            return model_specific
+        preferred = prefer_safe_activation_path(model_specific)
+        if preferred.exists():
+            return str(preferred)
         # Flat layout
         model_specific_flat = os.path.join(data_dir, f"activations_{short}_{full_name}.pt")
-        if os.path.exists(model_specific_flat):
-            return model_specific_flat
+        preferred = prefer_safe_activation_path(model_specific_flat)
+        if preferred.exists():
+            return str(preferred)
         # Glob for timestamped files: activations_{model}_{scenario}_*_.pt
         import glob
-        pattern = os.path.join(data_dir, full_name, f"activations_{short}_{full_name}_*.pt")
-        matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        patterns = [
+            os.path.join(
+                data_dir, full_name,
+                f"activations_{short}_{full_name}_*.json",
+            ),
+            os.path.join(
+                data_dir, full_name,
+                f"activations_{short}_{full_name}_*.pt",
+            ),
+        ]
+        matches = sorted(
+            (match for pattern in patterns for match in glob.glob(pattern)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
         if matches:
             return matches[0]  # Most recent
 
     # 2. Gemma original paths (backwards compatible)
     if model_name == "google/gemma-7b-it" and scenario_short in GEMMA_FILES:
         local_path = os.path.join(data_dir, GEMMA_FILES[scenario_short])
-        if os.path.exists(local_path):
-            return local_path
+        preferred = prefer_safe_activation_path(local_path)
+        if preferred.exists():
+            return str(preferred)
 
     # 3. Generic merged
     generic = os.path.join(data_dir, full_name, f"activations_merged_{full_name}.pt")
-    if os.path.exists(generic):
-        return generic
+    preferred = prefer_safe_activation_path(generic)
+    if preferred.exists():
+        return str(preferred)
 
     # 4. HuggingFace fallback (Gemma only)
     if model_name == "google/gemma-7b-it" and scenario_short in HF_FILES:
         print(f"  Local file not found, downloading from HuggingFace ({HF_REPO})...")
-        from huggingface_hub import hf_hub_download
-        return hf_hub_download(
-            repo_id=HF_REPO,
-            filename=HF_FILES[scenario_short],
-            repo_type="dataset",
-        )
+        return str(download_activation_input(
+            HF_REPO,
+            HF_FILES[scenario_short],
+        ))
 
     raise FileNotFoundError(
         f"No activation file found for model={model_name}, scenario={scenario_short} in {data_dir}"
@@ -129,9 +154,9 @@ def ensure_file(data_dir, scenario_short, model_name="google/gemma-7b-it"):
 
 # ---------- Helpers ----------
 
-def load_data(path, layer):
-    """Load .pt file and return activations at given layer, labels, metadata."""
-    data = torch.load(path, map_location="cpu", weights_only=False)
+def load_data(path, layer, *, trust_legacy_pt=False):
+    """Load activation data and return one layer, labels, and metadata."""
+    data = load_activation_input(path, trust_legacy_pt=trust_legacy_pt)
 
     # Find the layer key (may be int or str depending on how it was saved)
     acts = data["activations"]
@@ -284,7 +309,7 @@ def residualized_probing(X, gm_labels, round_nums, metadata, seed):
 
 # ---------- Main ----------
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Confound control analyses for deception probes")
     parser.add_argument("--data-dir", default="experiment_results",
                         help="Directory containing scenario subdirectories (default: experiment_results)")
@@ -299,7 +324,8 @@ def main():
     parser.add_argument("--scenarios", type=str, default=None,
                         help="Comma-separated scenario short names to run (e.g. 'UB,AB,IW,CB'). "
                              "Default: all scenarios with available data files.")
-    args = parser.parse_args()
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
 
     # Resolve layer
     layer = args.layer if args.layer is not None else MODEL_DEFAULT_LAYERS.get(args.model, 14)
@@ -346,7 +372,11 @@ def main():
         print(f"{'─' * 70}")
 
         # Load and filter to emergent
-        X_all, gm_all, rounds_all, modes_all, meta_all = load_data(pt_path, layer)
+        X_all, gm_all, rounds_all, modes_all, meta_all = load_data(
+            pt_path,
+            layer,
+            trust_legacy_pt=args.trust_legacy_pt,
+        )
         X, gm, rounds, meta = filter_emergent(X_all, gm_all, rounds_all, modes_all, meta_all)
 
         y = binary_labels(gm)

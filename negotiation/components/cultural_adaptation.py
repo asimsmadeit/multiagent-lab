@@ -8,6 +8,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from concordia.language_model import language_model
 from concordia.typing import entity_component
+from negotiation.components.contracts import (
+    ComponentDiagnosticContract,
+    ModelCallDeclaration,
+    ModelCallDiagnosticsMixin,
+)
 
 
 class CulturalDimension(enum.Enum):
@@ -136,7 +141,10 @@ CULTURAL_PROFILES = {
 }
 
 
-class CulturalAdaptation(entity_component.ContextComponent):
+class CulturalAdaptation(
+    ModelCallDiagnosticsMixin,
+    entity_component.ContextComponent,
+):
     """Component that adapts negotiation style to cultural contexts.
 
     This component:
@@ -145,6 +153,26 @@ class CulturalAdaptation(entity_component.ContextComponent):
     - Provides culturally-appropriate negotiation guidance
     - Tracks cultural dynamics throughout negotiation
     """
+
+    DIAGNOSTIC_CONTRACT = ComponentDiagnosticContract(
+        inputs=('action_spec.call_to_action', 'counterpart observation'),
+        outputs=('cultural profile', 'communication guidance', 'bridge strategies'),
+        state_fields=(
+            'own_culture', 'adaptation_level', 'detect_culture',
+            'detected_culture', 'adaptation_history', 'cultural_bridges',
+        ),
+        extra_model_calls={
+            'pre_act': 0,
+            'post_act': 0,
+            'pre_observe': ModelCallDeclaration(
+                0,
+                1,
+                'one call only for substantial observations when detection is enabled',
+            ),
+            'post_observe': 0,
+        },
+        logging_fields=('detected_culture', 'adaptation_level'),
+    )
 
     def __init__(
         self,
@@ -167,6 +195,7 @@ class CulturalAdaptation(entity_component.ContextComponent):
         if not 0.0 <= adaptation_level <= 1.0:
             raise ValueError('adaptation_level must be between 0 and 1.')
         self._model = model
+        self._own_culture = own_culture
         self._own_profile = CULTURAL_PROFILES[own_culture]
         self._adaptation_level = adaptation_level
         self._detect_culture = detect_culture
@@ -379,8 +408,21 @@ Return only the profile name (e.g., western_business).'''
     def pre_observe(self, observation: str) -> str:
         """Detect cultural cues from observations."""
         # Try to detect culture from substantial communications
-        if len(observation.strip()) >= 20:
+        substantial = len(observation.strip()) >= 20
+        should_detect = substantial and self._detect_culture
+        if should_detect:
             self.detect_cultural_style(observation)
+        branch = (
+            'detect'
+            if should_detect
+            else ('disabled' if not self._detect_culture else 'too_short')
+        )
+        self._record_model_call_branch(
+            'pre_observe',
+            observed_calls=1 if should_detect else 0,
+            expected_calls=1 if should_detect else 0,
+            branch=branch,
+        )
         return ""
 
     def post_observe(self) -> str:
@@ -396,9 +438,25 @@ Return only the profile name (e.g., western_business).'''
         """Component name."""
         return 'CulturalAdaptation'
 
+    def get_own_culture(self) -> str:
+        """Expose the configured participant culture to authorized GM setup."""
+        return self._own_culture
+
+    def get_public_diagnostics(self) -> Dict[str, Any]:
+        """Return configuration and detected counterpart style without internals."""
+        return {
+            'own_culture': self._own_culture,
+            'detected_counterpart_culture': self._detected_culture,
+            'adaptation_level': self._adaptation_level,
+            'detect_culture': self._detect_culture,
+        }
+
     def get_state(self) -> Dict[str, Any]:
         """Get component state."""
         return {
+            'own_culture': self._own_culture,
+            'adaptation_level': self._adaptation_level,
+            'detect_culture': self._detect_culture,
             'detected_culture': self._detected_culture,
             'adaptation_history': [
                 [culture, action]
@@ -417,6 +475,20 @@ Return only the profile name (e.g., western_business).'''
             return
         if not isinstance(state, Mapping):
             raise TypeError('Cultural state must be a mapping or legacy string.')
+        own_culture = str(state.get('own_culture', self._own_culture))
+        if own_culture not in CULTURAL_PROFILES:
+            raise ValueError(f'Unknown culture {own_culture!r}.')
+        adaptation_level = float(
+            state.get('adaptation_level', self._adaptation_level)
+        )
+        if not 0.0 <= adaptation_level <= 1.0:
+            raise ValueError('adaptation_level must be between 0 and 1.')
+        self._own_culture = own_culture
+        self._own_profile = CULTURAL_PROFILES[own_culture]
+        self._adaptation_level = adaptation_level
+        self._detect_culture = bool(
+            state.get('detect_culture', self._detect_culture)
+        )
         culture = state.get('detected_culture')
         self._detected_culture = (
             str(culture) if culture in CULTURAL_PROFILES else None

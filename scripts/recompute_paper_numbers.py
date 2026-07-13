@@ -17,19 +17,27 @@ CPU only. Uses cached HF activations from previous runs.
 
 from __future__ import annotations
 
+# NumPy exposes RandomState at runtime; Pylint cannot infer the lazy namespace.
+# pylint: disable=no-member
+
+import argparse
 import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-from huggingface_hub import hf_hub_download
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+)
 
 HF_REPO = 'sycorpia/multiagent-lab-data'
 ALPHA = 100.0
@@ -77,11 +85,16 @@ def _is_negotiation(md: Dict[str, Any]) -> bool:
     return rn is None or rn >= 0
 
 
-def load_run(key, layer: Optional[int] = None):
+def load_run(
+    key,
+    layer: Optional[int] = None,
+    *,
+    trust_legacy_pt: bool = False,
+):
     path = RUNS[key]
     print(f"  Loading {path}", flush=True)
-    fp = hf_hub_download(HF_REPO, path, repo_type='dataset')
-    data = torch.load(fp, weights_only=False)
+    fp = download_activation_input(HF_REPO, path)
+    data = load_activation_input(fp, trust_legacy_pt=trust_legacy_pt)
     md = data.get('metadata', [])
     labels = data['labels']
     acts = data['activations']
@@ -118,7 +131,7 @@ def mass_mean_direction(X, y_binary):
 # Section 1: Commission/omission cosine similarity matrices
 # ============================================================
 
-def section1_cosine_similarities():
+def section1_cosine_similarities(*, trust_legacy_pt: bool = False):
     print("\n=== Section 1: Cosine similarity matrices (bipolar deception) ===")
     results = {}
     for model in ('gemma7b', 'llama31_8b', 'mistral7b'):
@@ -131,7 +144,7 @@ def section1_cosine_similarities():
                 key = (model, config, scenario)
                 if key not in RUNS:
                     continue
-                d = load_run(key)
+                d = load_run(key, trust_legacy_pt=trust_legacy_pt)
                 X = d['X']
                 y_binary = (d['y'] > 0.5)
                 if y_binary.sum() < 2 or (~y_binary).sum() < 2:
@@ -182,7 +195,7 @@ def section1_cosine_similarities():
 # Section 2: Cross-scenario transfer (LOSO)
 # ============================================================
 
-def section2_cross_scenario_transfer():
+def section2_cross_scenario_transfer(*, trust_legacy_pt: bool = False):
     print("\n=== Section 2: Cross-scenario transfer ===")
     results = {}
     for model in ('gemma7b', 'llama31_8b', 'mistral7b'):
@@ -195,7 +208,7 @@ def section2_cross_scenario_transfer():
                 key = (model, config, sc)
                 if key not in RUNS:
                     continue
-                d = load_run(key)
+                d = load_run(key, trust_legacy_pt=trust_legacy_pt)
                 if d['X'].shape[1] != 4096 and d['X'].shape[1] != 3072:
                     # Layer dim should match; skip if oddly shaped
                     pass
@@ -239,7 +252,7 @@ def section2_cross_scenario_transfer():
 # Section 3: Probe faithfulness — mass-mean ablation
 # ============================================================
 
-def section3_probe_faithfulness():
+def section3_probe_faithfulness(*, trust_legacy_pt: bool = False):
     print("\n=== Section 3: Probe faithfulness (mass-mean ablation) ===")
     targets = [
         ('gemma7b', 'no_tom', 'info_withholding', 'headline'),
@@ -254,7 +267,7 @@ def section3_probe_faithfulness():
         if key not in RUNS:
             continue
         print(f"\n  {model}/{config}/{scenario} ({label})")
-        d = load_run(key)
+        d = load_run(key, trust_legacy_pt=trust_legacy_pt)
         X, y = d['X'], d['y']
         y_binary = (y > 0.5)
         if y_binary.sum() < 2 or (~y_binary).sum() < 2:
@@ -307,7 +320,7 @@ def section3_probe_faithfulness():
 # Section 4: Per-round AUC + bootstrap CIs
 # ============================================================
 
-def section4_per_round_auc():
+def section4_per_round_auc(*, trust_legacy_pt: bool = False):
     print("\n=== Section 4: Per-round AUC + bootstrap CIs ===")
     targets = [
         ('gemma7b', 'no_tom', 'ultimatum_bluff'),
@@ -322,8 +335,8 @@ def section4_per_round_auc():
             continue
         print(f"\n  {model}/{config}/{scenario}")
         path = RUNS[key]
-        fp = hf_hub_download(HF_REPO, path, repo_type='dataset')
-        data = torch.load(fp, weights_only=False)
+        fp = download_activation_input(HF_REPO, path)
+        data = load_activation_input(fp, trust_legacy_pt=trust_legacy_pt)
         md = data.get('metadata', [])
         labels = data['labels']
         acts = data['activations']
@@ -388,10 +401,10 @@ def section4_per_round_auc():
 # Section 5: Baselines (shuffled labels, random features)
 # ============================================================
 
-def section5_baselines():
+def section5_baselines(*, trust_legacy_pt: bool = False):
     print("\n=== Section 5: Baselines (sanity controls) ===")
     target = ('gemma7b', 'no_tom', 'ultimatum_bluff')
-    d = load_run(target)
+    d = load_run(target, trust_legacy_pt=trust_legacy_pt)
     X, y = d['X'], d['y']
     yb = (y > 0.5).astype(int)
 
@@ -460,16 +473,29 @@ def section5_baselines():
     return result
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
     out_dir = Path('experiment_results/paper_numbers')
     out_dir.mkdir(parents=True, exist_ok=True)
 
     all_results = {}
-    all_results['cosine_similarity'] = section1_cosine_similarities()
-    all_results['cross_scenario_transfer'] = section2_cross_scenario_transfer()
-    all_results['probe_faithfulness'] = section3_probe_faithfulness()
-    all_results['per_round_auc'] = section4_per_round_auc()
-    all_results['baselines'] = section5_baselines()
+    all_results['cosine_similarity'] = section1_cosine_similarities(
+        trust_legacy_pt=args.trust_legacy_pt
+    )
+    all_results['cross_scenario_transfer'] = section2_cross_scenario_transfer(
+        trust_legacy_pt=args.trust_legacy_pt
+    )
+    all_results['probe_faithfulness'] = section3_probe_faithfulness(
+        trust_legacy_pt=args.trust_legacy_pt
+    )
+    all_results['per_round_auc'] = section4_per_round_auc(
+        trust_legacy_pt=args.trust_legacy_pt
+    )
+    all_results['baselines'] = section5_baselines(
+        trust_legacy_pt=args.trust_legacy_pt
+    )
 
     out_path = out_dir / 'paper_numbers.json'
     with out_path.open('w') as f:

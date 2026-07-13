@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -10,9 +11,15 @@ import torch
 
 from interpretability.baseline_agents import BasicLLMAgent, create_all_baselines
 from interpretability.core.dataset_builder import ActivationSample, DatasetBuilder
+from interpretability.data import load_activation_dataset
 from interpretability.core.deepeval_detector import DeceptionResult
 from interpretability.core.ground_truth import GroundTruthDetector
-from interpretability.core.qc_filter import classify_response, filter_samples
+from interpretability.core.qc_filter import (
+    QC_VERSION,
+    classify_response,
+    classify_sample_response,
+    filter_samples,
+)
 from interpretability.probes.mech_interp_tools import extract_direction
 from interpretability.probes.sanity_checks import sanity_check_random_labels
 from interpretability.probes.train_probes import (
@@ -43,23 +50,41 @@ from interpretability.scenarios.emergent_prompts import (
 
 
 def test_dataset_builder_handles_empty_sae_maps_and_unknown_scenario(tmp_path):
-    builder = DatasetBuilder()
-    builder.add_sample(ActivationSample(
-        trial_id="trial-1",
-        round_num=0,
-        agent_name="agent",
-        activations={"blocks.2.hook_resid_post": torch.ones(4)},
-        actual_deception=0.0,
-        perceived_deception=0.0,
-        sae_features={},
-    ))
-    path = tmp_path / "dataset.pt"
-    builder.save(str(path))
+    builder = DatasetBuilder(
+        experiment_track="single_agent_white_box",
+        captured_actor_ids=("agent",),
+        capture_modes=("teacher_forced_replay",),
+    )
+    for index in range(3):
+        builder.add_sample(ActivationSample(
+            trial_id=f"trial-{index}",
+            trial_family_id=f"family-{index}",
+            round_num=0,
+            agent_name="agent",
+            activations={"blocks.2.hook_resid_post": torch.ones(4)},
+            actual_deception=0.0,
+            perceived_deception=0.0,
+            sae_features={},
+            sample_type="serialization_fixture",
+            sampling_config={
+                "requested": {"temperature": 0.7},
+                "effective": {"temperature": 0.7},
+                "generation_path": "offline_fixture",
+            },
+        ))
+    path = tmp_path / "dataset.json"
+    manifest_path = builder.save(
+        str(path),
+        model_name="offline-model",
+        model_revision="offline-model@fixture",
+        tokenizer_name="offline-tokenizer",
+        tokenizer_revision="offline-tokenizer@fixture",
+    )
 
-    data = torch.load(path, weights_only=False)
+    data = load_activation_dataset(manifest_path)
     assert data["config"]["has_sae"] is False
     assert "sae_features" not in data
-    assert data["labels"]["scenario"] == ["unknown"]
+    assert data["labels"]["scenario"] == ["unknown"] * 3
 
 
 def test_standard_baseline_factories_share_one_model_contract():
@@ -77,6 +102,72 @@ def test_qc_rejects_non_text_and_unknown_flag_names():
     assert classify_response(float("nan")) == {"too_short"}
     with pytest.raises(ValueError, match="Unknown QC flags"):
         filter_samples([], keep_flags=["typoed_flag"])
+
+
+def test_exact_execution_token_uses_contextual_versioned_qc(tmp_path):
+    assert classify_response("DEFECT") == {"too_short"}
+    assert classify_sample_response(
+        "DEFECT",
+        scenario="promise_break",
+        semantic_phase="execution",
+    ) == set()
+    assert classify_sample_response(
+        "DEFECT",
+        scenario="promise_break",
+        semantic_phase="discussion",
+    ) == {"too_short"}
+    assert classify_sample_response(
+        "I might defect.",
+        scenario="promise_break",
+        semantic_phase="execution",
+    ) == {"too_short"}
+
+    sample = ActivationSample(
+        trial_id="trial-execution",
+        round_num=1,
+        agent_name="agent",
+        activations={"blocks.2.hook_resid_post": torch.ones(4)},
+        actual_deception=1.0,
+        perceived_deception=None,
+        response="DEFECT",
+        scenario_type="promise_break",
+        emergent_scenario="promise_break",
+        semantic_phase="execution",
+        sample_type="negotiation",
+    )
+    assert filter_samples([sample]) == [sample]
+
+    builder = DatasetBuilder(
+        experiment_track="single_agent_white_box",
+        captured_actor_ids=("agent",),
+        capture_modes=("teacher_forced_replay",),
+    )
+    for index in range(3):
+        builder.add_sample(replace(
+            sample,
+            trial_id=f"trial-execution-{index}",
+            trial_family_id=f"family-execution-{index}",
+            sample_type="qc_fixture",
+            experiment_track="single_agent_white_box",
+            sampling_config={
+                "requested": {"temperature": 0.7},
+                "effective": {"temperature": 0.7},
+                "generation_path": "offline_fixture",
+            },
+        ))
+    path = tmp_path / "execution.json"
+    manifest_path = builder.save(
+        str(path),
+        model_name="offline-model",
+        model_revision="offline-model@fixture",
+        tokenizer_name="offline-tokenizer",
+        tokenizer_revision="offline-tokenizer@fixture",
+    )
+    row = load_activation_dataset(manifest_path)["metadata"][0]
+    assert row["semantic_phase"] == "execution"
+    assert row["qc_flags"] == []
+    assert row["qc_status"] == "passed"
+    assert row["qc_version"] == QC_VERSION == "response-qc/2"
 
 
 def test_failed_llm_evaluation_falls_back_to_rule_label():
@@ -104,8 +195,23 @@ def test_instructed_ground_truth_is_consistent_without_observed_promises():
     state = AgentState(10, 10, 10, 10, [], [])
     promise = compute_ground_truth("promise_break", state)
     alliance = compute_ground_truth("alliance_betrayal", state)
-    assert promise.is_deceptive is False and promise.deception_score == 0.0
-    assert alliance.is_deceptive is False and alliance.deception_score == 0.0
+    assert promise.is_deceptive is None and promise.deception_score is None
+    assert alliance.is_deceptive is None and alliance.deception_score is None
+    withholding = compute_ground_truth("info_withholding", state)
+    assert withholding.is_deceptive is None
+    assert withholding.deception_score is None
+
+    state.promises_made = ["cooperate"]
+    still_pending = compute_ground_truth("promise_break", state)
+    assert still_pending.is_deceptive is None
+
+    state.promises_kept = [True]
+    kept = compute_ground_truth("promise_break", state)
+    assert kept.is_deceptive is False and kept.deception_score == 0.0
+
+    state.promises_kept = [False]
+    broken = compute_ground_truth("promise_break", state)
+    assert broken.is_deceptive is True and broken.deception_score == 1.0
 
     state.agent_claimed_honest = False
     withholding = compute_ground_truth("info_withholding", state)
@@ -225,7 +331,8 @@ def test_dyadic_analysis_requires_reciprocal_asymmetric_links():
     X = rng.normal(size=(24, 8))
     y = np.tile([0.0, 1.0], 12)
     one_way = [i + 1 if i % 2 == 0 else None for i in range(24)]
-    result = analyze_dyadic_pairs(X, y, one_way)
+    groups = np.array([f"family-{index // 2}" for index in range(len(y))])
+    result = analyze_dyadic_pairs(X, y, one_way, groups=groups)
     assert result["n_pairs"] == 0
     assert "error" in result
 
@@ -244,7 +351,8 @@ def test_outcome_prediction_excludes_unknown_and_probe_round_rows():
         for _ in range(rows_per_trial)
     ]
     result = analyze_outcome_prediction(X, y, rounds, trials, outcomes)
-    assert result["n_early_samples"] == 18 * 3
+    assert result["n_early_samples"] == 18 * 2
+    assert result["early_round_values"] == [0, 1]
 
 
 def test_random_label_sanity_check_does_not_mutate_numpy_global_rng():

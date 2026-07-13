@@ -1,0 +1,45 @@
+{
+  "experiment_track": "single_agent_white_box",
+  "experiment_name": "offline-contract-smoke",
+  "random_seed": 42,
+  "random_seeds": [42],
+  "use_multi_seed": false,
+  "model": {
+    "name": "google/gemma-2b-it",
+    "device": "cpu",
+    "dtype": "float32",
+    "use_sae": false
+  },
+  "evaluator": {
+    "enabled": true,
+    "model": "google/gemma-2b-it",
+    "max_tokens": 64,
+    "ground_truth_method": "rule"
+  },
+  "scenarios": {
+    "mode": "emergent",
+    "scenarios": ["hidden_value", "info_withholding", "promise_break"],
+    "num_trials": 1,
+    "max_rounds": 2,
+    "agent_modules": ["theory_of_mind"],
+    "protocol": "alternating",
+    "probes": "auto",
+    "counterpart_policies": ["default", "skeptical", "credulous", "informed"],
+    "counterbalance": true,
+    "counterbalance_seed": 0,
+    "surface_variants": [
+      "default",
+      "formal-brief",
+      "compact-brief",
+      "formal-metadata-only"
+    ]
+  },
+  "causal": {
+    "enabled": false
+  },
+  "save_activations": false,
+  "output_dir": "./results/offline-contract-smoke",
+  "checkpoint_dir": "./checkpoints/offline-contract-smoke",
+  "verbose": true,
+  "log_to_file": false
+}

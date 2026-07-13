@@ -34,10 +34,20 @@ Available Modules:
 
 from negotiation import advanced_negotiator
 from negotiation import base_negotiator
+from negotiation import minimal_negotiator
 from negotiation.constants import (
     DEFAULT_MODULE_CONFIGS,
     MODULE_COMPONENT_NAMES,
     ModuleType,
+)
+from negotiation.profiles import AgentProfile, validate_agent_profile
+from negotiation.components.config import (
+    CulturalAdaptationConfig,
+    StrategyEvolutionConfig,
+    SwarmIntelligenceConfig,
+    TemporalStrategyConfig,
+    TheoryOfMindModuleConfig,
+    UncertaintyAwareConfig,
 )
 from config.agents.negotiation import (
     AlgorithmConfig,
@@ -55,6 +65,9 @@ from config.agents.negotiation import (
 # Convenience aliases for common operations
 build_agent = base_negotiator.build_agent
 build_advanced_agent = advanced_negotiator.build_agent
+build_ultrafast_agent = minimal_negotiator.build_agent
+ULTRAFAST_AGENT_PROFILE = minimal_negotiator.AGENT_PROFILE
+ADVANCED_AGENT_PROFILE = advanced_negotiator.AGENT_PROFILE
 
 # Prefab dataclasses for Entity pattern
 BaseNegotiator = base_negotiator.Entity
@@ -64,9 +77,11 @@ __all__ = [
     # Modules
     'base_negotiator',
     'advanced_negotiator',
+    'minimal_negotiator',
     # Builder functions
     'build_agent',
     'build_advanced_agent',
+    'build_ultrafast_agent',
     # Prefab classes
     'BaseNegotiator',
     'AdvancedNegotiator',
@@ -74,6 +89,16 @@ __all__ = [
     'ModuleType',
     'MODULE_COMPONENT_NAMES',
     'DEFAULT_MODULE_CONFIGS',
+    'ULTRAFAST_AGENT_PROFILE',
+    'ADVANCED_AGENT_PROFILE',
+    'AgentProfile',
+    'validate_agent_profile',
+    'CulturalAdaptationConfig',
+    'TemporalStrategyConfig',
+    'SwarmIntelligenceConfig',
+    'UncertaintyAwareConfig',
+    'StrategyEvolutionConfig',
+    'TheoryOfMindModuleConfig',
     # Configuration
     'StrategyConfig',
     'OutcomeConfig',

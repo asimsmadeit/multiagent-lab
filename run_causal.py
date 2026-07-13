@@ -78,6 +78,13 @@ _check_packages()
 import numpy as np
 import torch
 
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+    prefer_safe_activation_path,
+)
+
 # Direct imports — bypass interpretability/__init__.py to avoid heavy deps
 # (concordia_mini, pandas, etc.) that aren't needed for causal validation.
 import importlib.util
@@ -148,41 +155,52 @@ def ensure_activation_file(data_dir: str, scenario: str, model_name: str = "goog
     # 1. Try model-specific file: {scenario}/activations_{model_short}_{scenario}.pt
     if short:
         model_specific = os.path.join(data_dir, scenario, f"activations_{short}_{scenario}.pt")
-        if os.path.exists(model_specific):
-            return model_specific
+        preferred = prefer_safe_activation_path(model_specific)
+        if preferred.exists():
+            return str(preferred)
         # Also try flat layout: {data_dir}/activations_{model_short}_{scenario}.pt
         model_specific_flat = os.path.join(data_dir, f"activations_{short}_{scenario}.pt")
-        if os.path.exists(model_specific_flat):
-            return model_specific_flat
+        preferred = prefer_safe_activation_path(model_specific_flat)
+        if preferred.exists():
+            return str(preferred)
         # Try glob for timestamped files: activations_{model}_{scenario}_*_.pt
         import glob
-        pattern = os.path.join(data_dir, scenario, f"activations_{short}_{scenario}_*.pt")
-        matches = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        patterns = [
+            os.path.join(
+                data_dir, scenario,
+                f"activations_{short}_{scenario}_*.json",
+            ),
+            os.path.join(
+                data_dir, scenario,
+                f"activations_{short}_{scenario}_*.pt",
+            ),
+        ]
+        matches = sorted(
+            (match for pattern in patterns for match in glob.glob(pattern)),
+            key=os.path.getmtime,
+            reverse=True,
+        )
         if matches:
             return matches[0]  # Most recent
 
     # 2. For Gemma, try original hardcoded paths
     if model_name == "google/gemma-7b-it" and scenario in ACTIVATION_FILES:
         local_path = os.path.join(data_dir, ACTIVATION_FILES[scenario])
-        if os.path.exists(local_path):
-            return local_path
+        preferred = prefer_safe_activation_path(local_path)
+        if preferred.exists():
+            return str(preferred)
 
     # 3. Try generic merged file in scenario subdir
     generic_merged = os.path.join(data_dir, scenario, f"activations_merged_{scenario}.pt")
-    if os.path.exists(generic_merged):
-        return generic_merged
+    preferred = prefer_safe_activation_path(generic_merged)
+    if preferred.exists():
+        return str(preferred)
 
     # 4. HuggingFace fallback (only for Gemma originals)
     if model_name == "google/gemma-7b-it" and scenario in HF_FILES:
         print(f"Local file not found for {model_name}/{scenario}")
         print(f"Downloading from HuggingFace ({HF_REPO})...")
-        from huggingface_hub import hf_hub_download
-
-        hf_path = hf_hub_download(
-            repo_id=HF_REPO,
-            filename=HF_FILES[scenario],
-            repo_type="dataset",
-        )
+        hf_path = download_activation_input(HF_REPO, HF_FILES[scenario])
         print(f"Downloaded to cache: {hf_path}")
         return hf_path
 
@@ -196,7 +214,7 @@ def ensure_activation_file(data_dir: str, scenario: str, model_name: str = "goog
     )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run causal validation for deception probes"
     )
@@ -240,7 +258,8 @@ def parse_args():
         default="cuda",
         help="Device for model loading (default: cuda)",
     )
-    return parser.parse_args()
+    add_legacy_trust_argument(parser)
+    return parser.parse_args(argv)
 
 
 def load_model(model_name: str, device: str):
@@ -267,7 +286,14 @@ def load_model(model_name: str, device: str):
     return model
 
 
-def load_activations(data_dir: str, scenario: str, layer: int, model_name: str = "google/gemma-7b-it"):
+def load_activations(
+    data_dir: str,
+    scenario: str,
+    layer: int,
+    model_name: str = "google/gemma-7b-it",
+    *,
+    trust_legacy_pt: bool = False,
+):
     """
     Load activation .pt file and extract activations, labels, and metadata.
 
@@ -279,7 +305,10 @@ def load_activations(data_dir: str, scenario: str, layer: int, model_name: str =
     pt_path = ensure_activation_file(data_dir, scenario, model_name)
     print(f"\nLoading activations from: {pt_path}")
 
-    data = torch.load(pt_path, map_location="cpu", weights_only=False)
+    data = load_activation_input(
+        pt_path,
+        trust_legacy_pt=trust_legacy_pt,
+    )
 
     # ── Extract activations as {int_layer: np.ndarray} ──
     raw_acts = data["activations"]
@@ -484,8 +513,8 @@ def print_summary(results: dict, scenario: str):
         print("     meaningfully used by the model for deceptive behavior.")
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
 
     # Resolve layer default from model if not specified
     if args.layer is None:
@@ -509,7 +538,11 @@ def main():
 
     # ── Step 2: Load activation data from .pt file ──
     activations, labels, metadata = load_activations(
-        args.data_dir, args.scenario, args.layer, args.model
+        args.data_dir,
+        args.scenario,
+        args.layer,
+        args.model,
+        trust_legacy_pt=args.trust_legacy_pt,
     )
 
     # ── Step 3: Filter to emergent-mode samples only ──

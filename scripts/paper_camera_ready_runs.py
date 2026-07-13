@@ -14,6 +14,10 @@ independently so a partial failure does not kill the others.
 
 from __future__ import annotations
 
+# NumPy exposes RandomState at runtime; Pylint cannot infer the lazy namespace.
+# pylint: disable=no-member
+
+import argparse
 import json
 import sys
 import time
@@ -22,13 +26,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-from huggingface_hub import hf_hub_download
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+)
 
 HF_REPO = 'sycorpia/multiagent-lab-data'
 ALPHA = 100.0
@@ -74,17 +82,23 @@ def _is_negotiation(md):
     return rn is None or rn >= 0
 
 
-def load_target(model: str, config: str, scenario: str) -> Optional[Dict[str, Any]]:
+def load_target(
+    model: str,
+    config: str,
+    scenario: str,
+    *,
+    trust_legacy_pt: bool = False,
+) -> Optional[Dict[str, Any]]:
     key = (model, config, scenario)
     if key not in RUNS:
         return None
     path = RUNS[key]
     try:
-        fp = hf_hub_download(HF_REPO, path, repo_type='dataset')
+        fp = download_activation_input(HF_REPO, path)
     except Exception as e:
         print(f"  ERROR loading {path}: {e}")
         return None
-    data = torch.load(fp, weights_only=False)
+    data = load_activation_input(fp, trust_legacy_pt=trust_legacy_pt)
     md = data.get('metadata', [])
     labels = data['labels']
     acts = data['activations']
@@ -151,7 +165,7 @@ def mass_mean_direction(X, y_binary):
 # Section 1: per-layer x per-round probe AUC heatmap
 # ============================================================
 
-def section1_heatmap():
+def section1_heatmap(*, trust_legacy_pt: bool = False):
     print("\n=== Section 1: per-layer x per-round probe AUC ===")
     targets = [
         ('gemma7b', 'tom', 'info_withholding'),
@@ -163,7 +177,12 @@ def section1_heatmap():
     for model, config, scenario in targets:
         tag = f'{model}_{config}_{scenario}'
         print(f"\n  {tag}")
-        d = load_target(model, config, scenario)
+        d = load_target(
+            model,
+            config,
+            scenario,
+            trust_legacy_pt=trust_legacy_pt,
+        )
         if d is None:
             continue
         layers = d['layers']
@@ -242,7 +261,7 @@ def section1_heatmap():
 # Section 2: cross-architecture probe direction transfer
 # ============================================================
 
-def section2_cross_arch_transfer():
+def section2_cross_arch_transfer(*, trust_legacy_pt: bool = False):
     print("\n=== Section 2: cross-architecture probe-direction transfer ===")
     # Best layer per (model, config) — from earlier audit
     best_layers = {
@@ -255,7 +274,12 @@ def section2_cross_arch_transfer():
     scenario = 'info_withholding'
     sources = []
     for (model, config), layer in best_layers.items():
-        d = load_target(model, config, scenario)
+        d = load_target(
+            model,
+            config,
+            scenario,
+            trust_legacy_pt=trust_legacy_pt,
+        )
         if d is None:
             continue
         if layer not in d['layers']:
@@ -310,14 +334,23 @@ def section2_cross_arch_transfer():
 # Section 3: bootstrap 95% CIs on every headline AUC
 # ============================================================
 
-def section3_bootstrap_cis(n_boot: int = 500):
+def section3_bootstrap_cis(
+    n_boot: int = 500,
+    *,
+    trust_legacy_pt: bool = False,
+):
     print(f"\n=== Section 3: bootstrap 95% CIs (n_boot={n_boot}) ===")
     results = {}
     targets = list(RUNS.keys())
     for i, (model, config, scenario) in enumerate(targets):
         tag = f'{model}_{config}_{scenario}'
         print(f"\n  [{i+1}/{len(targets)}] {tag}")
-        d = load_target(model, config, scenario)
+        d = load_target(
+            model,
+            config,
+            scenario,
+            trust_legacy_pt=trust_legacy_pt,
+        )
         if d is None:
             continue
         # Best layer = highest AUC at full-data probe
@@ -368,7 +401,7 @@ def section3_bootstrap_cis(n_boot: int = 500):
 # Section 4: Gram-Schmidt orthogonalized TTPD
 # ============================================================
 
-def section4_ttpd_orthogonalized():
+def section4_ttpd_orthogonalized(*, trust_legacy_pt: bool = False):
     print("\n=== Section 4: Gram-Schmidt orthogonalized TTPD decomposition ===")
     COMMISSION = ('ultimatum_bluff', 'alliance_betrayal')
     OMISSION = ('info_withholding',)
@@ -382,7 +415,12 @@ def section4_ttpd_orthogonalized():
         print(f"\n  {tag}")
         directions = {}
         for scenario in ('ultimatum_bluff', 'alliance_betrayal', 'info_withholding'):
-            d = load_target(model, config, scenario)
+            d = load_target(
+                model,
+                config,
+                scenario,
+                trust_legacy_pt=trust_legacy_pt,
+            )
             if d is None:
                 continue
             layer = 14 if 14 in d['layers'] else sorted(d['layers'])[len(d['layers']) // 2]
@@ -395,8 +433,11 @@ def section4_ttpd_orthogonalized():
             # Try instructed if labels distinguish modes
             full_path = RUNS[(model, config, scenario)]
             try:
-                fp = hf_hub_download(HF_REPO, full_path, repo_type='dataset')
-                data_full = torch.load(fp, weights_only=False)
+                fp = download_activation_input(HF_REPO, full_path)
+                data_full = load_activation_input(
+                    fp,
+                    trust_legacy_pt=trust_legacy_pt,
+                )
                 ml = data_full['labels'].get('mode_labels')
                 md = data_full.get('metadata', [])
                 if ml is not None:
@@ -495,7 +536,10 @@ def section4_ttpd_orthogonalized():
     return results
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
     overall_start = time.time()
     sections = [
         ('section1_heatmap', section1_heatmap),
@@ -507,7 +551,7 @@ def main():
     for name, fn in sections:
         t0 = time.time()
         try:
-            summary[name] = fn()
+            summary[name] = fn(trust_legacy_pt=args.trust_legacy_pt)
             summary[f'{name}_wall_time_sec'] = time.time() - t0
         except Exception as e:
             print(f"\nERROR in {name}: {type(e).__name__}: {e}")

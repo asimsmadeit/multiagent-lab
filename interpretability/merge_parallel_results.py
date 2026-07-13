@@ -1,425 +1,354 @@
 #!/usr/bin/env python3
-"""
-Merge activation files from parallel GPU execution.
+"""Merge aligned activation pods into one safe JSON+NPZ dataset."""
 
-This utility combines results from multiple pods that ran the same experiment
-in parallel, producing a single merged dataset for probe training.
-
-Usage:
-    python merge_parallel_results.py pod1.pt pod2.pt pod3.pt -o merged.pt
-
-    # Or from run_deception_experiment.py:
-    python run_deception_experiment.py --merge-pods pod1.pt pod2.pt pod3.pt
-"""
+from __future__ import annotations
 
 import argparse
-import torch
-import numpy as np
-from pathlib import Path
+import copy
 from datetime import datetime
-from typing import List, Dict, Any, Optional
-from collections import defaultdict
+import json
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+import torch
+
+from interpretability.core.dataset_builder import _build_split_projection
+from interpretability.data import load_activation_dataset, save_activation_dataset
+
+
+def _canonical_json(value: Mapping[str, Any]) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def _validate_alignment(data: Mapping[str, Any], source: str) -> int:
+    activations = data.get("activations")
+    labels = data.get("labels")
+    metadata = data.get("metadata")
+    config = data.get("config")
+    if not isinstance(activations, Mapping) or not activations:
+        raise ValueError(f"{source}: activation layers are missing")
+    if not isinstance(labels, Mapping) or not isinstance(
+        labels.get("gm_labels"), list
+    ):
+        raise ValueError(f"{source}: labels.gm_labels is missing")
+    if not isinstance(metadata, list) or not isinstance(config, Mapping):
+        raise ValueError(f"{source}: metadata/config is missing")
+    n_samples = len(labels["gm_labels"])
+    if n_samples < 1 or len(metadata) != n_samples:
+        raise ValueError(f"{source}: metadata is not sample-aligned")
+    for name, values in labels.items():
+        if not isinstance(values, list) or len(values) != n_samples:
+            raise ValueError(f"{source}: label {name!r} is not sample-aligned")
+    for layer, tensor in activations.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{source}: layer {layer!r} is not a tensor")
+        if tensor.ndim != 2 or tensor.shape[0] != n_samples:
+            raise ValueError(f"{source}: layer {layer!r} is not sample-aligned")
+        if not bool(torch.isfinite(tensor.float()).all()):
+            raise ValueError(f"{source}: layer {layer!r} contains non-finite values")
+    return n_samples
+
+
+def _config_identity(config: Mapping[str, Any]) -> dict[str, Any]:
+    identity = copy.deepcopy(dict(config))
+    for key in (
+        "dataset_hash",
+        "n_samples",
+        "schema_registry_checksum",
+        "split_manifest_id",
+    ):
+        identity.pop(key, None)
+    provenance = identity.get("provenance")
+    if isinstance(provenance, dict):
+        provenance.pop("sampling_configs", None)
+    return identity
+
+
+def _merge_canonical_records(
+    datasets: Sequence[Mapping[str, Any]],
+    *,
+    collection: str,
+    id_key: str,
+) -> list[dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    encoded_by_id: dict[str, str] = {}
+    for data in datasets:
+        records = data.get(collection, [])
+        if not isinstance(records, list):
+            raise TypeError(f"{collection} must be a list")
+        for record in records:
+            if not isinstance(record, Mapping):
+                raise TypeError(f"{collection} entries must be mappings")
+            identity = record.get(id_key)
+            if not isinstance(identity, str) or not identity:
+                raise ValueError(f"{collection} entries require {id_key}")
+            payload = copy.deepcopy(dict(record))
+            encoded = _canonical_json(payload)
+            if identity in encoded_by_id and encoded_by_id[identity] != encoded:
+                raise ValueError(
+                    f"conflicting duplicate canonical ID {identity!r} in {collection}"
+                )
+            encoded_by_id[identity] = encoded
+            by_id.setdefault(identity, payload)
+    return [by_id[identity] for identity in sorted(by_id)]
+
+
+def _merge_sampling_configs(datasets: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    by_encoding: dict[str, dict[str, Any]] = {}
+    for data in datasets:
+        configs = data["config"]["provenance"]["sampling_configs"]
+        for config in configs:
+            payload = copy.deepcopy(dict(config))
+            by_encoding.setdefault(_canonical_json(payload), payload)
+    return [by_encoding[key] for key in sorted(by_encoding)]
 
 
 def merge_parallel_activations(
-    pod_files: List[str],
-    output_dir: str = None,
-    timestamp: str = None,
+    pod_files: Sequence[str],
+    output_dir: str | None = None,
+    timestamp: str | None = None,
     verbose: bool = True,
+    trusted_legacy: bool = False,
 ) -> str:
-    """
-    Merge activation files from parallel pods.
-
-    Handles:
-    1. Concatenate activation tensors per layer
-    2. Merge all label arrays maintaining alignment
-    3. Remap counterpart_idxs to global indices
-    4. Preserve and merge metadata
-    5. Validate alignment across all arrays
-
-    Args:
-        pod_files: List of paths to pod activation files (.pt)
-        output_dir: Directory for output file (default: same as first pod file)
-        timestamp: Session timestamp for output filename
-        verbose: Print progress information
-
-    Returns:
-        Path to merged output file
-    """
+    """Merge pods without weakening provenance, lineage, or SAE validation."""
     if not pod_files:
         raise ValueError("No pod files provided")
+    sources = sorted(map(str, pod_files))
+    datasets = [
+        load_activation_dataset(path, trusted_legacy=trusted_legacy)
+        for path in sources
+    ]
+    sample_counts = [
+        _validate_alignment(data, source)
+        for data, source in zip(datasets, sources)
+    ]
+    first = datasets[0]
+    expected_layers = list(first["activations"])
+    expected_labels = set(first["labels"])
+    expected_config = _config_identity(first["config"])
+    expected_sae = bool(first["config"].get("has_sae"))
+    for data, source in zip(datasets[1:], sources[1:]):
+        if list(data["activations"]) != expected_layers:
+            raise ValueError(f"{source}: activation layer order/identity differs")
+        if set(data["labels"]) != expected_labels:
+            raise ValueError(f"{source}: label schema differs")
+        if _config_identity(data["config"]) != expected_config:
+            raise ValueError(f"{source}: dataset provenance/config is incompatible")
+        if bool(data["config"].get("has_sae")) != expected_sae:
+            raise ValueError(f"{source}: SAE presence differs")
 
-    # Sort files to ensure consistent ordering
-    pod_files = sorted(pod_files)
+    activations: dict[Any, torch.Tensor] = {}
+    for layer in expected_layers:
+        tensors = [data["activations"][layer] for data in datasets]
+        reference = tensors[0]
+        if any(
+            tensor.dtype != reference.dtype
+            or tensor.shape[1:] != reference.shape[1:]
+            for tensor in tensors[1:]
+        ):
+            raise ValueError(f"activation dtype/shape differs at layer {layer!r}")
+        activations[layer] = torch.cat(tensors, dim=0)
 
-    if verbose:
-        print(f"\n{'='*60}")
-        print("MERGING PARALLEL POD RESULTS")
-        print(f"{'='*60}")
-        print(f"Input files: {len(pod_files)}")
-        for f in pod_files:
-            print(f"  - {f}")
+    labels = {
+        name: [item for data in datasets for item in data["labels"][name]]
+        for name in first["labels"]
+        if name not in {"split_partitions", "connected_group_ids"}
+    }
+    metadata = [
+        copy.deepcopy(row)
+        for data in datasets
+        for row in data["metadata"]
+    ]
 
-    # Initialize containers
-    all_activations: Dict[Any, List[torch.Tensor]] = defaultdict(list)
-    all_labels: Dict[str, List] = defaultdict(list)
-    all_metadata: List[Dict] = []
-    all_sae_features: List[torch.Tensor] = []
-    all_sae_top_features: List[List] = []
-    all_sae_available_mask: List[bool] = []
-
-    # Track sample offsets for counterpart index remapping
-    sample_offset = 0
-    counterpart_remap: Dict[tuple, int] = {}  # (source_idx, local_idx) -> global_idx
-
-    # Collect pod info for validation
-    pod_infos = []
-    total_samples = 0
-    source_indices: List[int] = []
-    expected_label_keys = None
-    expected_layer_keys = None
-    metadata_presence = None
-    sae_presence = None
-
-    for source_idx, pod_file in enumerate(pod_files):
-        if verbose:
-            print(f"\nLoading: {pod_file}")
-
-        # Load pod data
-        data = torch.load(pod_file, weights_only=False)
-
-        # Extract pod info
-        pod_info = data.get('pod_info', {
-            'pod_id': 0,
-            'trial_id_offset': 0,
-            'n_samples': len(data['labels']['gm_labels']),
-        })
-        pod_infos.append(pod_info)
-
-        n_samples = len(data['labels']['gm_labels'])
-        pod_id = pod_info.get('pod_id', 0)
-
-        label_keys = set(data['labels'])
-        layer_keys = set(data['activations'])
-        has_metadata = 'metadata' in data
-        has_sae = data.get('sae_features') is not None
-        if expected_label_keys is None:
-            expected_label_keys = label_keys
-            expected_layer_keys = layer_keys
-            metadata_presence = has_metadata
-            sae_presence = has_sae
-        if label_keys != expected_label_keys:
-            raise ValueError(
-                f"Label keys differ in {pod_file}: {sorted(label_keys)} != "
-                f"{sorted(expected_label_keys)}"
-            )
-        if layer_keys != expected_layer_keys:
-            raise ValueError(
-                f"Activation layers differ in {pod_file}: {sorted(layer_keys, key=str)} != "
-                f"{sorted(expected_layer_keys, key=str)}"
-            )
-        if has_metadata != metadata_presence:
-            raise ValueError("All pod files must consistently include metadata")
-        if has_sae != sae_presence:
-            raise ValueError("All pod files must consistently include SAE features")
-
-        for key, values in data['labels'].items():
-            if len(values) != n_samples:
-                raise ValueError(
-                    f"{pod_file}: label '{key}' has {len(values)} rows, "
-                    f"expected {n_samples}"
-                )
-        for layer, tensor in data['activations'].items():
-            if tensor.shape[0] != n_samples:
-                raise ValueError(
-                    f"{pod_file}: layer {layer} has {tensor.shape[0]} rows, "
-                    f"expected {n_samples}"
-                )
-        if has_metadata and len(data['metadata']) != n_samples:
-            raise ValueError(
-                f"{pod_file}: metadata has {len(data['metadata'])} rows, "
-                f"expected {n_samples}"
-            )
-        if has_sae and data['sae_features'].shape[0] != n_samples:
-            raise ValueError(
-                f"{pod_file}: SAE features have {data['sae_features'].shape[0]} "
-                f"rows, expected {n_samples}"
-            )
-
-        if verbose:
-            print(f"  Pod ID: {pod_id}")
-            print(f"  Samples: {n_samples}")
-            print(f"  Trial offset: {pod_info.get('trial_id_offset', 0)}")
-
-        # Build counterpart remap table for this pod
-        # Maps (pod_id, local_sample_idx) -> global_sample_idx
-        for local_idx in range(n_samples):
-            global_idx = sample_offset + local_idx
-            counterpart_remap[(source_idx, local_idx)] = global_idx
-        source_indices.extend([source_idx] * n_samples)
-
-        # Merge activations (concatenate along sample dimension)
-        for layer, tensor in data['activations'].items():
-            all_activations[layer].append(tensor)
-
-        # Merge labels (simple concatenation, order preserved)
-        for key, values in data['labels'].items():
-            if isinstance(values, list):
-                all_labels[key].extend(values)
-            elif isinstance(values, np.ndarray):
-                all_labels[key].extend(values.tolist())
-            elif hasattr(values, 'tolist'):
-                all_labels[key].extend(values.tolist())
-            else:
-                raise TypeError(
-                    f"Unsupported label container for '{key}': {type(values).__name__}"
-                )
-
-        # Merge metadata
-        if 'metadata' in data:
-            all_metadata.extend(data['metadata'])
-
-        # Merge SAE features if present
-        if 'sae_features' in data and data['sae_features'] is not None:
-            all_sae_features.append(data['sae_features'])
-        if 'sae_top_features' in data and data['sae_top_features'] is not None:
-            if len(data['sae_top_features']) != n_samples:
-                raise ValueError(
-                    f"{pod_file}: sae_top_features has "
-                    f"{len(data['sae_top_features'])} rows, expected {n_samples}"
-                )
-            all_sae_top_features.extend(data['sae_top_features'])
-        if has_sae:
-            available_mask = data.get('sae_available_mask', [True] * n_samples)
-            if len(available_mask) != n_samples:
-                raise ValueError(
-                    f"{pod_file}: sae_available_mask has {len(available_mask)} "
-                    f"rows, expected {n_samples}"
-                )
-            all_sae_available_mask.extend(bool(v) for v in available_mask)
-
-        # Update offset for next pod
-        sample_offset += n_samples
-        total_samples += n_samples
-
-    if verbose:
-        print(f"\nTotal samples after merge: {total_samples}")
-
-    # Stack activations per layer
-    merged_activations = {}
-    for layer, tensors in all_activations.items():
-        merged_activations[layer] = torch.cat(tensors, dim=0)
-        if verbose:
-            print(f"  Layer {layer}: {merged_activations[layer].shape}")
-
-    # Remap counterpart_idxs to global indices
-    if 'counterpart_idxs' in all_labels:
-        original_idxs = all_labels['counterpart_idxs']
-
-        remapped_idxs = []
-        for source_idx, local_idx in zip(source_indices, original_idxs):
-            if local_idx is None:
-                remapped_idxs.append(None)
-            else:
-                # Namespace local indices by source file. Declared pod IDs are
-                # not guaranteed unique (legacy files often all used pod_id=0).
-                global_idx = counterpart_remap.get((source_idx, int(local_idx)))
-                if global_idx is not None:
-                    remapped_idxs.append(global_idx)
+    offsets = np.cumsum([0, *sample_counts[:-1]]).tolist()
+    if "counterpart_idxs" in labels:
+        remapped: list[int | None] = []
+        cursor = 0
+        for source_index, (count, offset) in enumerate(zip(sample_counts, offsets)):
+            source_values = datasets[source_index]["labels"]["counterpart_idxs"]
+            for local_index in source_values:
+                if local_index is None:
+                    remapped.append(None)
+                elif type(local_index) is not int or not 0 <= local_index < count:
+                    raise ValueError("counterpart index is outside its source pod")
                 else:
-                    # Counterpart from different pod - mark as cross-pod
-                    # This happens when pods run different trials
-                    remapped_idxs.append(None)  # Can't link across pods
+                    remapped.append(offset + local_index)
+                cursor += 1
+        labels["counterpart_idxs"] = remapped
+        for row, counterpart_idx in zip(metadata, remapped):
+            row["counterpart_idx"] = counterpart_idx
 
-        all_labels['counterpart_idxs'] = remapped_idxs
-        if len(all_metadata) == total_samples:
-            for row, counterpart_idx in zip(all_metadata, remapped_idxs):
-                row['counterpart_idx'] = counterpart_idx
+    split_seed = first["config"].get("split_seed")
+    split_manifest, partitions, connected_groups = _build_split_projection(
+        metadata,
+        split_seed=split_seed,
+        supplied_manifest=None,
+    )
+    labels["split_partitions"] = partitions
+    labels["connected_group_ids"] = connected_groups
 
-        # Count how many cross-pod references were lost
-        n_lost = sum(1 for orig, new in zip(original_idxs, remapped_idxs)
-                     if orig is not None and new is None)
-        if n_lost > 0 and verbose:
-            print(f"  Warning: {n_lost} cross-pod counterpart references could not be remapped")
-
-    # Validate alignment
-    n_labels = len(all_labels.get('gm_labels', []))
-    for key, values in all_labels.items():
-        if len(values) != n_labels:
-            raise ValueError(f"Label array '{key}' has {len(values)} items, expected {n_labels}")
-
-    for layer, tensor in merged_activations.items():
-        if tensor.shape[0] != n_labels:
-            raise ValueError(f"Activation layer {layer} has {tensor.shape[0]} samples, expected {n_labels}")
-
-    if verbose:
-        print(f"\nValidation passed: all arrays aligned with {n_labels} samples")
-
-    # Build merged dataset
-    merged = {
-        'activations': merged_activations,
-        'labels': dict(all_labels),
-        'config': {
-            'model': 'merged',
-            'layers': list(merged_activations.keys()),
-            'n_samples': total_samples,
-            'has_sae': len(all_sae_features) > 0,
+    config = copy.deepcopy(dict(first["config"]))
+    config.pop("dataset_hash", None)
+    config.pop("schema_registry_checksum", None)
+    config["n_samples"] = sum(sample_counts)
+    config["split_manifest_id"] = split_manifest["manifest_id"]
+    config["provenance"]["sampling_configs"] = _merge_sampling_configs(datasets)
+    merged: dict[str, Any] = {
+        "activations": activations,
+        "labels": labels,
+        "config": config,
+        "metadata": metadata,
+        "generation_records": _merge_canonical_records(
+            datasets, collection="generation_records", id_key="call_id"
+        ),
+        "interaction_events": _merge_canonical_records(
+            datasets, collection="interaction_events", id_key="event_id"
+        ),
+        "label_records": _merge_canonical_records(
+            datasets, collection="label_records", id_key="label_id"
+        ),
+        "intervention_designs": _merge_canonical_records(
+            datasets, collection="intervention_designs", id_key="design_id"
+        ),
+        "intervention_schedules": _merge_canonical_records(
+            datasets, collection="intervention_schedules", id_key="schedule_id"
+        ),
+        "intervention_application_logs": _merge_canonical_records(
+            datasets,
+            collection="intervention_application_logs",
+            id_key="log_id",
+        ),
+        "split_manifest": split_manifest,
+        "pod_info": {
+            "pod_id": "merged",
+            "n_samples": sum(sample_counts),
         },
-        'metadata': all_metadata,
-        'merge_info': {
-            'source_files': [str(f) for f in pod_files],
-            'n_pods': len(pod_files),
-            'pod_infos': pod_infos,
-            'total_samples': total_samples,
-            'merged_at': timestamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "merge_info": {
+            "source_files": sources,
+            "source_dataset_hashes": [
+                data.get("config", {}).get("dataset_hash") for data in datasets
+            ],
+            "n_pods": len(datasets),
+            "pod_infos": [copy.deepcopy(data.get("pod_info", {})) for data in datasets],
+            "total_samples": sum(sample_counts),
+            "merged_at": timestamp or datetime.now().strftime("%Y%m%d_%H%M%S"),
         },
     }
 
-    # Add merged SAE features if available
-    if all_sae_features:
-        try:
-            sae_dims = {tensor.shape[1:] for tensor in all_sae_features}
-            if len(sae_dims) != 1:
-                raise ValueError(f"SAE feature shapes differ: {sae_dims}")
-            merged['sae_features'] = torch.cat(all_sae_features, dim=0)
-            merged['sae_top_features'] = all_sae_top_features
-            merged['sae_available_mask'] = all_sae_available_mask
-            if verbose:
-                print(f"  SAE features merged: {merged['sae_features'].shape}")
-        except Exception as e:
-            print(f"  Warning: Could not merge SAE features: {e}")
+    if expected_sae:
+        sae_tensors = [data.get("sae_features") for data in datasets]
+        if any(not isinstance(tensor, torch.Tensor) for tensor in sae_tensors):
+            raise ValueError("every SAE-enabled pod must contain SAE features")
+        reference = sae_tensors[0]
+        if any(
+            tensor.dtype != reference.dtype
+            or tensor.shape[1:] != reference.shape[1:]
+            for tensor in sae_tensors[1:]
+        ):
+            raise ValueError("SAE feature dtype/shape differs across pods")
+        merged["sae_features"] = torch.cat(sae_tensors, dim=0)
+        merged["sae_top_features"] = [
+            list(row)
+            for data in datasets
+            for row in data.get("sae_top_features", [])
+        ]
+        merged["sae_available_mask"] = [
+            value
+            for data in datasets
+            for value in data.get("sae_available_mask", [])
+        ]
+        if len(merged["sae_top_features"]) != config["n_samples"] or len(
+            merged["sae_available_mask"]
+        ) != config["n_samples"]:
+            raise ValueError("SAE metadata is not sample-aligned after merge")
 
-    # Determine output path
-    if output_dir is None:
-        output_dir = Path(pod_files[0]).parent
-    else:
-        output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    destination = Path(output_dir) if output_dir else Path(sources[0]).parent
+    destination.mkdir(parents=True, exist_ok=True)
     ts = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = output_dir / f"activations_merged_{ts}.pt"
-
-    # Save merged dataset
-    torch.save(merged, output_path)
-
+    saved = save_activation_dataset(destination / f"activations_merged_{ts}.json", merged)
+    output_path = saved[1]
     if verbose:
-        print(f"\nMerged dataset saved to: {output_path}")
-        print(f"{'='*60}\n")
-
+        print(
+            f"Merged {len(datasets)} pods / {config['n_samples']} samples "
+            f"to {output_path}"
+        )
     return str(output_path)
 
 
-def validate_merge(merged_path: str, verbose: bool = True) -> Dict[str, Any]:
-    """
-    Validate a merged dataset for consistency.
-
-    Args:
-        merged_path: Path to merged .pt file
-        verbose: Print validation results
-
-    Returns:
-        Dict with validation results
-    """
-    data = torch.load(merged_path, weights_only=False)
-
-    results = {
-        'valid': True,
-        'errors': [],
-        'warnings': [],
-        'stats': {},
+def validate_merge(
+    merged_path: str,
+    verbose: bool = True,
+    *,
+    trusted_legacy: bool = False,
+) -> dict[str, Any]:
+    """Load and validate an existing merged artifact."""
+    data = load_activation_dataset(
+        merged_path,
+        trusted_legacy=trusted_legacy,
+    )
+    n_samples = _validate_alignment(data, merged_path)
+    finite_labels = [
+        float(value)
+        for value in data["labels"]["gm_labels"]
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and np.isfinite(value)
+    ]
+    result = {
+        "valid": True,
+        "errors": [],
+        "warnings": [],
+        "stats": {
+            "n_samples": n_samples,
+            "n_pods": data.get("merge_info", {}).get("n_pods", 1),
+            "layers": list(data["activations"]),
+            "deception_rate": (
+                float(np.mean(np.asarray(finite_labels) > 0.5))
+                if finite_labels
+                else None
+            ),
+        },
     }
-
-    n_samples = data['config']['n_samples']
-    results['stats']['n_samples'] = n_samples
-    results['stats']['n_pods'] = data.get('merge_info', {}).get('n_pods', 1)
-    results['stats']['layers'] = list(data['activations'].keys())
-
-    # Check activation shapes
-    for layer, tensor in data['activations'].items():
-        if tensor.shape[0] != n_samples:
-            results['errors'].append(f"Layer {layer} has {tensor.shape[0]} samples, expected {n_samples}")
-            results['valid'] = False
-
-    # Check label array lengths
-    for key, values in data['labels'].items():
-        if len(values) != n_samples:
-            results['errors'].append(f"Label '{key}' has {len(values)} items, expected {n_samples}")
-            results['valid'] = False
-
-    # Check for label balance
-    gm_labels = data['labels'].get('gm_labels', [])
-    if gm_labels:
-        deception_rate = np.mean([l > 0.5 for l in gm_labels])
-        results['stats']['deception_rate'] = deception_rate
-        if deception_rate < 0.05 or deception_rate > 0.95:
-            results['warnings'].append(f"Extreme deception rate: {deception_rate:.1%}")
-
-    # Check mode distribution
-    mode_labels = data['labels'].get('mode_labels', [])
-    if mode_labels:
-        mode_counts = {}
-        for m in mode_labels:
-            mode_counts[m] = mode_counts.get(m, 0) + 1
-        results['stats']['mode_distribution'] = mode_counts
-
     if verbose:
-        print(f"\nValidation results for: {merged_path}")
-        print(f"  Valid: {results['valid']}")
-        print(f"  Samples: {results['stats']['n_samples']}")
-        print(f"  Pods merged: {results['stats']['n_pods']}")
-        print(f"  Layers: {results['stats']['layers']}")
-        if 'deception_rate' in results['stats']:
-            print(f"  Deception rate: {results['stats']['deception_rate']:.1%}")
-        if results['errors']:
-            print(f"  Errors: {results['errors']}")
-        if results['warnings']:
-            print(f"  Warnings: {results['warnings']}")
-
-    return results
+        print(f"Validated {merged_path}: {n_samples} aligned samples")
+    return result
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Merge activation files from parallel GPU execution"
+        description="Merge safe activation datasets from parallel execution"
     )
+    parser.add_argument("pod_files", nargs="+", help="Safe .json or legacy .pt files")
+    parser.add_argument("-o", "--output-dir", default=None)
+    parser.add_argument("--timestamp", default=None)
+    parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument("-q", "--quiet", action="store_true")
     parser.add_argument(
-        'pod_files',
-        nargs='+',
-        help="Paths to pod activation files (.pt)"
+        "--trust-legacy-pt",
+        action="store_true",
+        help="Allow pickle-capable .pt loading only for reviewed inputs",
     )
-    parser.add_argument(
-        '-o', '--output-dir',
-        type=str,
-        default=None,
-        help="Output directory (default: same as first input file)"
-    )
-    parser.add_argument(
-        '--timestamp',
-        type=str,
-        default=None,
-        help="Timestamp for output filename"
-    )
-    parser.add_argument(
-        '--validate-only',
-        action='store_true',
-        help="Only validate an existing merged file (first arg)"
-    )
-    parser.add_argument(
-        '-q', '--quiet',
-        action='store_true',
-        help="Suppress progress output"
-    )
-
     args = parser.parse_args()
-
     if args.validate_only:
-        validate_merge(args.pod_files[0], verbose=not args.quiet)
+        validate_merge(
+            args.pod_files[0],
+            verbose=not args.quiet,
+            trusted_legacy=args.trust_legacy_pt,
+        )
     else:
         output_path = merge_parallel_activations(
             args.pod_files,
             output_dir=args.output_dir,
             timestamp=args.timestamp,
             verbose=not args.quiet,
+            trusted_legacy=args.trust_legacy_pt,
         )
         print(f"Output: {output_path}")
 

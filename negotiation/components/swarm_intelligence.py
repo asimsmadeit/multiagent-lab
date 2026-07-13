@@ -11,6 +11,11 @@ from concordia.typing import entity as entity_lib
 from negotiation.utils.parsing import (
     parse_structured_response,
 )
+from negotiation.components.contracts import (
+    ComponentDiagnosticContract,
+    ModelCallDeclaration,
+    ModelCallDiagnosticsMixin,
+)
 
 
 @dataclasses.dataclass
@@ -34,6 +39,10 @@ class CollectiveDecision:
     dissenting_agents: List[str]
     compromise_elements: List[str]
     implementation_notes: str
+    consensus_reached: bool = False
+    iterations_used: int = 0
+    consensus_threshold: float = 0.7
+    support_ratio: float = 0.0
 
 
 class SubAgent(ABC):
@@ -271,8 +280,31 @@ OPPORTUNITIES: [List partnership opportunities]"""
         return parse_structured_response(response)
 
 
-class SwarmIntelligence(entity_component.ContextComponent):
+class SwarmIntelligence(
+    ModelCallDiagnosticsMixin,
+    entity_component.ContextComponent,
+):
     """Component for collective intelligence through specialized sub-agents."""
+
+    DIAGNOSTIC_CONTRACT = ComponentDiagnosticContract(
+        inputs=('action_spec.call_to_action', 'action attempt'),
+        outputs=('sub-agent analyses', 'collective decision', 'guidance'),
+        state_fields=(
+            'consensus_threshold', 'max_iterations', 'sub_agents',
+            'last_analyses', 'decision_history',
+        ),
+        extra_model_calls={
+            'pre_act': ModelCallDeclaration(
+                0,
+                4,
+                'exactly one call per enabled specialized sub-agent',
+            ),
+            'post_act': 0,
+            'pre_observe': 0,
+            'post_observe': 0,
+        },
+        logging_fields=('supporting_agents', 'dissenting_agents', 'confidence'),
+    )
 
     def __init__(
         self,
@@ -374,48 +406,82 @@ class SwarmIntelligence(entity_component.ContextComponent):
 
         return weights
 
-    def _build_collective_decision(self, analyses: Dict[str, SubAgentAnalysis], weights: Dict[str, float]) -> CollectiveDecision:
-        """Build collective decision from individual analyses."""
-        # Collect all recommendations
-        all_recommendations = []
-        for analysis in analyses.values():
-            all_recommendations.extend(analysis.recommendations)
-
-        # Score recommendations based on weighted support
-        rec_scores = {}
+    def _build_collective_decision(
+        self,
+        analyses: Dict[str, SubAgentAnalysis],
+        weights: Dict[str, float],
+    ) -> CollectiveDecision:
+        """Build a bounded consensus from weighted recommendation support."""
+        rec_scores: Dict[str, float] = {}
+        display_text: Dict[str, str] = {}
+        recommendations_by_agent: Dict[str, set[str]] = {}
         for agent_type, analysis in analyses.items():
             weight = weights.get(agent_type, 0.0)
             confidence = analysis.confidence
             combined_weight = weight * confidence
+            normalized = {
+                ' '.join(recommendation.split()).casefold()
+                for recommendation in analysis.recommendations
+                if recommendation.strip()
+            }
+            recommendations_by_agent[agent_type] = normalized
+            for recommendation in analysis.recommendations:
+                key = ' '.join(recommendation.split()).casefold()
+                if not key:
+                    continue
+                display_text.setdefault(key, recommendation.strip())
+                rec_scores[key] = rec_scores.get(key, 0.0) + combined_weight
 
-            for rec in analysis.recommendations:
-                if rec not in rec_scores:
-                    rec_scores[rec] = 0
-                rec_scores[rec] += combined_weight
+        selected: List[str] = []
+        supporting_agents: List[str] = []
+        support_ratio = 0.0
+        iterations_used = 0
+        total_weight = sum(max(0.0, value) for value in weights.values())
+        for iterations_used in range(1, self._max_iterations + 1):
+            remaining = [key for key in rec_scores if key not in selected]
+            if not remaining:
+                break
+            selected.append(max(remaining, key=lambda key: (rec_scores[key], key)))
+            selected_set = set(selected)
+            supporting_agents = [
+                agent_type
+                for agent_type in analyses
+                if recommendations_by_agent.get(agent_type, set()) & selected_set
+            ]
+            supported_weight = sum(
+                max(0.0, weights.get(agent_type, 0.0))
+                for agent_type in supporting_agents
+            )
+            support_ratio = supported_weight / total_weight if total_weight else 0.0
+            if support_ratio >= self._consensus_threshold:
+                break
 
-        # Choose top recommendation
-        if rec_scores:
-            chosen_strategy = max(rec_scores, key=rec_scores.get)
-            confidence = rec_scores[chosen_strategy]
+        consensus_reached = support_ratio >= self._consensus_threshold
+        dissenting_agents = [
+            agent_type for agent_type in analyses
+            if agent_type not in supporting_agents
+        ]
+        if selected:
+            primary = display_text[selected[0]]
+            additions = [display_text[key] for key in selected[1:]]
+            chosen_strategy = primary
+            if additions:
+                chosen_strategy += '; incorporate: ' + '; '.join(additions)
+            confidence = support_ratio
         else:
             chosen_strategy = "Proceed with balanced approach"
-            confidence = 0.5
+            confidence = 0.0
 
-        # Identify supporting and dissenting agents
-        supporting_agents = []
-        dissenting_agents = []
-
-        for agent_type, analysis in analyses.items():
-            if chosen_strategy in analysis.recommendations:
-                supporting_agents.append(agent_type)
-            else:
-                dissenting_agents.append(agent_type)
-
-        # Generate compromise elements
-        compromise_elements = []
+        compromise_elements = [
+            f"Include supported concern: {display_text[key]}"
+            for key in selected[1:]
+        ]
         for agent_type in dissenting_agents:
             if analyses[agent_type].recommendations:
-                compromise_elements.append(f"Consider {agent_type} concern: {analyses[agent_type].recommendations[0]}")
+                compromise_elements.append(
+                    f"Unresolved {agent_type} concern: "
+                    f"{analyses[agent_type].recommendations[0]}"
+                )
 
         return CollectiveDecision(
             chosen_strategy=chosen_strategy,
@@ -423,7 +489,16 @@ class SwarmIntelligence(entity_component.ContextComponent):
             supporting_agents=supporting_agents,
             dissenting_agents=dissenting_agents,
             compromise_elements=compromise_elements[:3],  # Limit to 3 elements
-            implementation_notes=f"Collective decision with {len(supporting_agents)}/{len(analyses)} agent support"
+            implementation_notes=(
+                f"Consensus {'reached' if consensus_reached else 'not reached'} "
+                f"after {iterations_used} iteration(s): "
+                f"{support_ratio:.3f} support against "
+                f"{self._consensus_threshold:.3f} threshold"
+            ),
+            consensus_reached=consensus_reached,
+            iterations_used=iterations_used,
+            consensus_threshold=self._consensus_threshold,
+            support_ratio=support_ratio,
         )
 
     def _generate_swarm_guidance(self, decision: CollectiveDecision, analyses: Dict[str, SubAgentAnalysis]) -> str:
@@ -463,6 +538,13 @@ class SwarmIntelligence(entity_component.ContextComponent):
         # Collect analyses from all sub-agents
         analyses = self._collect_analyses(context)
         self._last_analyses = analyses
+        enabled_count = len(self._sub_agents)
+        self._record_model_call_branch(
+            'pre_act',
+            observed_calls=enabled_count,
+            expected_calls=enabled_count,
+            branch=f'{enabled_count}_enabled_sub_agents',
+        )
 
         # Calculate expertise weights
         weights = self._calculate_weights(context)
@@ -501,6 +583,8 @@ class SwarmIntelligence(entity_component.ContextComponent):
     def get_state(self) -> Dict[str, Any]:
         """Return a JSON-safe snapshot that can reproduce future behavior."""
         return {
+            'consensus_threshold': self._consensus_threshold,
+            'max_iterations': self._max_iterations,
             'sub_agents': {
                 name: {
                     'expertise_weight': agent._expertise_weight,
@@ -524,6 +608,16 @@ class SwarmIntelligence(entity_component.ContextComponent):
         """Restore a snapshot produced by :meth:`get_state`."""
         if not isinstance(state, dict):
             raise TypeError('Swarm intelligence state must be a mapping.')
+        consensus_threshold = float(
+            state.get('consensus_threshold', self._consensus_threshold)
+        )
+        max_iterations = int(state.get('max_iterations', self._max_iterations))
+        if not 0.0 <= consensus_threshold <= 1.0:
+            raise ValueError('consensus_threshold must be between 0 and 1.')
+        if max_iterations < 1:
+            raise ValueError('max_iterations must be at least 1.')
+        self._consensus_threshold = consensus_threshold
+        self._max_iterations = max_iterations
         for name, data in state.get('sub_agents', {}).items():
             if name in self._sub_agents:
                 self._sub_agents[name]._expertise_weight = float(

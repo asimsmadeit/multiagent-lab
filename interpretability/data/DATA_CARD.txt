@@ -1,0 +1,37 @@
+Negotiation Activation Dataset Card
+
+INTENDED USE
+
+This dataset format supports controlled research on whether negotiation behavior has a held-out, causally testable activation signal. It is not a general deception detector, truth oracle, or production safety classifier.
+
+UNIT AND SCOPE
+
+One eligible row is a completed `sample_type == "negotiation"` action linked to one acting-agent `GenerationRecord`, one committed GM/rule event, and provenance-rich `LabelRecord` IDs. Verification (`round_num == -1`), plausibility (`-2`), and bilateral `counterpart_capture` rows are retained interventions or controls, never ordinary behavior-probe training rows.
+
+Tracks are separate access regimes: `text_only`, `single_agent_white_box`, `bilateral_white_box`, `theory_of_mind`, and `adaptive`. Do not pool them without a declared transfer analysis.
+
+Execution protocols are also distinct: alternating turns, simultaneous batches, and solo no-response trials have different visibility and round semantics and must carry different trial identities. An absent counterpart is an explicit environment protocol, not an empty model response. Agent profiles, counterpart policies, prompt surfaces, role/order assignments, and intervention designs are identity-bearing provenance. For an intervention trial, every row names the trial's embedded design and exact application-receipt list; captured probe rows additionally bind their receipt to the corresponding verification or plausibility `GenerationRecord`.
+
+LABELS
+
+`actual_deception` is a compatibility projection from the manifest-selected GM/rule/human source. Unknown, failed, conflicted, and not-applicable evaluations remain unavailable. `perceived_deception` is the acting agent's estimate of its counterpart and is never self-report or ground truth.
+
+QUALITY AND SPLITS
+
+Apply the deterministic QC filter and report exclusions. Schema `activation_dataset/4.1.0` requires a locked, content-addressed `SplitManifest` with at least three independent family/dyad components. Row-aligned partition and connected-group IDs keep paraphrases, mirrored roles, first-mover variants, names, counterpart policies, and surface forms together. Layer and hyperparameter selection uses development groups; locked test groups are evaluated once.
+
+ARTIFACT FORMAT
+
+New datasets are a JSON manifest plus numeric NPZ arrays. The manifest binds every array name, shape, source/stored dtype, aligned label and metadata row, canonical generation/event/label record, embedded intervention design, trial-bound schedule, application log and receipts, access track, captured actors, model/tokenizer revisions, requested/effective sampling, capture layer/position/mode, split assignment, schema-registry snapshot, and dataset hash. The loader reconstructs those typed intervention records and rejects missing schedules, mismatched receipts, or probe evidence calls with the wrong trial, actor, purpose, or capture row. Malformed or partially available SAE rows fail publication rather than being dropped.
+
+Audit/manual-salvage recovery uses the distinct `activation-recovery/3` JSON+NPZ contract. It preserves accumulated tensors, typed canonical records, trial/runtime/capture identity, the complete cross-trial intervention design/schedule/application-log graph, and progress without claiming split eligibility. A supplied active-trial runtime envelope must agree with those aggregate records. Public aggregate CLIs cannot resume a schedule from completed-trial snapshots: those artifacts omit the active runtime envelope and complete result accumulator. Restarting is a new run, never pseudo-resume. Text-only recovery may contain records and transcripts with no activation rows. Recovery artifacts cannot be loaded as `activation_dataset/4.1.0`; instructed legacy rows are archived this way and remain non-headline.
+
+The current contract set is schema registry `2.2.0`, runtime executor `emergent-trial-executor/9`, trial runtime `1.7.0`, and intervention application/application-log `1.1.0`.
+
+PROVENANCE AND SECURITY
+
+The loader requires the exact current schema registry and revalidates stable record IDs, committed-event lineage, array semantics, SAE masks, and split projections after checksum verification. Public arrays/probes use JSON plus NPZ with NumPy pickle disabled. Legacy `.pt` files require explicit trusted opt-in because loading them may execute code; they are never the default publication format.
+
+KNOWN LIMITATIONS
+
+Offline fake-model tests validate contracts, not construct validity. Release requires a pinned real-model capture smoke test, blinded human construct validation, behavioral causal scoring with scenario context, and documented hardware/credential prerequisites. Historical generated datasets must not be treated as a post-refactor oracle.

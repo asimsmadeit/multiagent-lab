@@ -171,7 +171,8 @@ class TestCrossModeTransfer:
         compute_cross_mode_transfer = train_probes_module.compute_cross_mode_transfer
 
         X, y, mode_labels = multimode_data
-        result = compute_cross_mode_transfer(X, y, mode_labels)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = compute_cross_mode_transfer(X, y, mode_labels, groups=groups)
 
         assert "transfer_auc" in result
         assert "transfer_r2" in result
@@ -184,7 +185,8 @@ class TestCrossModeTransfer:
         compute_cross_mode_transfer = train_probes_module.compute_cross_mode_transfer
 
         X, y, mode_labels = multimode_data
-        result = compute_cross_mode_transfer(X, y, mode_labels)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = compute_cross_mode_transfer(X, y, mode_labels, groups=groups)
 
         if result.get("transfer_auc") is not None:
             assert 0 <= result["transfer_auc"] <= 1
@@ -197,7 +199,8 @@ class TestCrossModeTransfer:
         y = np.random.rand(15)
         mode_labels = ["instructed"] * 5 + ["emergent"] * 10
 
-        result = compute_cross_mode_transfer(X, y, mode_labels)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = compute_cross_mode_transfer(X, y, mode_labels, groups=groups)
 
         assert "error" in result or result["n_instructed"] >= 10
 
@@ -208,10 +211,38 @@ class TestCrossModeTransfer:
         X, y = sample_activations
         mode_labels = ["instructed"] * len(y)  # All same mode
 
-        result = compute_cross_mode_transfer(X, y, mode_labels)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = compute_cross_mode_transfer(X, y, mode_labels, groups=groups)
 
         # Should return error or indicate insufficient data
         assert "error" in result or result.get("n_emergent", 0) < 10
+
+    def test_mirrored_family_crossing_modes_is_unavailable(
+        self, multimode_data, train_probes_module
+    ):
+        compute_cross_mode_transfer = train_probes_module.compute_cross_mode_transfer
+        X, y, mode_labels = multimode_data
+        half = len(y) // 2
+        groups = np.array(
+            [f"mirrored-family-{index % half}" for index in range(len(y))]
+        )
+
+        result = compute_cross_mode_transfer(
+            X, y, mode_labels, groups=groups
+        )
+
+        assert result["available"] is False
+        assert result["crossing_group_ids"]
+        assert "leak" in result["error"]
+
+    def test_requires_connected_groups(
+        self, multimode_data, train_probes_module
+    ):
+        compute_cross_mode_transfer = train_probes_module.compute_cross_mode_transfer
+        X, y, mode_labels = multimode_data
+
+        with pytest.raises(ValueError, match="connected family/dyad groups"):
+            compute_cross_mode_transfer(X, y, mode_labels)
 
 
 class TestImplicitEncoding:
@@ -222,10 +253,13 @@ class TestImplicitEncoding:
         analyze_implicit_encoding = train_probes_module.analyze_implicit_encoding
 
         X, y = sample_activations
-        agent_labels = y + 0.1 * np.random.randn(len(y))
-        agent_labels = np.clip(agent_labels, 0, 1)
+        agent_labels = (y > 0.5).astype(float)
+        gm_labels = (y > 0.5).astype(float)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
 
-        result = analyze_implicit_encoding(X, y, agent_labels)
+        result = analyze_implicit_encoding(
+            X, gm_labels, agent_labels, groups=groups
+        )
 
         assert "gm_auc" in result
         assert "agent_auc" in result
@@ -238,9 +272,13 @@ class TestImplicitEncoding:
         analyze_implicit_encoding = train_probes_module.analyze_implicit_encoding
 
         X, y = sample_activations
-        agent_labels = y.copy()
+        agent_labels = (y > 0.5).astype(float)
+        gm_labels = agent_labels.copy()
+        groups = np.array([f"family-{index}" for index in range(len(y))])
 
-        result = analyze_implicit_encoding(X, y, agent_labels)
+        result = analyze_implicit_encoding(
+            X, gm_labels, agent_labels, groups=groups
+        )
 
         assert 0 <= result["gm_auc"] <= 1
         assert 0 <= result["agent_auc"] <= 1
@@ -250,12 +288,30 @@ class TestImplicitEncoding:
         analyze_implicit_encoding = train_probes_module.analyze_implicit_encoding
 
         X, y = sample_activations
-        agent_labels = y.copy()
+        agent_labels = (y > 0.5).astype(float)
+        gm_labels = agent_labels.copy()
+        groups = np.array([f"family-{index}" for index in range(len(y))])
 
-        result = analyze_implicit_encoding(X, y, agent_labels)
+        result = analyze_implicit_encoding(
+            X, gm_labels, agent_labels, groups=groups
+        )
 
         expected_gm_wins = result["auc_gap"] > 0
         assert result["gm_wins"] == expected_gm_wins
+
+    def test_continuous_counterpart_estimate_requires_regression_policy(
+        self, sample_activations, train_probes_module
+    ):
+        analyze_implicit_encoding = train_probes_module.analyze_implicit_encoding
+        X, y = sample_activations
+        binary = (y > 0.5).astype(float)
+        continuous = np.linspace(0.0, 1.0, len(y))
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+
+        with pytest.raises(ValueError, match="explicit binary"):
+            analyze_implicit_encoding(
+                X, binary, continuous, groups=groups
+            )
 
 
 class TestRoundTrajectory:
@@ -269,8 +325,11 @@ class TestRoundTrajectory:
 
         # Need activations_by_layer format
         activations_by_layer = {10: X, 15: X, 20: X}
+        groups = np.array([f"family-{index // 5}" for index in range(len(y))])
 
-        result = analyze_round_trajectory(activations_by_layer, y, round_nums)
+        result = analyze_round_trajectory(
+            activations_by_layer, y, round_nums, groups=groups
+        )
 
         assert "per_round" in result
         assert "trajectory_slope" in result
@@ -282,8 +341,11 @@ class TestRoundTrajectory:
 
         X, y, round_nums = multiround_data
         activations_by_layer = {15: X}
+        groups = np.array([f"family-{index // 5}" for index in range(len(y))])
 
-        result = analyze_round_trajectory(activations_by_layer, y, round_nums)
+        result = analyze_round_trajectory(
+            activations_by_layer, y, round_nums, groups=groups
+        )
 
         assert len(result["per_round"]) == 5  # 5 rounds
 
@@ -294,8 +356,11 @@ class TestRoundTrajectory:
         X, y = sample_activations
         round_nums = [1] * len(y)  # All same round
         activations_by_layer = {15: X}
+        groups = np.array([f"family-{index}" for index in range(len(y))])
 
-        result = analyze_round_trajectory(activations_by_layer, y, round_nums)
+        result = analyze_round_trajectory(
+            activations_by_layer, y, round_nums, groups=groups
+        )
 
         assert "error" in result
 
@@ -308,7 +373,10 @@ class TestDyadicPairs:
         analyze_dyadic_pairs = train_probes_module.analyze_dyadic_pairs
 
         X, y, counterpart_idxs = dyadic_data
-        result = analyze_dyadic_pairs(X, y, counterpart_idxs)
+        groups = np.array([f"family-{index // 2}" for index in range(len(y))])
+        result = analyze_dyadic_pairs(
+            X, y, counterpart_idxs, groups=groups
+        )
 
         assert "n_pairs" in result
         assert "pair_probe_auc" in result or "error" in result
@@ -318,7 +386,10 @@ class TestDyadicPairs:
         analyze_dyadic_pairs = train_probes_module.analyze_dyadic_pairs
 
         X, y, counterpart_idxs = dyadic_data
-        result = analyze_dyadic_pairs(X, y, counterpart_idxs)
+        groups = np.array([f"family-{index // 2}" for index in range(len(y))])
+        result = analyze_dyadic_pairs(
+            X, y, counterpart_idxs, groups=groups
+        )
 
         if "error" not in result:
             assert "d_prime" in result
@@ -330,10 +401,25 @@ class TestDyadicPairs:
         X = np.random.randn(10, 32)
         y = np.random.rand(10)
         counterpart_idxs = [-1] * 10  # No valid pairs
+        groups = np.array([f"family-{index}" for index in range(len(y))])
 
-        result = analyze_dyadic_pairs(X, y, counterpart_idxs)
+        result = analyze_dyadic_pairs(
+            X, y, counterpart_idxs, groups=groups
+        )
 
         assert "error" in result
+
+    def test_counterpart_rows_must_share_connected_identity(
+        self, dyadic_data, train_probes_module
+    ):
+        analyze_dyadic_pairs = train_probes_module.analyze_dyadic_pairs
+        X, y, counterpart_idxs = dyadic_data
+        groups = np.array([f"row-{index}" for index in range(len(y))])
+
+        with pytest.raises(ValueError, match="share a connected group"):
+            analyze_dyadic_pairs(
+                X, y, counterpart_idxs, groups=groups
+            )
 
 
 class TestOutcomePrediction:
@@ -383,7 +469,8 @@ class TestInterpretations:
         compute_cross_mode_transfer = train_probes_module.compute_cross_mode_transfer
 
         X, y, mode_labels = multimode_data
-        result = compute_cross_mode_transfer(X, y, mode_labels)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = compute_cross_mode_transfer(X, y, mode_labels, groups=groups)
 
         if "interpretation" in result:
             assert isinstance(result["interpretation"], str)
@@ -394,7 +481,11 @@ class TestInterpretations:
         analyze_implicit_encoding = train_probes_module.analyze_implicit_encoding
 
         X, y = sample_activations
-        result = analyze_implicit_encoding(X, y, y)
+        binary = (y > 0.5).astype(float)
+        groups = np.array([f"family-{index}" for index in range(len(y))])
+        result = analyze_implicit_encoding(
+            X, binary, binary, groups=groups
+        )
 
         assert isinstance(result["interpretation"], str)
         assert len(result["interpretation"]) > 0

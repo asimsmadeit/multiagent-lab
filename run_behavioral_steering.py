@@ -26,7 +26,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+)
 
 HF_REPO = "sycorpia/multiagent-lab-data"
 OUT_DIR = Path("experiment_results/behavioral_steering")
@@ -65,12 +70,17 @@ def is_negotiation(md: Dict[str, Any]) -> bool:
     return rn is None or rn >= 0
 
 
-def load_direction(activations_path: str, layer: int) -> Tuple[np.ndarray, int]:
+def load_direction(
+    activations_path: str,
+    layer: int,
+    *,
+    trust_legacy_pt: bool = False,
+) -> Tuple[np.ndarray, int]:
     """Load activations from HF, filter to negotiation samples, return
     mass-mean direction at the requested layer."""
     print(f"  loading {activations_path}", flush=True)
-    fp = hf_hub_download(HF_REPO, activations_path, repo_type="dataset")
-    data = torch.load(fp, weights_only=False)
+    fp = download_activation_input(HF_REPO, activations_path)
+    data = load_activation_input(fp, trust_legacy_pt=trust_legacy_pt)
     md = data.get("metadata", [])
     labels = data["labels"]
     acts = data["activations"]
@@ -165,7 +175,7 @@ def build_llm_scorer(scenario: str, scenario_params_list: List[Dict[str, Any]]):
 
 def run_cell(cell_id, model_name, scenario, activations_path, best_layer,
              magnitudes, n_samples, max_new_tokens, dtype, device, force,
-             evaluator_type: str = "rule"):
+             evaluator_type: str = "rule", trust_legacy_pt: bool = False):
     out_path = OUT_DIR / f"{cell_id}.json"
     if out_path.exists() and not force:
         print(f"[{cell_id}] already done at {out_path}; skipping (use --force to rerun)")
@@ -174,7 +184,11 @@ def run_cell(cell_id, model_name, scenario, activations_path, best_layer,
     print(f"\n=== {cell_id} ({model_name} / {scenario}) ===", flush=True)
     t0 = time.time()
 
-    direction, layer = load_direction(activations_path, best_layer)
+    direction, layer = load_direction(
+        activations_path,
+        best_layer,
+        trust_legacy_pt=trust_legacy_pt,
+    )
     if direction is None:
         print(f"  could not compute direction; skipping")
         return
@@ -267,7 +281,7 @@ def run_cell(cell_id, model_name, scenario, activations_path, best_layer,
     torch.cuda.empty_cache()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", help="comma-separated cell ids to run")
     parser.add_argument("--magnitudes", default="-3,-2,-1,0,1,2,3",
@@ -283,7 +297,8 @@ def main():
     parser.add_argument("--evaluator-type", default="llm",
                         choices=["rule", "llm"],
                         help="rule-based regex or LLM judge (DeepEval gpt-4o-mini)")
-    args = parser.parse_args()
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
 
     magnitudes = [float(x) for x in args.magnitudes.split(",")]
     selected = set(args.only.split(",")) if args.only else None
@@ -301,7 +316,8 @@ def main():
                      dtype=args.dtype,
                      device=args.device,
                      force=args.force,
-                     evaluator_type=args.evaluator_type)
+                     evaluator_type=args.evaluator_type,
+                     trust_legacy_pt=args.trust_legacy_pt)
         except Exception as e:
             print(f"[{cell_id}] FAILED: {type(e).__name__}: {e}")
             traceback.print_exc()

@@ -14,6 +14,7 @@ from concordia.typing import prefab as prefab_lib
 from negotiation.components import negotiation_instructions
 from negotiation.components import negotiation_memory
 from negotiation.components import negotiation_strategy
+from negotiation.components import scoped_act
 
 
 @dataclasses.dataclass
@@ -184,10 +185,14 @@ class Entity(prefab_lib.Prefab):
             ])
 
         # Create the acting component
-        act_component = agent_components.concat_act_component.ConcatActComponent(
+        action_scope_factory = self.params.get('action_call_scope_factory')
+        if action_scope_factory is not None and not callable(action_scope_factory):
+            raise TypeError('action_call_scope_factory must be callable.')
+        act_component = scoped_act.ScopedConcatActComponent(
             model=model,
             component_order=component_order,
             prefix_entity_name=True,
+            action_scope_factory=action_scope_factory,
         )
 
         # Create the agent

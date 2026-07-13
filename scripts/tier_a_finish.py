@@ -8,6 +8,10 @@ table from the prior delta CSV and runs 200 bootstraps.
 
 from __future__ import annotations
 
+# NumPy exposes RandomState at runtime; Pylint cannot infer the lazy namespace.
+# pylint: disable=no-member
+
+import argparse
 import json
 import sys
 import time
@@ -15,13 +19,17 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-from huggingface_hub import hf_hub_download
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+)
 
 HF_REPO = 'sycorpia/multiagent-lab-data'
 ALPHA = 100.0
@@ -84,14 +92,21 @@ def _is_negotiation(md):
     return rn is None or rn >= 0
 
 
-def load_layer(model: str, config: str, scenario: str, layer: int):
+def load_layer(
+    model: str,
+    config: str,
+    scenario: str,
+    layer: int,
+    *,
+    trust_legacy_pt: bool = False,
+):
     """Load only the requested layer for speed."""
     key = (model, config, scenario)
     if key not in RUNS:
         return None
     path = RUNS[key]
-    fp = hf_hub_download(HF_REPO, path, repo_type='dataset')
-    data = torch.load(fp, weights_only=False)
+    fp = download_activation_input(HF_REPO, path)
+    data = load_activation_input(fp, trust_legacy_pt=trust_legacy_pt)
     md = data.get('metadata', [])
     labels = data['labels']
     acts = data['activations']
@@ -149,7 +164,7 @@ def mass_mean_direction(X, y_binary):
 
 # --- Section 2: cross-arch direction transfer (info_withholding) ---
 
-def cross_arch_transfer():
+def cross_arch_transfer(*, trust_legacy_pt: bool = False):
     print("\n=== Cross-architecture probe-direction transfer ===")
     scenario = 'info_withholding'
     sources = []
@@ -161,7 +176,13 @@ def cross_arch_transfer():
     }
     for (model, config), layer in best_per_config.items():
         print(f"  loading {model}/{config}/{scenario} L{layer}")
-        loaded = load_layer(model, config, scenario, layer)
+        loaded = load_layer(
+            model,
+            config,
+            scenario,
+            layer,
+            trust_legacy_pt=trust_legacy_pt,
+        )
         if loaded is None:
             continue
         X, y, layer_used = loaded
@@ -210,7 +231,7 @@ def cross_arch_transfer():
 
 # --- Section 3: bootstrap CIs ---
 
-def bootstrap_cis():
+def bootstrap_cis(*, trust_legacy_pt: bool = False):
     print(f"\n=== Bootstrap 95% CIs (n_boot={N_BOOT}) ===")
     results = {}
     targets = list(RUNS.keys())
@@ -219,7 +240,13 @@ def bootstrap_cis():
         layer = BEST_LAYERS.get(key)
         tag = f'{model}_{config}_{scenario}'
         print(f"\n  [{i+1}/{len(targets)}] {tag} L{layer}")
-        loaded = load_layer(model, config, scenario, layer)
+        loaded = load_layer(
+            model,
+            config,
+            scenario,
+            layer,
+            trust_legacy_pt=trust_legacy_pt,
+        )
         if loaded is None:
             continue
         X, y, layer_used = loaded
@@ -262,14 +289,17 @@ def bootstrap_cis():
     return results
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
     t0 = time.time()
     try:
-        cross_arch_transfer()
+        cross_arch_transfer(trust_legacy_pt=args.trust_legacy_pt)
     except Exception as e:
         import traceback; traceback.print_exc()
     try:
-        bootstrap_cis()
+        bootstrap_cis(trust_legacy_pt=args.trust_legacy_pt)
     except Exception as e:
         import traceback; traceback.print_exc()
     print(f"\nTotal: {time.time()-t0:.0f}s")

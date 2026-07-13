@@ -88,6 +88,16 @@ class CulturalAwarenessGM(gm_modules.NegotiationGMModule):
           face_saving_importance=0.9,
           negotiation_pace='slow',
       ),
+      'northern_european': CulturalProfile(
+          culture_name='Northern European',
+          communication_style='direct',
+          context_level='low_context',
+          time_orientation='monochronic',
+          relationship_importance=0.2,
+          hierarchy_sensitivity=0.2,
+          face_saving_importance=0.3,
+          negotiation_pace='fast',
+      ),
   }
 
   def __init__(
@@ -119,9 +129,10 @@ class CulturalAwarenessGM(gm_modules.NegotiationGMModule):
 
   def set_participant_culture(self, participant: str, culture: str) -> None:
     """Set the cultural profile for a participant."""
-    if culture in self.CULTURAL_PROFILES:
-      self._participant_cultures[participant] = culture
-      self.set_module_state(f'culture_{participant}', culture)
+    if culture not in self.CULTURAL_PROFILES:
+      raise ValueError(f'Unknown GM cultural profile: {culture!r}')
+    self._participant_cultures[participant] = culture
+    self.set_module_state(f'culture_{participant}', culture)
 
   def detect_cultural_violation(
       self,

@@ -27,7 +27,7 @@ Usage:
     python run_deception_experiment.py --device cuda --dtype bfloat16
 
     # Train probes on existing data
-    python run_deception_experiment.py --train-only --data activations.pt
+    python run_deception_experiment.py --train-only --data activations.json
 
 Parallel Execution (3 pods):
     # Pod 1: python run_deception_experiment.py --scenario-name ultimatum_bluff
@@ -38,12 +38,26 @@ Parallel Execution (3 pods):
 import argparse
 import json
 import os
+import sys
 import time
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 import torch
+
+from interpretability.data import load_activation_dataset
+from interpretability.tracks import ExperimentTrack, get_track_spec
+from interpretability.launch import (
+    PUBLIC_RESUME_LIMITATION,
+    resolve_config_execution_surface,
+    resolve_execution_surface,
+)
+from interpretability.scenarios.compiled import (
+    ExecutionProtocol,
+    SUPPORTED_SURFACE_VARIANTS,
+)
 import numpy as np
 
 
@@ -63,6 +77,8 @@ class NumpyEncoder(json.JSONEncoder):
 
 def _sanitize_for_json(obj):
     """Recursively convert numpy types in dicts/lists to native Python types."""
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return _sanitize_for_json(asdict(obj))
     if isinstance(obj, dict):
         return {
             (int(k) if isinstance(k, (np.integer,)) else
@@ -80,6 +96,11 @@ def _sanitize_for_json(obj):
         return obj.tolist()
     if isinstance(obj, np.bool_):
         return bool(obj)
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    enum_value = getattr(obj, "value", None)
+    if enum_value is not None:
+        return _sanitize_for_json(enum_value)
     return obj
 
 from interpretability import (
@@ -121,6 +142,13 @@ def run_emergent_experiment(
     ultrafast: bool = False,
     checkpoint_dir: str = None,
     counterpart_type: str = None,
+    counterpart_types: Optional[List[str]] = None,
+    protocol: ExecutionProtocol | str = ExecutionProtocol.ALTERNATING,
+    counterbalance: bool = True,
+    counterbalance_seed: int = 0,
+    surface_variants: Optional[List[str]] = None,
+    run_probes: Optional[bool] = None,
+    executions_per_family: int = 1,
 ) -> Dict[str, Any]:
     """
     Run emergent deception experiment through Concordia framework.
@@ -134,6 +162,9 @@ def run_emergent_experiment(
         agent_modules: List of agent modules to enable (default: ['theory_of_mind'])
         ultrafast: Use minimal agents for ~5x speedup (default: False)
         counterpart_type: Counterpart behavior variant for A1 analysis
+        counterpart_types: Policies crossed by the counterbalance schedule
+        protocol: Alternating, simultaneous, or solo-no-response scheduler
+        counterbalance: Balance role, order, policy, and prompt surface
 
     Returns:
         Dict with all results
@@ -141,18 +172,27 @@ def run_emergent_experiment(
     if conditions is None:
         conditions = [IncentiveCondition.HIGH_INCENTIVE, IncentiveCondition.LOW_INCENTIVE]
     if agent_modules is None:
-        agent_modules = ['theory_of_mind']
+        agent_modules = [] if ultrafast else ['theory_of_mind']
+    elif ultrafast and agent_modules:
+        raise ValueError(
+            'ultrafast_minimal/1 requires agent_modules to be empty'
+        )
 
     print(f"\n{'='*60}", flush=True)
     print("EMERGENT DECEPTION EXPERIMENT", flush=True)
     print(f"{'='*60}", flush=True)
     print(f"Scenarios: {scenarios}", flush=True)
     print(f"Conditions: {[c.value for c in conditions]}", flush=True)
-    print(f"Trials per condition: {trials_per_scenario}", flush=True)
+    print(f"Semantic families per condition: {trials_per_scenario}", flush=True)
+    print(f"Executions per family: {executions_per_family}", flush=True)
     print(f"Max rounds: {max_rounds}", flush=True)
     print(f"Agent modules: {agent_modules}", flush=True)
     print(f"Ultrafast mode: {ultrafast}", flush=True)
-    print(f"Total trials: {len(scenarios) * len(conditions) * trials_per_scenario}", flush=True)
+    print(
+        "Total physical executions: "
+        f"{len(scenarios) * len(conditions) * trials_per_scenario * executions_per_family}",
+        flush=True,
+    )
 
     # Use the integrated run_all_emergent_scenarios method
     results = runner.run_all_emergent_scenarios(
@@ -164,6 +204,12 @@ def run_emergent_experiment(
         ultrafast=ultrafast,
         checkpoint_dir=checkpoint_dir,
         counterpart_type=counterpart_type,
+        counterpart_types=counterpart_types,
+        protocol=protocol,
+        counterbalance=counterbalance,
+        counterbalance_seed=counterbalance_seed,
+        surface_variants=surface_variants,
+        run_probes=run_probes,
     )
 
     return results
@@ -220,16 +266,18 @@ def train_probes_on_data(
     timestamp: str = None,
     scenario_name: str = None,
     pod_id: str = None,
+    trusted_legacy: bool = False,
 ) -> Dict[str, Any]:
     """
     Train probes on captured activation data.
 
     Args:
-        data_path: Path to activations.pt file
+        data_path: Path to a safe activation manifest or reviewed legacy file
         output_dir: Directory for output files
         timestamp: Session timestamp for unique filenames (prevents overwrites)
         scenario_name: Scenario name for filename (optional)
         pod_id: Pod ID for parallel execution (optional)
+        trusted_legacy: Whether the caller reviewed and trusts the .pt artifact
 
     Returns:
         Dict with probe results
@@ -240,7 +288,10 @@ def train_probes_on_data(
     print(f"Loading data from: {data_path}")
 
     # Run full analysis
-    results = run_full_analysis(data_path)
+    results = run_full_analysis(
+        data_path,
+        trusted_legacy=trusted_legacy,
+    )
 
     # Save results
     if output_dir:
@@ -256,12 +307,21 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run deception detection experiment with Concordia agents"
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Authoritative ExperimentConfig JSON; cannot be mixed with run overrides",
+    )
 
     # Mode selection
     parser.add_argument(
-        "--mode", type=str, default="both",
+        "--mode", type=str, default="emergent",
         choices=["emergent", "instructed", "both"],
-        help="Experiment mode: emergent, instructed, or both (default: both)"
+        help=(
+            "Experiment mode: emergent (headline default), instructed legacy "
+            "compatibility, or both with instructed rows excluded from probes"
+        )
     )
 
     # Model configuration
@@ -292,7 +352,10 @@ def main():
     )
     parser.add_argument(
         "--trials", type=int, default=40,
-        help="Trials per scenario per condition (default: 40)"
+        help=(
+            "Semantic families per scenario per condition (default: 40); "
+            "counterbalancing expands every family"
+        )
     )
     parser.add_argument(
         "--conditions", type=str, default=None,
@@ -337,6 +400,12 @@ def main():
         help="Disable Theory of Mind module (same as --fast but explicit for control experiments)"
     )
     parser.add_argument(
+        "--experiment-track",
+        choices=[track.value for track in ExperimentTrack],
+        default=None,
+        help="Activation-access track; inferred from enabled modules when omitted",
+    )
+    parser.add_argument(
         "--ultrafast", action="store_true",
         help="Ultrafast mode: use minimal agents for ~5x additional speedup (2 LLM calls/round vs 10)"
     )
@@ -376,7 +445,11 @@ def main():
     )
     parser.add_argument(
         "--data", type=str,
-        help="Path to activations.pt file for training"
+        help="Path to a safe activation .json manifest or legacy .pt file for training"
+    )
+    parser.add_argument(
+        "--trust-legacy-pt", action="store_true",
+        help="Allow pickle-capable .pt loading only for reviewed input files",
     )
 
     # Output
@@ -386,7 +459,10 @@ def main():
     )
     parser.add_argument(
         "--checkpoint-dir", type=str, default=None,
-        help="Directory for checkpoint saves after each trial (enables crash recovery)"
+        help=(
+            "Write audit/manual-salvage snapshots after completed executions; "
+            "these artifacts cannot resume the public experiment schedule"
+        ),
     )
 
     # Causal validation
@@ -401,26 +477,200 @@ def main():
 
     # Counterpart behavior variant (A1: conditioned vs complex deception test)
     parser.add_argument(
-        "--counterpart-type", type=str, default=None,
+        "--counterpart-type", type=str, action="append", default=None,
         choices=["default", "skeptical", "credulous", "informed", "absent"],
-        help="Counterpart behavior variant for A1 analysis. "
+        help="Counterpart behavior variant; repeat to cross multiple policies. "
              "Tests whether agent adapts deception strategy to counterpart type "
              "(evidence for complex vs conditioned deception)."
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=[protocol.value for protocol in ExecutionProtocol],
+        default=ExecutionProtocol.ALTERNATING.value,
+        help="Turn scheduler; protocol identity is persisted with every trial",
+    )
+    parser.add_argument(
+        "--counterbalance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Balance physical roles, order, policy, and prompt surface",
+    )
+    parser.add_argument(
+        "--counterbalance-seed",
+        type=int,
+        default=0,
+        help="Stable non-negative presentation-order seed",
+    )
+    parser.add_argument(
+        "--surface-variant",
+        action="append",
+        default=None,
+        choices=list(SUPPORTED_SURFACE_VARIANTS),
+        help="Prompt surface to include; repeat to select multiple variants",
+    )
+    parser.add_argument(
+        "--probes",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Typed verification/plausibility probes (auto enables alternating only)",
     )
 
     # Parallel execution (for multi-GPU clusters)
     parser.add_argument(
         "--parallel-pod", type=str, default=None,
-        help="Parallel pod ID: 'POD_NUM/TOTAL_PODS' (e.g., '3/8' = pod 3 of 8). "
-             "Each pod runs a subset of trials with unique trial IDs."
+        help=(
+            "Unsupported and rejected: exact schedule partitioning across pods "
+            "has not been implemented"
+        ),
     )
     parser.add_argument(
         "--merge-pods", type=str, nargs='+', default=None,
-        help="Merge activation files from parallel pods: file1.pt file2.pt ... "
+        help="Merge activation files from parallel pods: file1.json file2.json ... "
              "Use after all pods complete to combine results for probe training."
     )
 
     args = parser.parse_args()
+
+    if args.parallel_pod:
+        parser.error(
+            "--parallel-pod is unsupported: offsetting IDs does not partition the "
+            "execution schedule and can overlap seed windows; partition explicitly "
+            "with separate scenario/condition commands"
+        )
+
+    validated_condition_names = None
+    if args.conditions is not None:
+        raw_conditions = [
+            item.strip().lower() for item in args.conditions.split(",")
+        ]
+        valid_condition_names = {
+            "high_incentive", "low_incentive", "penalty", "minimal"
+        }
+        if len(raw_conditions) == 1 and raw_conditions[0] == "all":
+            validated_condition_names = [
+                "high_incentive", "low_incentive", "penalty", "minimal"
+            ]
+        else:
+            unknown_conditions = [
+                name for name in raw_conditions
+                if not name or name not in valid_condition_names
+            ]
+            if unknown_conditions:
+                parser.error(
+                    "--conditions contains unsupported or empty value(s): "
+                    + ", ".join(repr(name) for name in unknown_conditions)
+                )
+            validated_condition_names = raw_conditions
+
+    launch_config = None
+    execution_plan = None
+    publish_activations = True
+    config_family_seed_start = 0
+    evaluator_model_name = "google/gemma-2b-it"
+    evaluator_max_tokens = 64
+    if args.config is not None:
+        provided_flags = {
+            token.split("=", maxsplit=1)[0]
+            for token in sys.argv[1:]
+            if token.startswith("-")
+        }
+        conflicts = sorted(provided_flags.difference({"--config"}))
+        if conflicts:
+            parser.error(
+                "--config is authoritative and cannot be mixed with: "
+                + ", ".join(conflicts)
+            )
+        try:
+            from config.experiment import ExperimentConfig
+            launch_config = ExperimentConfig.load_json(str(args.config))
+            execution_plan = resolve_config_execution_surface(launch_config)
+        except (OSError, TypeError, ValueError) as error:
+            parser.error(f"invalid --config: {error}")
+
+        args.mode = launch_config.scenarios.mode
+        args.model = launch_config.model.name
+        args.device = launch_config.model.device
+        args.dtype = launch_config.model.dtype
+        args.scenarios = len(launch_config.scenarios.scenarios)
+        args.scenario_name = None
+        args.trials = launch_config.scenarios.num_trials
+        args.max_rounds = launch_config.scenarios.max_rounds
+        args.layers = (
+            None
+            if execution_plan.experiment_track is ExperimentTrack.TEXT_ONLY
+            else ",".join(map(str, launch_config.probes.layers_to_probe))
+        )
+        args.fast = False
+        args.no_tom = False
+        args.ultrafast = False
+        args.hybrid = False
+        args.sae = launch_config.model.use_sae
+        args.sae_layer = launch_config.model.sae_layer or args.sae_layer
+        args.evaluator = "local" if launch_config.evaluator.enabled else "none"
+        evaluator_model_name = launch_config.evaluator.model
+        evaluator_max_tokens = launch_config.evaluator.max_tokens
+        args.evaluator_type = launch_config.evaluator.ground_truth_method
+        args.skip_api_eval = args.evaluator_type == "rule"
+        args.checkpoint_dir = launch_config.checkpoint_dir
+        args.causal = launch_config.causal.enabled
+        args.causal_samples = launch_config.causal.num_samples
+        args.output = launch_config.output_dir
+        config_family_seed_start = launch_config.random_seed
+        publish_activations = launch_config.save_activations
+
+    if args.mode in {"instructed", "both"}:
+        print(
+            "LEGACY/NON-HEADLINE: instructed rows are unclassified and excluded "
+            "from negotiation probe training. Mode both trains on emergent rows "
+            "only; it is not a cross-mode headline result.",
+            flush=True,
+        )
+    if args.causal and args.mode == "instructed":
+        parser.error(
+            "--causal cannot run on instructed-only legacy/non-headline rows"
+        )
+
+    if not args.train_only and not args.merge_pods:
+        if execution_plan is None:
+            try:
+                execution_plan = resolve_execution_surface(
+                    experiment_track=args.experiment_track,
+                    protocol=args.protocol,
+                    counterpart_types=args.counterpart_type,
+                    counterbalance=args.counterbalance,
+                    counterbalance_seed=args.counterbalance_seed,
+                    surface_variants=args.surface_variant,
+                    fast=args.fast,
+                    ultrafast=args.ultrafast,
+                    no_tom=args.no_tom,
+                    mode=args.mode,
+                    probe_mode=args.probes,
+                )
+            except (TypeError, ValueError) as error:
+                parser.error(str(error))
+        if execution_plan.experiment_track is ExperimentTrack.TEXT_ONLY:
+            incompatible = []
+            if args.causal:
+                incompatible.append("--causal")
+            if args.sae:
+                incompatible.append("--sae")
+            if args.hybrid:
+                incompatible.append("--hybrid")
+            if args.layers:
+                incompatible.append("--layers")
+            if args.dense_layers is not None:
+                incompatible.append("--dense-layers")
+            if args.dense_9:
+                incompatible.append("--dense-9")
+            if args.capture_mean:
+                incompatible.append("--capture-mean")
+            if incompatible:
+                parser.error(
+                    "text_only cannot use white-box options: "
+                    + ", ".join(incompatible)
+                )
+        if args.sae and not args.hybrid:
+            parser.error("--sae requires --hybrid")
 
     # Create session timestamp for all output files (prevents overwrites between runs)
     session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -428,11 +678,19 @@ def main():
     # Build organized output directory: output/{model}/{scenario}/{config}_{timestamp}/
     from config.experiment import get_model_short_name
     model_short = get_model_short_name(args.model)
-    tom_label = "no_tom" if (args.fast or args.no_tom) else "tom"
-    run_label = f"{tom_label}_{session_timestamp}"
+    surface_label = (
+        f"{execution_plan.experiment_track.value}_{execution_plan.protocol.value}"
+        if execution_plan is not None
+        else ("no_tom" if (args.fast or args.no_tom) else "tom")
+    )
+    run_label = f"{surface_label}_{session_timestamp}"
 
     output_dir = Path(args.output)
-    if args.scenario_name:
+    if launch_config is not None:
+        emergent_scenarios = list(launch_config.scenarios.scenarios)
+        instructed_scenarios = list(launch_config.scenarios.scenarios)
+        n_scenarios = len(emergent_scenarios)
+    elif args.scenario_name:
         output_dir = output_dir / model_short / args.scenario_name / run_label
     else:
         output_dir = output_dir / model_short / "all_scenarios" / run_label
@@ -449,6 +707,7 @@ def main():
             output_dir=str(output_dir),
             timestamp=session_timestamp,
             verbose=True,
+            trusted_legacy=args.trust_legacy_pt,
         )
         # Auto-train probes on merged data unless --train-only was NOT specified
         print(f"\nTraining probes on merged data...")
@@ -457,41 +716,34 @@ def main():
             str(output_dir),
             timestamp=session_timestamp,
             scenario_name="merged",  # Merged data contains multiple scenarios/pods
+            trusted_legacy=False,
         )
         return
 
-    # Calculate trial_id_offset for parallel execution
-    trial_id_offset = 0
-    if args.parallel_pod:
-        try:
-            pod_num, total_pods = map(int, args.parallel_pod.split('/'))
-            if pod_num < 1 or pod_num > total_pods:
-                parser.error(f"Invalid pod number: {pod_num}/{total_pods}. Pod must be between 1 and {total_pods}")
-            # Each pod gets a range of 1000 trial IDs
-            # Pod 1: 0-999, Pod 2: 1000-1999, etc.
-            trial_id_offset = (pod_num - 1) * 1000
-            print(f"\n{'='*60}")
-            print(f"PARALLEL MODE: Pod {pod_num} of {total_pods}")
-            print(f"{'='*60}")
-            print(f"Trial ID offset: {trial_id_offset}")
-            print(f"Trial ID range: {trial_id_offset} - {trial_id_offset + 999}")
-        except ValueError:
-            parser.error(f"Invalid --parallel-pod format: '{args.parallel_pod}'. Use 'POD_NUM/TOTAL_PODS' (e.g., '3/8')")
+    # Public schedules use one explicit family-seed namespace. Exact pod
+    # partitioning is rejected above rather than approximated with ID offsets.
+    trial_id_offset = config_family_seed_start
 
-    # Create checkpoint directory - ALWAYS enabled now (defaults to output_dir/checkpoints)
-    # This ensures data is saved incrementally and survives crashes
+    # Recovery snapshots are always enabled for audit/manual salvage. They are
+    # not complete aggregate-schedule continuation tokens.
     if args.checkpoint_dir:
         checkpoint_dir = Path(args.checkpoint_dir)
     else:
         checkpoint_dir = output_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Checkpoints will be saved to: {checkpoint_dir}")
+    print(f"Recovery snapshots will be written to: {checkpoint_dir}")
+    print(PUBLIC_RESUME_LIMITATION)
 
     # Training-only mode
     if args.train_only:
         if not args.data:
             parser.error("--data is required when using --train-only")
-        results = train_probes_on_data(args.data, str(output_dir), timestamp=session_timestamp)
+        results = train_probes_on_data(
+            args.data,
+            str(output_dir),
+            timestamp=session_timestamp,
+            trusted_legacy=args.trust_legacy_pt,
+        )
         return
 
     # Get scenarios - support both --scenario-name (single) and --scenarios (count)
@@ -546,7 +798,7 @@ def main():
     print(f"Device: {args.device}", flush=True)
     print(f"Dtype: {args.dtype}", flush=True)
     print(f"Scenarios: {emergent_scenarios}", flush=True)
-    print(f"Trials per condition: {args.trials}", flush=True)
+    print(f"Semantic families per condition: {args.trials}", flush=True)
     print(f"Max rounds: {args.max_rounds}", flush=True)
     print(f"Max tokens: {args.max_tokens}", flush=True)
     print(f"Fast mode: {args.fast}", flush=True)
@@ -564,35 +816,166 @@ def main():
     print(f"Evaluator type: {evaluator_type}", flush=True)
     print(f"Output directory: {output_dir}", flush=True)
 
-    # Determine agent modules based on --fast / --no-tom flag
-    agent_modules = [] if (args.fast or args.no_tom) else ['theory_of_mind']
-
+    if execution_plan is None:
+        raise RuntimeError("execution plan was not resolved for an experiment run")
+    agent_modules = list(execution_plan.agent_modules)
+    selected_track = execution_plan.experiment_track
+    participant_ids = execution_plan.participant_ids
+    captured_actor_ids = execution_plan.captured_actor_ids
+    track_manifest = {
+        'experiment_track': selected_track.value,
+        'activation_access': get_track_spec(selected_track).activation_access,
+        'participant_ids': list(participant_ids),
+        'captured_actor_ids': list(captured_actor_ids),
+        'headline_capture_policy': execution_plan.per_trial_capture_policy,
+        'headline_captured_actor_count_per_trial': (
+            execution_plan.per_trial_captured_actor_count
+        ),
+        'enabled_modules': list(agent_modules),
+        'allows_online_adaptation': (
+            selected_track is ExperimentTrack.ADAPTIVE
+        ),
+        'protocol': execution_plan.protocol.value,
+        'counterpart_policies': list(execution_plan.counterpart_types),
+        'counterbalance': execution_plan.counterbalance,
+        'counterbalance_seed': execution_plan.counterbalance_seed,
+        'surface_variants': list(execution_plan.surface_variants),
+        'execution_design_scope': execution_plan.execution_design_scope,
+        'config_source': str(args.config) if args.config is not None else None,
+        'experiment_name': (
+            launch_config.experiment_name if launch_config is not None else None
+        ),
+        'activation_publication': {
+            'enabled': publish_activations,
+            'scientific_status': (
+                'activation_dataset_requested'
+                if publish_activations
+                else 'recovery_evidence_only_no_dataset'
+            ),
+        },
+        'recovery_contract': {
+            'writes_snapshots': True,
+            'schedule_resume_supported': False,
+            'purpose': 'audit_and_manual_salvage_only',
+            'limitation': PUBLIC_RESUME_LIMITATION,
+        },
+        'logging_contract': {
+            'verbose': True,
+            'log_to_file': False,
+            'destination': 'stdout',
+        },
+        'seed_design': {
+            'family_seed_start': trial_id_offset,
+            'use_multi_seed': False,
+            'configured_random_seeds': (
+                list(launch_config.random_seeds)
+                if launch_config is not None else None
+            ),
+            'configured_random_seeds_status': (
+                'inactive_reserved'
+                if launch_config is not None else 'not_configured'
+            ),
+            'source': (
+                'experiment_config' if launch_config is not None
+                else 'cli_default'
+            ),
+        },
+        'evaluator_design': {
+            'local_structured_extractor': {
+                'enabled': args.evaluator != 'none',
+                'model': evaluator_model_name,
+                'max_tokens': evaluator_max_tokens,
+            },
+            'ground_truth_detector': {
+                'requested': evaluator_type,
+                'skip_api_eval': args.skip_api_eval,
+                'effective': None,
+                'deepeval_available': None,
+            },
+        },
+        'legacy_instructed_execution_contract': (
+            {
+                'protocol': 'legacy_run_study_alternating',
+                'counterpart_policy_cross': 'unsupported',
+                'surface_cross': 'unsupported',
+            }
+            if args.mode in {'instructed', 'both'}
+            else None
+        ),
+        'probes': {
+            'mode': execution_plan.probe_mode,
+            'enabled': (
+                execution_plan.protocol is ExecutionProtocol.ALTERNATING
+                if execution_plan.run_probes is None
+                else execution_plan.run_probes
+            ),
+        },
+        'experiment_mode': args.mode,
+        'headline_probe_rows': (
+            'emergent_only'
+            if args.mode == 'both'
+            else ('emergent' if args.mode == 'emergent' else 'none')
+        ),
+        'instructed_scientific_status': (
+            'legacy_non_headline_excluded_from_probes'
+            if args.mode in {'instructed', 'both'}
+            else 'not_requested'
+        ),
+    }
     # Parse incentive conditions
     conditions = None  # None = default (HIGH + LOW)
-    if args.conditions:
-        if args.conditions.lower() == "all":
-            conditions = [
-                IncentiveCondition.HIGH_INCENTIVE,
-                IncentiveCondition.LOW_INCENTIVE,
-                IncentiveCondition.PENALTY,
-                IncentiveCondition.MINIMAL,
-            ]
-        else:
-            condition_map = {
-                "high_incentive": IncentiveCondition.HIGH_INCENTIVE,
-                "low_incentive": IncentiveCondition.LOW_INCENTIVE,
-                "penalty": IncentiveCondition.PENALTY,
-                "minimal": IncentiveCondition.MINIMAL,
-            }
-            conditions = []
-            for c in args.conditions.split(","):
-                c = c.strip().lower()
-                if c not in condition_map:
-                    print(f"WARNING: Unknown condition '{c}', skipping. "
-                          f"Valid: {list(condition_map.keys())}")
-                    continue
-                conditions.append(condition_map[c])
+    if validated_condition_names is not None:
+        condition_map = {
+            "high_incentive": IncentiveCondition.HIGH_INCENTIVE,
+            "low_incentive": IncentiveCondition.LOW_INCENTIVE,
+            "penalty": IncentiveCondition.PENALTY,
+            "minimal": IncentiveCondition.MINIMAL,
+        }
+        conditions = [
+            condition_map[name] for name in validated_condition_names
+        ]
         print(f"Incentive conditions: {[c.value for c in conditions]}", flush=True)
+
+    emergent_condition_count = len(conditions) if conditions is not None else 2
+    estimated_emergent_executions = (
+        len(emergent_scenarios)
+        * args.trials
+        * emergent_condition_count
+        * execution_plan.executions_per_family
+        if args.mode in {"emergent", "both"}
+        else 0
+    )
+    estimated_instructed_executions = (
+        len(instructed_scenarios) * args.trials * 2
+        if args.mode in {"instructed", "both"}
+        else 0
+    )
+    track_manifest.update({
+        'semantic_families_per_scenario_condition': args.trials,
+        'executions_per_family': execution_plan.executions_per_family,
+        'estimated_emergent_executions': estimated_emergent_executions,
+        'estimated_instructed_legacy_executions': (
+            estimated_instructed_executions
+        ),
+        'estimated_total_physical_executions': (
+            estimated_emergent_executions + estimated_instructed_executions
+        ),
+    })
+    track_manifest_path = output_dir / 'experiment_track_manifest.json'
+    track_manifest_path.write_text(
+        json.dumps(track_manifest, sort_keys=True, indent=2) + '\n',
+        encoding='utf-8',
+    )
+    print(f"Experiment track: {selected_track.value}", flush=True)
+    print(f"Execution protocol: {execution_plan.protocol.value}", flush=True)
+    print(
+        "Execution budget: "
+        f"{args.trials} semantic families/scenario/condition × "
+        f"{execution_plan.executions_per_family} assignments/family; "
+        f"estimated total={estimated_emergent_executions + estimated_instructed_executions}",
+        flush=True,
+    )
+    print(f"Track manifest: {track_manifest_path}", flush=True)
 
     # Initialize runner
     print(f"\nInitializing InterpretabilityRunner...", flush=True)
@@ -608,9 +991,27 @@ def main():
         use_sae=args.sae,
         sae_layer=args.sae_layer,
         evaluator_api=args.evaluator if args.evaluator != 'none' else None,
+        evaluator_model_name=evaluator_model_name,
+        evaluator_max_tokens=evaluator_max_tokens,
         evaluator_type=evaluator_type,
         trial_id_offset=trial_id_offset,  # For parallel execution
         capture_mean_pooled=args.capture_mean,  # E13: mean-pooled activations
+        experiment_track=selected_track,
+        captured_actor_ids=captured_actor_ids,
+    )
+
+    detector_manifest = track_manifest['evaluator_design'][
+        'ground_truth_detector'
+    ]
+    detector_manifest['effective'] = getattr(
+        runner, 'evaluator_type', evaluator_type
+    )
+    detector_manifest['deepeval_available'] = bool(
+        getattr(runner, '_deepeval_detector', None)
+    )
+    track_manifest_path.write_text(
+        json.dumps(track_manifest, sort_keys=True, indent=2) + '\n',
+        encoding='utf-8',
     )
 
     init_time = time.time() - start_time
@@ -618,6 +1019,10 @@ def main():
 
     # Run experiments
     all_results = {}
+    activations_path = None
+    text_evidence_path = None
+    unpublished_activation_recovery_path = None
+    instructed_recovery_path = None
 
     if args.mode in ["emergent", "both"]:
         results = run_emergent_experiment(
@@ -629,22 +1034,145 @@ def main():
             agent_modules=agent_modules,
             ultrafast=args.ultrafast,
             checkpoint_dir=str(checkpoint_dir) if checkpoint_dir else None,
-            counterpart_type=args.counterpart_type,
+            counterpart_types=list(execution_plan.counterpart_types),
+            protocol=execution_plan.protocol,
+            counterbalance=execution_plan.counterbalance,
+            counterbalance_seed=execution_plan.counterbalance_seed,
+            surface_variants=list(execution_plan.surface_variants),
+            run_probes=execution_plan.run_probes,
+            executions_per_family=execution_plan.executions_per_family,
         )
         all_results["emergent"] = results
+        if selected_track is ExperimentTrack.TEXT_ONLY:
+            text_evidence_path = runner.write_activation_recovery(
+                output_dir / "text_only_evidence.json",
+                reason=(
+                    "text-only runs intentionally contain no activation rows; "
+                    "canonical generations and interaction events are retained"
+                ),
+                experiment_progress={
+                    "experiment_mode": args.mode,
+                    "scientific_status": "text_only_evidence",
+                    "protocol": execution_plan.protocol.value,
+                    "counterpart_policies": list(
+                        execution_plan.counterpart_types
+                    ),
+                    "counterbalance": execution_plan.counterbalance,
+                    "counterbalance_seed": execution_plan.counterbalance_seed,
+                    "surface_variants": list(
+                        execution_plan.surface_variants
+                    ),
+                    "semantic_families_per_scenario_condition": args.trials,
+                    "executions_per_family": (
+                        execution_plan.executions_per_family
+                    ),
+                    "estimated_total_physical_executions": (
+                        estimated_emergent_executions
+                    ),
+                    "probes": {
+                        "mode": execution_plan.probe_mode,
+                        "enabled": (
+                            execution_plan.protocol
+                            is ExecutionProtocol.ALTERNATING
+                            if execution_plan.run_probes is None
+                            else execution_plan.run_probes
+                        ),
+                    },
+                },
+            )
+            print(
+                f"Text-only evidence artifact: {text_evidence_path}",
+                flush=True,
+            )
+        if args.mode == "both" and selected_track is not ExperimentTrack.TEXT_ONLY:
+            if publish_activations:
+                activations_path = runner.save_dataset(
+                    str(output_dir / "activations_emergent_headline.json"),
+                    experiment_track=selected_track.value,
+                    captured_actor_ids=captured_actor_ids,
+                )
+            else:
+                unpublished_activation_recovery_path = (
+                    runner.write_activation_recovery(
+                        output_dir / "emergent_recovery_only.json",
+                        reason=(
+                            "ExperimentConfig.save_activations=False; no final "
+                            "activation dataset was published"
+                        ),
+                        experiment_progress={
+                            "experiment_mode": args.mode,
+                            "scientific_status": "recovery_evidence_only_no_dataset",
+                        },
+                    )
+                )
 
     if args.mode in ["instructed", "both"]:
+        instructed_offsets = {
+            "sample_start": len(runner.activation_samples),
+            "generation_start": len(runner.generation_records),
+            "label_start": len(runner.label_records),
+            "event_start": len(runner.interaction_events),
+        }
         results = run_instructed_experiment(
             runner=runner,
             scenarios=instructed_scenarios,
             trials_per_scenario=args.trials,
         )
         all_results["instructed"] = results
+        instructed_recovery_path = runner.write_activation_recovery(
+            output_dir / "instructed_legacy_recovery.json",
+            **instructed_offsets,
+            reason=(
+                "legacy instructed rows are unclassified, non-headline, and "
+                "ineligible for activation_dataset/4.1.0 publication"
+            ),
+            experiment_progress={
+                "experiment_mode": args.mode,
+                "scientific_status": "legacy_non_headline",
+            },
+        )
+        print(
+            "Instructed recovery artifact (non-publishable): "
+            f"{instructed_recovery_path}",
+            flush=True,
+        )
 
-    # Save activations — directory already encodes model/scenario/config/timestamp
-    activations_path = output_dir / "activations.pt"
-    runner.save_dataset(str(activations_path))
-    print(f"\nActivations saved to: {activations_path}")
+    if (
+        args.mode == "emergent"
+        and selected_track is not ExperimentTrack.TEXT_ONLY
+    ):
+        if publish_activations:
+            activations_path = runner.save_dataset(
+                str(output_dir / "activations.json"),
+                experiment_track=selected_track.value,
+                captured_actor_ids=captured_actor_ids,
+            )
+        else:
+            unpublished_activation_recovery_path = runner.write_activation_recovery(
+                output_dir / "emergent_recovery_only.json",
+                reason=(
+                    "ExperimentConfig.save_activations=False; no final activation "
+                    "dataset was published"
+                ),
+                experiment_progress={
+                    "experiment_mode": args.mode,
+                    "scientific_status": "recovery_evidence_only_no_dataset",
+                },
+            )
+    if activations_path is not None:
+        print(f"\nHeadline activations saved to: {activations_path}")
+
+    experiment_results_path = output_dir / "experiment_results.json"
+    experiment_results_path.write_text(
+        json.dumps(
+            _sanitize_for_json(all_results),
+            sort_keys=True,
+            indent=2,
+            cls=NumpyEncoder,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Experiment results saved to: {experiment_results_path}", flush=True)
 
     # Run sanity checks and train probes
     print(f"\n{'='*60}")
@@ -656,13 +1184,50 @@ def main():
     if args.parallel_pod:
         pod_id = args.parallel_pod.split('/')[0]
 
-    probe_results = train_probes_on_data(
-        str(activations_path),
-        str(output_dir),
-        timestamp=session_timestamp,
-        scenario_name=args.scenario_name,
-        pod_id=pod_id,
-    )
+    if selected_track is ExperimentTrack.TEXT_ONLY:
+        print(
+            'Probe training unavailable: text-only runs contain no activations.',
+            flush=True,
+        )
+        probe_results = {
+            'best_probe': None,
+            'scientific_status': 'unavailable_text_only',
+        }
+    elif args.mode == 'instructed':
+        print(
+            'Headline probe training unavailable: instructed-only rows are '
+            'legacy/non-headline and fail the negotiation eligibility contract.',
+            flush=True,
+        )
+        probe_results = {
+            'best_probe': None,
+            'scientific_status': 'unavailable_instructed_only',
+        }
+    elif not publish_activations:
+        print(
+            'Probe training unavailable: ExperimentConfig.save_activations=False '
+            'disabled activation-dataset publication.',
+            flush=True,
+        )
+        probe_results = {
+            'best_probe': None,
+            'scientific_status': 'unavailable_activation_publication_disabled',
+        }
+    else:
+        if args.mode == 'both':
+            print(
+                'Probe eligibility: training on emergent negotiation rows only; '
+                'instructed compatibility rows are excluded.',
+                flush=True,
+            )
+        probe_results = train_probes_on_data(
+            str(activations_path),
+            str(output_dir),
+            timestamp=session_timestamp,
+            scenario_name=args.scenario_name,
+            pod_id=pod_id,
+            trusted_legacy=False,
+        )
     best_probe = probe_results.get("best_probe")
 
     # Causal validation (if enabled)
@@ -674,10 +1239,7 @@ def main():
         print("CAUSAL VALIDATION")
         print(f"{'='*60}")
 
-        # Load activations for causal tests
-        # NOTE: weights_only=False needed because we save dicts with mixed types (tensors + lists)
-        # Only load files YOU generated - pickle can execute arbitrary code
-        data = torch.load(str(activations_path), weights_only=False)
+        data = load_activation_dataset(activations_path)
         # Convert bfloat16 to float32 before numpy (numpy doesn't support bfloat16)
         activations = {
             k: v.float().numpy() if hasattr(v, 'numpy') else v
@@ -715,7 +1277,9 @@ def main():
             if tl_model is None:
                 tl_model = getattr(runner.model, 'tl_model', None)
             if tl_model is None:
-                print("Warning: Could not access TransformerLens model for causal validation")
+                raise RuntimeError(
+                    "requested causal validation cannot access a TransformerLens model"
+                )
 
             if tl_model is not None:
                 # Pass metadata for matched cross-sample patching
@@ -735,7 +1299,7 @@ def main():
                     group_ids=group_ids,
                     verbose=True,
                 )
-                causal_validated = causal_results.get("overall_passed", False)
+                causal_validated = causal_results.get("causal_claim_ready", False)
 
                 # Save causal results (handle numpy types)
                 def convert_numpy(obj):
@@ -766,13 +1330,17 @@ def main():
             print(f"Causal validation failed: {e}")
             import traceback
             traceback.print_exc()
+            raise
 
     # Print summary
     print(f"\n{'='*60}")
     print("EXPERIMENT COMPLETE")
     print(f"{'='*60}")
     print(f"Total samples: {len(runner.activation_samples)}")
-    print(f"Activations saved: {activations_path}")
+    print(
+        "Primary experiment artifact: "
+        f"{activations_path or text_evidence_path or unpublished_activation_recovery_path or instructed_recovery_path}"
+    )
     print(f"Output directory: {output_dir}")
 
     if isinstance(best_probe, dict):
@@ -783,19 +1351,25 @@ def main():
     if probe_results.get("gm_vs_agent"):
         gm_vs_agent = probe_results["gm_vs_agent"]
         print(f"\nGM vs Agent comparison:")
-        print(f"  GM R²: {gm_vs_agent['gm_ridge_r2']:.3f}")
-        print(f"  Agent R²: {gm_vs_agent['agent_ridge_r2']:.3f}")
-        if gm_vs_agent["gm_wins"]:
-            print(f"  >> GM labels more predictable (implicit deception encoding)")
+        if gm_vs_agent.get("available", True):
+            print(f"  GM R²: {gm_vs_agent['gm_ridge_r2']:.3f}")
+            print(f"  Agent R²: {gm_vs_agent['agent_ridge_r2']:.3f}")
+            if gm_vs_agent["gm_wins"]:
+                print("  >> GM labels more predictable (implicit deception encoding)")
+        else:
+            print(
+                "  Unavailable: "
+                f"{gm_vs_agent.get('reason', 'no valid complete-case counterpart target')}"
+            )
 
     if causal_results:
         print(f"\nCausal validation:")
         print(f"  Tests passed: {causal_results['n_tests_passed']}/{causal_results['n_tests_total']}")
-        print(f"  Evidence strength: {causal_results['causal_evidence_strength'].upper()}")
+        print("  Aggregate evidence strength: unavailable (not calibrated)")
         if causal_validated:
-            print(f"  >> CAUSAL EVIDENCE CONFIRMED")
+            print(f"  >> PREREGISTERED CAUSAL GATE PASSED")
         else:
-            print(f"  >> WARNING: Causal validation failed - correlation may not imply causation")
+            print(f"  >> Review individual estimands and controls; no aggregate claim")
 
     # Print limitations
     print_limitations(

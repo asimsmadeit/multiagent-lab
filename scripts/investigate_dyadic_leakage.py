@@ -16,6 +16,9 @@ Usage:
 
 from __future__ import annotations
 
+# NumPy exposes RandomState at runtime; Pylint cannot infer the lazy namespace.
+# pylint: disable=no-member
+
 import argparse
 import json
 import sys
@@ -23,13 +26,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-import torch
-from huggingface_hub import hf_hub_download
 from sklearn.decomposition import PCA
 from sklearn.linear_model import Ridge
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+)
 
 HF_REPO = 'sycorpia/multiagent-lab-data'
 ALPHA = 100.0
@@ -57,14 +64,19 @@ def _is_negotiation(md_entry: Dict[str, Any]) -> bool:
     return rn >= 0
 
 
-def load_target(alias: str, layer: Optional[int] = None) -> Dict[str, Any]:
+def load_target(
+    alias: str,
+    layer: Optional[int] = None,
+    *,
+    trust_legacy_pt: bool = False,
+) -> Dict[str, Any]:
     """Load an activations.pt, filter to negotiation samples, and return the
     pieces we need for the dyadic analysis (best-layer X, y, counterpart_idxs,
     trial_ids, scenario params/metadata)."""
     path = TARGETS[alias]
     print(f"Loading {path} ...")
-    local = hf_hub_download(HF_REPO, path, repo_type='dataset')
-    data = torch.load(local, weights_only=False)
+    local = download_activation_input(HF_REPO, path)
+    data = load_activation_input(local, trust_legacy_pt=trust_legacy_pt)
 
     metadata = data.get('metadata', [])
     labels = data['labels']
@@ -391,7 +403,13 @@ def phase4_introspect(state, d):
                 direction_stability=stability)
 
 
-def phase5_cross_scenario(target_alias, all_targets, layer=None):
+def phase5_cross_scenario(
+    target_alias,
+    all_targets,
+    layer=None,
+    *,
+    trust_legacy_pt=False,
+):
     """Train dyadic probe on target, test on other scenarios (same model)."""
     print("\n=== Phase V: cross-scenario transfer ===")
     # Determine model family
@@ -406,7 +424,11 @@ def phase5_cross_scenario(target_alias, all_targets, layer=None):
         print(f"  No sibling scenarios for {target_alias}; skipping.")
         return {}
 
-    src = load_target(target_alias, layer=layer)
+    src = load_target(
+        target_alias,
+        layer=layer,
+        trust_legacy_pt=trust_legacy_pt,
+    )
     src_pairs = build_pairs(src['cp'], src['y'])
     if len(src_pairs) < 10:
         print(f"  Too few pairs on source; skipping.")
@@ -423,7 +445,11 @@ def phase5_cross_scenario(target_alias, all_targets, layer=None):
 
     transfer_aucs = {}
     for tgt_alias in sibling_aliases:
-        tgt = load_target(tgt_alias, layer=layer)
+        tgt = load_target(
+            tgt_alias,
+            layer=layer,
+            trust_legacy_pt=trust_legacy_pt,
+        )
         tgt_pairs = build_pairs(tgt['cp'], tgt['y'])
         if len(tgt_pairs) < 10:
             transfer_aucs[tgt_alias] = None
@@ -476,8 +502,13 @@ def phase6_bootstrap(state):
                 ci=(float(np.percentile(aucs, 2.5)), float(np.percentile(aucs, 97.5))))
 
 
-def run_investigation(target_alias: str, verbose: bool = True) -> Dict[str, Any]:
-    d = load_target(target_alias)
+def run_investigation(
+    target_alias: str,
+    verbose: bool = True,
+    *,
+    trust_legacy_pt: bool = False,
+) -> Dict[str, Any]:
+    d = load_target(target_alias, trust_legacy_pt=trust_legacy_pt)
     report = {'target': target_alias, 'path': d['path'], 'layer': d['layer'],
               'n_samples': len(d['y'])}
 
@@ -489,16 +520,22 @@ def run_investigation(target_alias: str, verbose: bool = True) -> Dict[str, Any]
     report['phase3'] = phase3_hypotheses(state, d)
     report['phase4'] = phase4_introspect(state, d)
     report['phase6'] = phase6_bootstrap(state)
-    report['phase5_cross_scenario'] = phase5_cross_scenario(target_alias, TARGETS, layer=d['layer'])
+    report['phase5_cross_scenario'] = phase5_cross_scenario(
+        target_alias,
+        TARGETS,
+        layer=d['layer'],
+        trust_legacy_pt=trust_legacy_pt,
+    )
     return report
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--target', default='llama_iw',
                         choices=list(TARGETS.keys()) + ['all_llama', 'all_1000'])
     parser.add_argument('--out', default='experiment_results/dyadic_investigation.json')
-    args = parser.parse_args()
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
 
     if args.target == 'all_llama':
         targets = [a for a in TARGETS if a.startswith('llama')]
@@ -511,7 +548,10 @@ def main() -> int:
     for t in targets:
         print(f"\n{'='*70}\nINVESTIGATING: {t}\n{'='*70}")
         try:
-            reports[t] = run_investigation(t)
+            reports[t] = run_investigation(
+                t,
+                trust_legacy_pt=args.trust_legacy_pt,
+            )
         except Exception as e:
             import traceback; traceback.print_exc()
             reports[t] = {'error': f'{type(e).__name__}: {e}'}

@@ -4,8 +4,19 @@ This is the central configuration hub for all deception detection experiments.
 Uses Pydantic for validation and serialization.
 """
 
+# Pydantic v2 fields are concrete nested models at runtime; Pylint's static
+# inference sees their class-level FieldInfo descriptors instead.
+# pylint: disable=no-member
+
+import warnings
 from typing import List, Optional, Literal, Dict, Any
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+class _StrictConfigModel(BaseModel):
+    """Forbid silently ignored keys at every public config boundary."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 # =============================================================================
@@ -265,7 +276,7 @@ def get_dense_layers(model_name: str, stride: int = 2) -> List[int]:
     return list(range(0, n_layers, stride))
 
 
-class ModelConfig(BaseModel):
+class ModelConfig(_StrictConfigModel):
     """LLM and interpretability model configuration.
 
     Auto-configuration: When `auto_configure=True` (default), SAE settings
@@ -317,8 +328,11 @@ class ModelConfig(BaseModel):
 
     # SAE settings (auto-configured if auto_configure=True)
     use_sae: bool = Field(
-        default=True,
-        description="Enable Sparse Autoencoder analysis"
+        default=False,
+        description=(
+            "Enable Sparse Autoencoder analysis. Public config launching "
+            "currently requires False until release/id injection is wired."
+        )
     )
     sae_release: Optional[str] = Field(
         default=None,
@@ -337,14 +351,31 @@ class ModelConfig(BaseModel):
     @model_validator(mode='after')
     def apply_model_preset(self) -> 'ModelConfig':
         """Auto-configure SAE settings based on model name."""
+        if not self.use_sae:
+            inactive_values = {
+                "sae_release": self.sae_release,
+                "sae_layer": self.sae_layer,
+                "sae_id": self.sae_id,
+            }
+            configured = [
+                name for name, value in inactive_values.items()
+                if value is not None
+            ]
+            if configured:
+                raise ValueError(
+                    "SAE release/layer/id must be None when use_sae=False; "
+                    "inactive override(s): " + ", ".join(configured)
+                )
+            return self
         if not self.auto_configure:
             return self
 
         preset = get_model_preset(self.name)
         if preset is None:
-            # Unknown model - use defaults or warn
             if self.sae_release is None:
-                self.use_sae = False  # Disable SAE for unknown models
+                raise ValueError(
+                    f"no supported SAE release is known for model {self.name!r}"
+                )
             return self
 
         # Apply preset values only if not explicitly set
@@ -355,9 +386,12 @@ class ModelConfig(BaseModel):
         if self.sae_id is None:
             self.sae_id = preset.get("sae_id")
 
-        # Disable SAE if no release available (e.g., Llama)
+        # Requested SAE analysis must never silently downgrade for a preset
+        # without a supported release (for example, Llama presets).
         if self.sae_release is None:
-            self.use_sae = False
+            raise ValueError(
+                f"no supported SAE release is known for model {self.name!r}"
+            )
 
         return self
 
@@ -381,7 +415,7 @@ class ModelConfig(BaseModel):
         return {"n_layers": None, "d_model": None, "vram_gb": None, "sae_available": False}
 
 
-class EvaluatorConfig(BaseModel):
+class EvaluatorConfig(_StrictConfigModel):
     """Lightweight local evaluator model for ground truth extraction.
 
     The evaluator is a separate (smaller) model that judges whether
@@ -401,9 +435,16 @@ class EvaluatorConfig(BaseModel):
         gt=0,
         description="Max tokens for evaluator responses (short = faster)"
     )
+    ground_truth_method: Literal["deepeval", "rule"] = Field(
+        default="rule",
+        description=(
+            "Ground-truth detector. This is independent of the local structured "
+            "extractor model configured above."
+        ),
+    )
 
 
-class ProbeConfig(BaseModel):
+class ProbeConfig(_StrictConfigModel):
     """Linear probe training configuration.
 
     Token Position for Probing:
@@ -530,10 +571,16 @@ class ProbeConfig(BaseModel):
         return v
 
 
-class CausalConfig(BaseModel):
+class CausalConfig(_StrictConfigModel):
     """Causal validation configuration (activation patching, ablation)."""
 
-    enabled: bool = Field(default=True, description="Enable causal validation")
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable causal validation. Public config launching currently "
+            "requires False until every CausalConfig control is wired."
+        ),
+    )
     num_samples: int = Field(
         default=30,
         gt=0,
@@ -563,16 +610,15 @@ class CausalConfig(BaseModel):
     )
 
 
-class ScenarioConfig(BaseModel):
+class ScenarioConfig(_StrictConfigModel):
     """Deception scenario configuration."""
 
     mode: Literal["emergent", "instructed", "both"] = Field(
-        default="both",
+        default="emergent",
         description="""Scenario mode:
-        - emergent: Incentive-based deception (no explicit instructions)
-        - instructed: Explicit deception instructions (Apollo-style)
-        - both: Run BOTH emergent and instructed modes [DEFAULT]
-        - contest: Game-theoretic scenarios (Fishery, Treaty, Gameshow)
+        - emergent: Incentive-based deception; headline/default dataset
+        - instructed: Legacy explicit-instruction compatibility; non-headline
+        - both: Emergent plus legacy instructed rows; probes use emergent rows only
         """
     )
     scenarios: List[str] = Field(
@@ -602,6 +648,50 @@ class ScenarioConfig(BaseModel):
         gt=0,
         description="Maximum conversation rounds per trial (5 for multi-agent temporal analysis)"
     )
+    agent_modules: List[Literal[
+        "theory_of_mind",
+        "cultural_adaptation",
+        "temporal_strategy",
+        "swarm_intelligence",
+        "uncertainty_aware",
+        "strategy_evolution",
+    ]] = Field(
+        default=["theory_of_mind"],
+        description="Actor cognition modules; access-track requirements are validated.",
+    )
+    protocol: Literal[
+        "alternating", "simultaneous", "solo_no_response"
+    ] = Field(
+        default="alternating",
+        description="Versioned turn scheduler included in trial identity.",
+    )
+    probes: Literal["auto", "on", "off"] = Field(
+        default="auto",
+        description="Typed probe control; auto enables alternating trials only.",
+    )
+    counterpart_policies: List[Literal[
+        "default", "skeptical", "credulous", "informed", "absent"
+    ]] = Field(
+        default=["default", "skeptical", "credulous", "informed"],
+        description="Counterpart policies crossed by the study schedule.",
+    )
+    counterbalance: bool = Field(
+        default=True,
+        description="Balance physical roles, order, policy, and prompt surface.",
+    )
+    counterbalance_seed: int = Field(
+        default=0,
+        ge=0,
+        description="Stable schedule-order seed.",
+    )
+    surface_variants: List[Literal[
+        "default", "formal-brief", "compact-brief", "formal-metadata-only"
+    ]] = Field(
+        default=[
+            "default", "formal-brief", "compact-brief", "formal-metadata-only"
+        ],
+        description="Prompt surfaces crossed by the counterbalance schedule.",
+    )
 
     @field_validator('scenarios')
     @classmethod
@@ -611,9 +701,129 @@ class ScenarioConfig(BaseModel):
             raise ValueError("scenarios list cannot be empty")
         return v
 
+    @field_validator("counterpart_policies")
+    @classmethod
+    def validate_counterpart_policies(cls, value):
+        """Require a duplicate-free nonempty policy design."""
+        if not value:
+            raise ValueError("counterpart_policies cannot be empty")
+        if len(set(value)) != len(value):
+            raise ValueError("counterpart_policies must be unique")
+        return value
 
-class ExperimentConfig(BaseModel):
+    @field_validator("agent_modules")
+    @classmethod
+    def validate_agent_modules(cls, value):
+        """Reject duplicate component construction before an experiment starts."""
+        if len(set(value)) != len(value):
+            raise ValueError("agent_modules must be unique")
+        return value
+
+    @field_validator("surface_variants")
+    @classmethod
+    def validate_surface_variants(cls, value):
+        """Require a nonempty, duplicate-free prompt-surface design."""
+        if not value:
+            raise ValueError("surface_variants cannot be empty")
+        if len(set(value)) != len(value):
+            raise ValueError("surface_variants must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_protocol_policy_pair(self):
+        """Keep solo absence distinct from model-backed counterpart policies."""
+        policies = set(self.counterpart_policies)
+        if self.mode != "emergent" and self.protocol != "alternating":
+            raise ValueError(
+                "legacy instructed execution supports protocol='alternating' only"
+            )
+        if self.protocol == "solo_no_response":
+            if policies != {"absent"}:
+                raise ValueError(
+                    "solo_no_response requires counterpart_policies=['absent']"
+                )
+            if self.counterbalance:
+                raise ValueError(
+                    "solo_no_response does not support two-party counterbalancing"
+                )
+            if self.surface_variants != ["default"]:
+                raise ValueError(
+                    "solo_no_response supports only surface_variants=['default']"
+                )
+        elif "absent" in policies:
+            raise ValueError(
+                "the absent policy requires protocol='solo_no_response'"
+            )
+        if not self.counterbalance and len(self.counterpart_policies) != 1:
+            raise ValueError(
+                "counterbalance=False requires exactly one counterpart policy"
+            )
+        if not self.counterbalance and self.surface_variants != ["default"]:
+            raise ValueError(
+                "counterbalance=False supports only surface_variants=['default']"
+            )
+        if self.probes == "on" and self.protocol != "alternating":
+            raise ValueError("typed probes currently require protocol='alternating'")
+        if self.mode == "instructed":
+            if self.counterpart_policies != [
+                "default", "skeptical", "credulous", "informed"
+            ]:
+                raise ValueError(
+                    "instructed-only legacy runs do not support custom "
+                    "counterpart policies"
+                )
+            if self.surface_variants != [
+                "default", "formal-brief", "compact-brief",
+                "formal-metadata-only",
+            ]:
+                raise ValueError(
+                    "instructed-only legacy runs do not support custom prompt surfaces"
+                )
+            if not self.counterbalance:
+                raise ValueError(
+                    "instructed-only legacy runs require the default "
+                    "counterbalance setting"
+                )
+            if self.probes != "auto":
+                raise ValueError(
+                    "instructed-only legacy runs do not support typed probe controls"
+                )
+        return self
+
+    @property
+    def executions_per_family(self) -> int:
+        """Return the physical execution expansion for one semantic family."""
+        if self.mode == "instructed" or not self.counterbalance:
+            return 1
+        return 4 * len(self.counterpart_policies) * len(self.surface_variants)
+
+    @model_validator(mode="after")
+    def report_legacy_instructed_status(self):
+        """Make non-headline instructed compatibility explicit at config time."""
+        if self.mode in {"instructed", "both"}:
+            warnings.warn(
+                "Instructed scenarios are legacy/non-headline compatibility "
+                "runs. Their unclassified rows are excluded from negotiation "
+                "probe training; mode='both' trains on emergent rows only.",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
+
+
+class ExperimentConfig(_StrictConfigModel):
     """Main experiment configuration combining all settings."""
+
+    experiment_track: Literal[
+        "text_only",
+        "single_agent_white_box",
+        "bilateral_white_box",
+        "theory_of_mind",
+        "adaptive",
+    ] = Field(
+        default="single_agent_white_box",
+        description="Access regime; tracks must not be pooled silently.",
+    )
 
     # Sub-configs
     model: ModelConfig = Field(default_factory=ModelConfig)
@@ -629,11 +839,17 @@ class ExperimentConfig(BaseModel):
     )
     checkpoint_dir: str = Field(
         default="./checkpoints",
-        description="Directory for checkpoints (resume interrupted experiments)"
+        description=(
+            "Directory for audit/manual-salvage recovery snapshots; the public "
+            "CLI cannot resume an experiment schedule from these artifacts"
+        )
     )
     save_activations: bool = Field(
         default=False,
-        description="Save raw activations (large files)"
+        description=(
+            "Publish a final activation dataset. The config-driven public CLI "
+            "currently accepts False only and writes recovery evidence instead."
+        )
     )
 
     # Experiment metadata
@@ -643,6 +859,7 @@ class ExperimentConfig(BaseModel):
     )
     random_seed: int = Field(
         default=42,
+        ge=0,
         description="Random seed for reproducibility. Used when random_seeds is empty."
     )
     random_seeds: List[int] = Field(
@@ -661,7 +878,86 @@ class ExperimentConfig(BaseModel):
 
     # Logging
     verbose: bool = Field(default=True, description="Enable verbose output")
-    log_to_file: bool = Field(default=True, description="Log output to file")
+    log_to_file: bool = Field(
+        default=False,
+        description=(
+            "Log output to a file. The public CLI currently supports stdout only."
+        ),
+    )
+
+    @field_validator("random_seed", mode="before")
+    @classmethod
+    def validate_random_seed(cls, value):
+        """Keep identity-bearing family seeds exact and non-negative."""
+        if type(value) is not int or value < 0:
+            raise ValueError("random_seed must be a non-negative integer")
+        return value
+
+    @field_validator("random_seeds", mode="before")
+    @classmethod
+    def validate_random_seeds(cls, value):
+        """Validate the reserved multi-seed design even while launch is disabled."""
+        if not isinstance(value, list) or not value:
+            raise ValueError("random_seeds must be a non-empty list")
+        if any(type(seed) is not int or seed < 0 for seed in value):
+            raise ValueError(
+                "random_seeds must contain only non-negative integers"
+            )
+        if len(set(value)) != len(value):
+            raise ValueError("random_seeds must be unique")
+        return value
+
+    @model_validator(mode='after')
+    def validate_track_settings(self) -> 'ExperimentConfig':
+        """Make the declared access track authoritative over white-box settings."""
+        modules = set(self.scenarios.agent_modules)
+        if (
+            self.experiment_track == "bilateral_white_box"
+            and self.scenarios.protocol == "solo_no_response"
+        ):
+            raise ValueError(
+                "solo_no_response cannot use the bilateral_white_box track"
+            )
+        if (
+            self.scenarios.mode != "emergent"
+            and self.experiment_track in {
+                "text_only", "bilateral_white_box", "adaptive"
+            }
+        ):
+            raise ValueError(
+                f"{self.experiment_track} currently supports emergent mode only"
+            )
+        if (
+            self.experiment_track == "theory_of_mind"
+            and "theory_of_mind" not in modules
+        ):
+            raise ValueError(
+                "theory_of_mind track requires the theory_of_mind agent module"
+            )
+        if self.experiment_track == "adaptive":
+            if "strategy_evolution" not in modules:
+                raise ValueError(
+                    "adaptive track requires the strategy_evolution agent module"
+                )
+        elif "strategy_evolution" in modules:
+            raise ValueError(
+                f"{self.experiment_track} does not allow online adaptation modules"
+            )
+        if self.experiment_track == "text_only" and self.save_activations:
+            raise ValueError("text_only experiments cannot save activations")
+        if self.experiment_track == "text_only":
+            if self.model.use_sae:
+                raise ValueError("text_only experiments cannot enable SAE analysis")
+            if self.causal.enabled:
+                raise ValueError(
+                    "text_only experiments cannot enable causal activation analysis"
+                )
+            self.model.use_transformerlens = False
+            self.model.cache_activations = False
+            self.causal.run_activation_patching = False
+            self.causal.run_ablation = False
+            self.causal.run_steering = False
+        return self
 
     def to_dict(self) -> dict:
         """Convert config to dictionary for JSON serialization."""
@@ -763,7 +1059,7 @@ QUICK_TEST = ExperimentConfig(
 FULL_EXPERIMENT = ExperimentConfig(
     model=ModelConfig(name="google/gemma-2-27b-it"),
     scenarios=ScenarioConfig(
-        mode="both",
+        mode="emergent",
         scenarios=["alliance_betrayal", "promise_break", "capability_bluff", "info_withholding"],
         num_trials=50,
         max_rounds=5,

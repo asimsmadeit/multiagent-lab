@@ -12,12 +12,18 @@ Predictions:
 """
 
 from __future__ import annotations
-import json, sys
+import argparse
+import json
+import sys
 from pathlib import Path
 import numpy as np
-import torch
-from huggingface_hub import hf_hub_download
 from sklearn.decomposition import PCA
+
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    download_activation_input,
+    load_activation_input,
+)
 
 HF_REPO = 'sycorpia/multiagent-lab-data'
 RUNS = {
@@ -52,14 +58,14 @@ def mass_mean(X, y_binary):
     return None if n < 1e-8 else d / n
 
 
-def directions_for(model: str, config: str):
+def directions_for(model: str, config: str, *, trust_legacy_pt: bool = False):
     out = {}
     for scenario in ('ultimatum_bluff', 'alliance_betrayal', 'info_withholding'):
         key = (model, config, scenario)
         if key not in RUNS:
             continue
-        fp = hf_hub_download(HF_REPO, RUNS[key], repo_type='dataset')
-        data = torch.load(fp, weights_only=False)
+        fp = download_activation_input(HF_REPO, RUNS[key])
+        data = load_activation_input(fp, trust_legacy_pt=trust_legacy_pt)
         md = data.get('metadata', [])
         labels = data['labels']
         acts = data['activations']
@@ -87,7 +93,10 @@ def directions_for(model: str, config: str):
     return out
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
     out_dir = Path('experiment_results/paper_numbers')
     out_dir.mkdir(parents=True, exist_ok=True)
     targets = [('gemma7b', 'tom'), ('gemma7b', 'no_tom'),
@@ -96,7 +105,11 @@ def main():
     for model, config in targets:
         tag = f'{model}_{config}'
         print(f"\n=== {tag} ===")
-        dirs = directions_for(model, config)
+        dirs = directions_for(
+            model,
+            config,
+            trust_legacy_pt=args.trust_legacy_pt,
+        )
         if len(dirs) < 2:
             print(f"  fewer than 2 directions; skipping")
             continue

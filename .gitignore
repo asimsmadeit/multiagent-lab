@@ -97,6 +97,10 @@ credentials.json
 *.hdf5
 data/
 !concordia_mini/contrib/data/
+!interpretability/data/
+!interpretability/data/__init__.py
+!interpretability/data/schema.py
+!interpretability/data/DATA_CARD.txt
 
 # Personal/local files (contain credentials, IPs, etc.)
 docs/RUNPOD_QUICKSTART.md

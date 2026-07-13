@@ -3,11 +3,13 @@
 import dataclasses
 import math
 import re
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from concordia.typing import entity_component
 from concordia.typing import entity as entity_lib
+from negotiation.components.contracts import ComponentDiagnosticContract
 
 
 @dataclasses.dataclass
@@ -96,6 +98,22 @@ class InformationValue:
 class UncertaintyAware(entity_component.ContextComponent):
     """Component for probabilistic reasoning and uncertainty management in negotiations."""
 
+    DIAGNOSTIC_CONTRACT = ComponentDiagnosticContract(
+        inputs=('action_spec.call_to_action', 'counterpart observation'),
+        outputs=('belief distributions', 'scenario analysis', 'uncertainty guidance'),
+        state_fields=(
+            'confidence_threshold', 'risk_tolerance',
+            'information_gathering_budget', 'beliefs', 'avg_confidence',
+            'uncertainty_level',
+            'scenario_probabilities', 'uncertainty_sources',
+            'information_gaps', 'rng_state', 'seed_provenance',
+        ),
+        extra_model_calls={
+            'pre_act': 2, 'post_act': 0, 'pre_observe': 1, 'post_observe': 0,
+        },
+        logging_fields=('avg_confidence', 'evidence_count', 'scenario_name'),
+    )
+
     def __init__(
         self,
         model: Any,
@@ -103,6 +121,7 @@ class UncertaintyAware(entity_component.ContextComponent):
         risk_tolerance: float = 0.3,
         information_gathering_budget: float = 0.1,
         seed: Optional[int] = None,
+        seed_provenance: Optional[Mapping[str, Any]] = None,
     ):
         """Initialize uncertainty-aware component.
 
@@ -125,6 +144,14 @@ class UncertaintyAware(entity_component.ContextComponent):
         self._risk_tolerance = risk_tolerance
         self._info_budget = information_gathering_budget
         self._rng = np.random.default_rng(seed)
+        self._seed_provenance = dict(seed_provenance or {
+            'source': 'constructor' if seed is not None else 'unseeded',
+            'trial_seed': None,
+            'resolved_seed': seed,
+            'module': 'uncertainty_aware',
+        })
+        if self._seed_provenance.get('resolved_seed') != seed:
+            raise ValueError('seed_provenance resolved_seed must match seed.')
 
         # Belief state tracking
         self._beliefs: Dict[str, BeliefDistribution] = {}
@@ -522,6 +549,9 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
     def get_state(self) -> Dict[str, Any]:
         """Return the complete probabilistic state."""
         return {
+            'confidence_threshold': self._confidence_threshold,
+            'risk_tolerance': self._risk_tolerance,
+            'information_gathering_budget': self._info_budget,
             'beliefs': {
                 name: {
                     'mean': belief.mean,
@@ -542,12 +572,30 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
             'uncertainty_sources': list(self._uncertainty_sources),
             'information_gaps': list(self._information_gaps),
             'rng_state': self._rng.bit_generator.state,
+            'seed_provenance': dict(self._seed_provenance),
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Set component state."""
         if not isinstance(state, dict):
             raise TypeError('Uncertainty state must be a mapping.')
+        configuration = {
+            'confidence_threshold': float(
+                state.get('confidence_threshold', self._confidence_threshold)
+            ),
+            'risk_tolerance': float(
+                state.get('risk_tolerance', self._risk_tolerance)
+            ),
+            'information_gathering_budget': float(
+                state.get('information_gathering_budget', self._info_budget)
+            ),
+        }
+        for name, value in configuration.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f'{name} must be between 0 and 1.')
+        self._confidence_threshold = configuration['confidence_threshold']
+        self._risk_tolerance = configuration['risk_tolerance']
+        self._info_budget = configuration['information_gathering_budget']
         for name, belief_data in state.get('beliefs', {}).items():
             if name in self._beliefs:
                 belief = self._beliefs[name]
@@ -572,8 +620,16 @@ RELATIONSHIP_INFO: [quality estimate 0-1] [confidence 0-1]"""
         self._information_gaps = [
             str(item) for item in state.get('information_gaps', [])
         ]
+        provenance = state.get('seed_provenance', self._seed_provenance)
+        if not isinstance(provenance, Mapping):
+            raise TypeError('seed_provenance must be a mapping.')
+        self._seed_provenance = dict(provenance)
         if 'rng_state' in state:
             self._rng.bit_generator.state = state['rng_state']
+
+    def get_seed_provenance(self) -> Dict[str, Any]:
+        """Return the public seed derivation record for this component."""
+        return dict(self._seed_provenance)
 
     def get_action_attempt(
         self,

@@ -1,289 +1,220 @@
 #!/usr/bin/env python3
-"""
-Flexible Data Analysis Script
+"""Discover, merge, summarize, and analyze safe activation datasets."""
 
-Analyze activation data from any combination of experiment runs.
-Supports merging multiple data files and running all probe analyses.
-
-Usage:
-    # Analyze single file
-    python analyze_data.py experiment_output/activations_*.pt
-
-    # Analyze multiple files (auto-merges)
-    python analyze_data.py gpu1/data.pt gpu2/data.pt gpu3/data.pt
-
-    # Analyze all .pt files in a directory
-    python analyze_data.py experiment_output/
-
-    # Specify output directory
-    python analyze_data.py data/*.pt --output results/
-
-    # Just merge, don't analyze
-    python analyze_data.py data/*.pt --merge-only --output merged/
-"""
+from __future__ import annotations
 
 import argparse
 import glob
 import json
 import os
-import sys
-from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any
+import sys
+import tempfile
+from datetime import datetime
+from typing import Any, Mapping, Sequence
 
-import torch
 import numpy as np
 
+from interpretability.data import load_activation_dataset, save_activation_dataset
 
-def find_data_files(paths: List[str]) -> List[str]:
-    """Find all .pt data files from given paths (files or directories)."""
-    data_files = []
 
-    for path in paths:
-        if os.path.isfile(path) and path.endswith('.pt'):
-            data_files.append(path)
-        elif os.path.isdir(path):
-            # Find all .pt files in directory
-            pt_files = glob.glob(os.path.join(path, '*.pt'))
-            pt_files += glob.glob(os.path.join(path, '**/*.pt'), recursive=True)
-            data_files.extend(pt_files)
-        elif '*' in path:
-            # Glob pattern
-            data_files.extend(glob.glob(path))
+def _is_activation_manifest(path: str | Path) -> bool:
+    candidate = Path(path)
+    if candidate.suffix != ".json" or not candidate.is_file():
+        return False
+    try:
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    manifest = payload.get("manifest")
+    return isinstance(manifest, dict) and isinstance(
+        manifest.get("activation_dataset_schema_version"), str
+    )
 
-    # Remove duplicates and sort
-    data_files = sorted(set(data_files))
 
-    # Filter out checkpoint files if there are final activation files
-    final_files = [f for f in data_files if 'checkpoint' not in f.lower()]
+def find_data_files(paths: Sequence[str]) -> list[str]:
+    """Resolve safe manifests and explicitly named legacy .pt artifacts."""
+    candidates: list[str] = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        if path.is_file():
+            if path.suffix == ".pt" or _is_activation_manifest(path):
+                candidates.append(str(path))
+        elif path.is_dir():
+            candidates.extend(
+                str(item)
+                for item in path.rglob("*.json")
+                if _is_activation_manifest(item)
+            )
+            candidates.extend(str(item) for item in path.rglob("*.pt"))
+        elif glob.has_magic(raw_path):
+            for match in glob.glob(raw_path, recursive=True):
+                item = Path(match)
+                if item.suffix == ".pt" or _is_activation_manifest(item):
+                    candidates.append(str(item))
+    data_files = sorted(set(candidates))
+    final_files = [path for path in data_files if "checkpoint" not in path.lower()]
     if final_files:
-        # Prefer final files over checkpoints
-        checkpoint_files = [f for f in data_files if 'checkpoint' in f.lower()]
-        if checkpoint_files:
-            print(f"Note: Ignoring {len(checkpoint_files)} checkpoint files (using final activation files)")
         data_files = final_files
-
     return data_files
 
 
-def load_and_merge(data_files: List[str], verbose: bool = True) -> Dict[str, Any]:
-    """Load and merge multiple data files."""
-
+def load_and_merge(
+    data_files: Sequence[str],
+    verbose: bool = True,
+    *,
+    trusted_legacy: bool = False,
+) -> dict[str, Any]:
+    """Load one dataset or safely merge several datasets."""
+    if not data_files:
+        raise ValueError("at least one activation dataset is required")
     if len(data_files) == 1:
         if verbose:
             print(f"Loading: {data_files[0]}")
-        return torch.load(data_files[0], weights_only=False)
-
-    # Multiple files - use merge utility
-    if verbose:
-        print(f"\nMerging {len(data_files)} data files:")
-        for f in data_files:
-            print(f"  - {f}")
-
-    from interpretability.merge_parallel_results import merge_parallel_activations
-    import tempfile
-
-    # Merge to temp file
-    with tempfile.TemporaryDirectory() as tmpdir:
-        merged_path = merge_parallel_activations(
-            data_files,
-            output_dir=tmpdir,
-            timestamp="merged",
-            verbose=verbose,
+        return load_activation_dataset(
+            data_files[0],
+            trusted_legacy=trusted_legacy,
         )
-        merged_data = torch.load(merged_path, weights_only=False)
+    if verbose:
+        print(f"Merging {len(data_files)} data files")
+    from interpretability.merge_parallel_results import merge_parallel_activations
 
-    return merged_data
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        merged_path = merge_parallel_activations(
+            list(data_files),
+            output_dir=temporary_directory,
+            timestamp="analysis",
+            verbose=verbose,
+            trusted_legacy=trusted_legacy,
+        )
+        return load_activation_dataset(merged_path)
 
 
-def run_analysis(data: Dict[str, Any], output_dir: str, timestamp: str, verbose: bool = True) -> Dict[str, Any]:
-    """Run full probe analysis on data."""
-
+def run_analysis(
+    data: Mapping[str, Any],
+    output_dir: str,
+    timestamp: str,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Run the primary grouped probe analysis through a safe temporary bundle."""
     from interpretability.probes.train_probes import run_full_analysis
 
-    # Save merged data temporarily for analysis
-    temp_path = os.path.join(output_dir, f"_temp_merged_{timestamp}.pt")
-    torch.save(data, temp_path)
-
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    base = destination / f"_temp_merged_{timestamp}"
+    saved = save_activation_dataset(base.with_suffix(".json"), data)
+    manifest_path = saved[1]
     try:
         if verbose:
-            print(f"\n{'='*60}")
             print("RUNNING PROBE ANALYSIS")
-            print(f"{'='*60}")
-
-        results = run_full_analysis(temp_path)
-
-        # Save results
-        results_path = os.path.join(output_dir, f"probe_results_{timestamp}.json")
-        with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-
+        results = run_full_analysis(str(manifest_path), trusted_legacy=False)
+        results_path = destination / f"probe_results_{timestamp}.json"
+        results_path.write_text(
+            json.dumps(results, indent=2, default=str) + "\n",
+            encoding="utf-8",
+        )
         if verbose:
-            print(f"\nResults saved to: {results_path}")
-
+            print(f"Results saved to: {results_path}")
         return results
-
     finally:
-        # Clean up temp file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        saved[0].unlink(missing_ok=True)
+        saved[1].unlink(missing_ok=True)
 
 
-def print_summary(data: Dict[str, Any], results: Dict[str, Any] = None):
-    """Print summary of data and results."""
-
-    print(f"\n{'='*60}")
+def print_summary(
+    data: Mapping[str, Any],
+    results: Mapping[str, Any] | None = None,
+) -> None:
+    """Print concise dataset and available-analysis summaries."""
+    config = data.get("config", {})
+    labels = data.get("labels", {})
     print("DATA SUMMARY")
-    print(f"{'='*60}")
-
-    config = data.get('config', {})
-    labels = data.get('labels', {})
-
     print(f"Total samples: {config.get('n_samples', len(labels.get('gm_labels', [])))}")
-    print(f"Layers: {config.get('layers', list(data.get('activations', {}).keys()))}")
-
-    # Deception rate
-    gm_labels = labels.get('gm_labels', [])
+    print(f"Layers: {config.get('layers', list(data.get('activations', {})))}")
+    gm_labels = [
+        float(value)
+        for value in labels.get("gm_labels", [])
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and np.isfinite(value)
+    ]
     if gm_labels:
-        deception_rate = np.mean([l > 0.5 for l in gm_labels])
-        print(f"Deception rate: {deception_rate:.1%}")
-
-    # Mode distribution
-    mode_labels = labels.get('mode_labels', [])
-    if mode_labels:
-        modes = {}
-        for m in mode_labels:
-            modes[m] = modes.get(m, 0) + 1
-        print(f"Mode distribution: {modes}")
-
-    # Scenario distribution
-    scenarios = labels.get('scenario', [])
-    if scenarios:
-        scenario_counts = {}
-        for s in scenarios:
-            scenario_counts[s] = scenario_counts.get(s, 0) + 1
-        print(f"Scenarios: {scenario_counts}")
-
-    # Pod info
-    merge_info = data.get('merge_info', {})
-    if merge_info:
-        print(f"Merged from {merge_info.get('n_pods', 1)} sources")
-
-    pod_info = data.get('pod_info', {})
-    if pod_info and not merge_info:
-        print(f"Pod ID: {pod_info.get('pod_id', 0)}")
-        print(f"Trial ID range: {pod_info.get('trial_id_range', 'N/A')}")
-
-    if results:
-        print(f"\n{'='*60}")
-        print("ANALYSIS RESULTS")
-        print(f"{'='*60}")
-
-        if results.get('best_probe'):
-            bp = results['best_probe']
-            print(f"Best probe - Layer {bp.get('layer')}: R²={bp.get('r2', 0):.3f}, AUC={bp.get('auc', 0):.3f}")
-
-        if results.get('gm_vs_agent'):
-            gva = results['gm_vs_agent']
-            print(f"GM vs Agent - GM R²={gva.get('gm_ridge_r2', 0):.3f}, Agent R²={gva.get('agent_ridge_r2', 0):.3f}")
-            if gva.get('gm_wins'):
-                print("  >> Actual-deception labels are more predictable than counterpart-belief labels")
-
-        if results.get('cross_mode_transfer'):
-            cmt = results['cross_mode_transfer']
-            print(f"Cross-mode transfer - Forward AUC={cmt.get('forward_transfer_auc', 0):.3f}, Reverse AUC={cmt.get('reverse_transfer_auc', 0):.3f}")
+        print(f"Deception rate: {np.mean(np.asarray(gm_labels) > 0.5):.1%}")
+    for label_name, heading in (
+        ("mode_labels", "Mode distribution"),
+        ("scenario", "Scenarios"),
+    ):
+        values = labels.get(label_name, [])
+        if values:
+            counts: dict[Any, int] = {}
+            for value in values:
+                counts[value] = counts.get(value, 0) + 1
+            print(f"{heading}: {counts}")
+    if results and results.get("best_probe"):
+        best_probe = results["best_probe"]
+        print(
+            f"Best probe - Layer {best_probe.get('layer')}: "
+            f"R²={best_probe.get('r2', 0):.3f}, "
+            f"AUC={best_probe.get('auc', 0):.3f}"
+        )
+    if results and results.get("gm_vs_agent"):
+        comparison = results["gm_vs_agent"]
+        if comparison.get("available", True):
+            print(
+                "GM vs Agent - "
+                f"GM R²={comparison['gm_ridge_r2']:.3f}, "
+                f"Agent R²={comparison['agent_ridge_r2']:.3f}"
+            )
+        else:
+            print(f"GM vs Agent unavailable: {comparison.get('reason', 'unknown')}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Analyze activation data from deception detection experiments",
+        description="Analyze safe activation datasets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    # Analyze single file
-    python analyze_data.py experiment_output/activations_*.pt
-
-    # Analyze multiple files (auto-merges)
-    python analyze_data.py gpu1/data.pt gpu2/data.pt gpu3/data.pt
-
-    # Analyze all .pt files in a directory
-    python analyze_data.py experiment_output/
-
-    # Just merge, don't analyze
-    python analyze_data.py data/*.pt --merge-only --output merged/
-        """
-    )
-
-    parser.add_argument(
-        'data_paths',
-        nargs='+',
-        help="Data files (.pt) or directories containing them"
     )
     parser.add_argument(
-        '--output', '-o',
-        type=str,
-        default='./analysis_output',
-        help="Output directory for results (default: ./analysis_output)"
+        "data_paths",
+        nargs="+",
+        help="Safe .json manifests, reviewed legacy .pt files, directories, or globs",
     )
+    parser.add_argument("--output", "-o", default="./analysis_output")
+    parser.add_argument("--merge-only", action="store_true")
+    parser.add_argument("--summary-only", action="store_true")
+    parser.add_argument("--quiet", "-q", action="store_true")
     parser.add_argument(
-        '--merge-only',
-        action='store_true',
-        help="Only merge data files, don't run analysis"
+        "--trust-legacy-pt",
+        action="store_true",
+        help="Allow pickle-capable .pt loading only for reviewed inputs",
     )
-    parser.add_argument(
-        '--summary-only',
-        action='store_true',
-        help="Only print data summary, don't run full analysis"
-    )
-    parser.add_argument(
-        '--quiet', '-q',
-        action='store_true',
-        help="Suppress verbose output"
-    )
-
     args = parser.parse_args()
-    verbose = not args.quiet
-
-    # Find all data files
     data_files = find_data_files(args.data_paths)
-
     if not data_files:
-        print("Error: No .pt data files found")
+        print("Error: no activation datasets found")
         sys.exit(1)
-
-    if verbose:
-        print(f"Found {len(data_files)} data file(s)")
-
-    # Create output directory
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Load and optionally merge data
-    data = load_and_merge(data_files, verbose=verbose)
-
+    data = load_and_merge(
+        data_files,
+        verbose=not args.quiet,
+        trusted_legacy=args.trust_legacy_pt,
+    )
     if args.merge_only:
-        # Save merged data
-        merged_path = output_dir / f"merged_data_{timestamp}.pt"
-        torch.save(data, merged_path)
-        print(f"\nMerged data saved to: {merged_path}")
+        saved = save_activation_dataset(
+            output_dir / f"merged_data_{timestamp}.json",
+            data,
+        )
+        print(f"Merged data saved to: {saved[1]}")
         print_summary(data)
         return
-
     if args.summary_only:
         print_summary(data)
         return
-
-    # Run full analysis
-    results = run_analysis(data, str(output_dir), timestamp, verbose=verbose)
-
-    # Print summary
+    results = run_analysis(data, str(output_dir), timestamp, verbose=not args.quiet)
     print_summary(data, results)
-
-    print(f"\n{'='*60}")
-    print(f"Analysis complete! Results in: {output_dir}")
-    print(f"{'='*60}")
+    print(f"Analysis complete. Results in: {output_dir}")
 
 
 if __name__ == "__main__":

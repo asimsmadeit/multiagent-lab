@@ -125,6 +125,44 @@ def test_validator_round_trip_preserves_enforcement() -> None:
     assert restored.enforce_agreement(agreement.agreement_id)
 
 
+def test_contract_feasibility_uses_explicit_typed_constraints() -> None:
+    validator = gm_validation.NegotiationValidator(
+        domain_type='contract',
+        enable_batna_check=False,
+        enable_fairness_check=False,
+    )
+    valid, errors = validator.validate_offer(
+        'Alice',
+        {
+            'duration': 12,
+            'payment_terms': 'net 30',
+            'start_date': '2030-02-01',
+        },
+        {
+            'available_duration_months': 18,
+            'earliest_start_date': '2030-01-01',
+        },
+    )
+    assert valid is True
+    assert errors == []
+
+    invalid, errors = validator.validate_offer(
+        'Alice',
+        {
+            'duration': 24,
+            'payment_terms': 'net 30',
+            'start_date': 'not-a-date',
+        },
+        {
+            'available_duration_months': 18,
+            'earliest_start_date': '2030-01-01',
+        },
+    )
+    assert invalid is False
+    assert 'Contract duration exceeds documented availability' in errors
+    assert 'Contract start_date must use ISO YYYY-MM-DD format' in errors
+
+
 def test_registry_contains_every_module_and_suggestions_are_stable() -> None:
     registered = set(gm_modules.NegotiationGMModuleRegistry.list_modules())
     assert registered == {
@@ -139,3 +177,25 @@ def test_registry_contains_every_module_and_suggestions_are_stable() -> None:
         'Alice': {'theory_of_mind', 'uncertainty_aware'},
     })
     assert suggestions == ['social_intelligence', 'uncertainty_management']
+
+
+def test_module_detection_uses_public_component_mapping_only() -> None:
+    class PublicAgent:
+        name = 'Alice'
+
+        @staticmethod
+        def get_all_context_components():
+            return {
+                'TheoryOfMind': object(),
+                'UncertaintyAware': object(),
+                'unrelated': object(),
+            }
+
+        def __getattr__(self, name):
+            if name == '_context_components':
+                raise AssertionError('private component storage was accessed')
+            raise AttributeError(name)
+
+    assert gm_modules.detect_agent_modules([PublicAgent()]) == {
+        'Alice': {'theory_of_mind', 'uncertainty_aware'}
+    }

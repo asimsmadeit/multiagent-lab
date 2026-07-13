@@ -16,6 +16,8 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 
+from interpretability.data import permute_group_blocks
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,7 +74,16 @@ def sanity_check_random_labels(
 
     rng = np.random.default_rng(random_state)
     for seed in range(n_shuffles):
-        y_shuffled = rng.permutation(y)
+        y_shuffled, unavailable_reason = permute_group_blocks(y, groups, rng)
+        if y_shuffled is None:
+            return {
+                "available": False,
+                "mean_shuffled_r2": None,
+                "std_shuffled_r2": None,
+                "max_shuffled_r2": None,
+                "passed": None,
+                "message": f"Random-label check unavailable: {unavailable_reason}",
+            }
         train_idx, test_idx = _split_indices(
             X, y_shuffled, random_state + seed, groups=groups
         )
@@ -86,6 +97,7 @@ def sanity_check_random_labels(
 
     mean_r2 = np.mean(shuffle_r2s)
     return {
+        "available": True,
         "mean_shuffled_r2": float(mean_r2),
         "std_shuffled_r2": float(np.std(shuffle_r2s)),
         "max_shuffled_r2": float(np.max(shuffle_r2s)),
@@ -250,7 +262,10 @@ def run_all_sanity_checks(
         X_mid, gm_labels, random_state=random_state, groups=groups
     )
     if verbose:
-        status = "PASSED" if results["random_labels"]["passed"] else "FAILED"
+        if not results["random_labels"].get("available", True):
+            status = "UNAVAILABLE"
+        else:
+            status = "PASSED" if results["random_labels"]["passed"] else "FAILED"
         print(f"\n1. Random Labels: {status}")
         print(f"   {results['random_labels']['message']}")
 
@@ -280,12 +295,17 @@ def run_all_sanity_checks(
         print(f"   {results['layer_0_baseline']['message']}")
 
     # Overall
-    all_passed = all(r["passed"] for r in results.values())
+    all_available = all(r.get("available", True) for r in results.values())
+    all_passed = all_available and all(r["passed"] for r in results.values())
+    results["all_available"] = all_available
     results["all_passed"] = all_passed
 
     if verbose:
         print("\n" + "-" * 60)
-        overall = "ALL CHECKS PASSED" if all_passed else "SOME CHECKS FAILED"
+        if not all_available:
+            overall = "CHECKS INCOMPLETE: REQUIRED GROUPING UNAVAILABLE"
+        else:
+            overall = "ALL CHECKS PASSED" if all_passed else "SOME CHECKS FAILED"
         print(f"Overall: {overall}")
 
     return results

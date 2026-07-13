@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill sample_type field on legacy activations.pt files.
+"""Backfill ``sample_type`` in safe datasets or reviewed legacy ``.pt`` files.
 
 Created 2026-04-21 as part of the data-quality remediation work. The
 `sample_type` field was added to `ActivationSample` on 2026-04-21 to
@@ -12,12 +12,13 @@ it backfilled from the `round_num` convention:
     round_num >= 0   -> sample_type = "negotiation"
 
 Usage:
-    python scripts/backfill_sample_type.py path/to/activations.pt
-    python scripts/backfill_sample_type.py --in-place path/to/activations.pt
+    python scripts/backfill_sample_type.py path/to/activations.json
+    python scripts/backfill_sample_type.py --in-place path/to/activations.json
     python scripts/backfill_sample_type.py --dir experiment_results/
 
-By default writes to <input>.backfilled.pt alongside the original so the
-source file is preserved. Pass --in-place to overwrite.
+By default writes a ``.backfilled.json``/``.npz`` bundle alongside a safe
+input. Loading or writing pickle-capable ``.pt`` files requires the explicit
+``--trust-legacy-pt`` acknowledgement.
 
 This script does NOT upload to Hugging Face. To publish:
     huggingface-cli upload sycorpia/multiagent-lab-data \\
@@ -31,7 +32,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-import torch
+from interpretability.data import save_activation_dataset
+from interpretability.script_artifacts import (
+    add_legacy_trust_argument,
+    load_activation_input,
+    prefer_safe_activation_path,
+)
 
 
 def _infer_sample_type(round_num: Any) -> str:
@@ -49,10 +55,20 @@ def _infer_sample_type(round_num: Any) -> str:
     return 'negotiation'
 
 
-def backfill(path: Path, in_place: bool = False, dry_run: bool = False) -> Dict[str, int]:
-    """Backfill sample_type on one .pt file. Returns counts by sample_type."""
-    print(f"Loading: {path}")
-    data = torch.load(path, weights_only=False)
+def backfill(
+    path: Path,
+    in_place: bool = False,
+    dry_run: bool = False,
+    *,
+    trust_legacy_pt: bool = False,
+) -> Dict[str, int]:
+    """Backfill one activation dataset and return counts by sample type."""
+    source = prefer_safe_activation_path(path)
+    print(f"Loading: {source}")
+    data = load_activation_input(
+        source,
+        trust_legacy_pt=trust_legacy_pt,
+    )
 
     metadata = data.get('metadata')
     if metadata is None:
@@ -63,8 +79,8 @@ def backfill(path: Path, in_place: bool = False, dry_run: bool = False) -> Dict[
 
     round_nums = None
     labels_dict = data.get('labels', {})
-    if isinstance(labels_dict, dict) and 'round_num' in labels_dict:
-        round_nums = labels_dict['round_num']
+    if isinstance(labels_dict, dict):
+        round_nums = labels_dict.get('round_nums', labels_dict.get('round_num'))
 
     counts: Dict[str, int] = {'negotiation': 0, 'pre_verification': 0,
                               'post_plausibility': 0, 'already_set': 0}
@@ -90,51 +106,75 @@ def backfill(path: Path, in_place: bool = False, dry_run: bool = False) -> Dict[
         print(f"  DRY RUN: not writing output")
         return counts
 
-    # Save: either in place or alongside with .backfilled.pt suffix
-    out_path = path if in_place else path.with_name(path.stem + '.backfilled.pt')
+    # Preserve the source format, while keeping legacy writes behind the same
+    # explicit trust acknowledgement as legacy reads.
+    out_path = source if in_place else source.with_name(
+        source.stem + f'.backfilled{source.suffix}'
+    )
     print(f"  Writing: {out_path}")
-    torch.save(data, out_path)
+    save_activation_dataset(
+        out_path,
+        data,
+        trusted_legacy=trust_legacy_pt,
+    )
     return counts
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('path', nargs='*', help='.pt file(s) to backfill')
-    parser.add_argument('--dir', help='Process every .pt file under this directory')
+    parser.add_argument('path', nargs='*', help='activation dataset(s) to backfill')
+    parser.add_argument('--dir', help='Process activation datasets under this directory')
     parser.add_argument('--in-place', action='store_true',
                         help='Overwrite the input file instead of writing .backfilled.pt')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print counts but do not write output')
-    args = parser.parse_args()
+    add_legacy_trust_argument(parser)
+    args = parser.parse_args(argv)
 
     targets = [Path(p) for p in args.path]
     if args.dir:
-        for p in sorted(Path(args.dir).rglob('*.pt')):
-            # Skip files we would treat as output of a previous backfill run
-            if p.suffixes[-2:] == ['.backfilled', '.pt']:
-                continue
-            targets.append(p)
+        directory = Path(args.dir)
+        discovered = set(directory.rglob('*activation*.json'))
+        discovered.update(
+            prefer_safe_activation_path(path)
+            for path in directory.rglob('*.pt')
+        )
+        targets.extend(
+            path for path in sorted(discovered)
+            if '.backfilled.' not in path.name
+        )
+
+    targets = list(dict.fromkeys(
+        prefer_safe_activation_path(path) for path in targets
+    ))
 
     if not targets:
         parser.print_help()
         return 1
 
     totals: Dict[str, int] = {}
+    failures = 0
     for path in targets:
         if not path.exists():
             print(f"SKIP: {path} does not exist")
             continue
         try:
-            counts = backfill(path, in_place=args.in_place, dry_run=args.dry_run)
+            counts = backfill(
+                path,
+                in_place=args.in_place,
+                dry_run=args.dry_run,
+                trust_legacy_pt=args.trust_legacy_pt,
+            )
             for k, v in counts.items():
                 totals[k] = totals.get(k, 0) + v
         except Exception as e:
             print(f"ERROR on {path}: {type(e).__name__}: {e}")
+            failures += 1
 
     print("\n=== Totals across all files ===")
     for k, v in sorted(totals.items()):
         print(f"  {k}: {v}")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == '__main__':

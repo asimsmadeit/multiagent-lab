@@ -43,7 +43,11 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+
+
+QC_VERSION = 'response-qc/2'
 
 
 # Compile once at module load; these run on every sample during a full-dataset
@@ -132,6 +136,77 @@ def classify_response(text: Optional[str]) -> Set[str]:
     return flags
 
 
+_EXACT_EXECUTION_RESPONSES = {
+    'promise_break': frozenset({'COOPERATE', 'DEFECT'}),
+    'alliance_betrayal': frozenset({
+        'HONOR ALLIANCE',
+        'HONOUR ALLIANCE',
+        'BETRAY ALLIANCE',
+    }),
+}
+
+
+def is_exact_protocol_execution(
+    text: Optional[str],
+    *,
+    scenario: Optional[str],
+    semantic_phase: Optional[str],
+) -> bool:
+    """Return whether text is an exact typed action at an execution boundary."""
+    if not isinstance(text, str) or semantic_phase != 'execution':
+        return False
+    allowed = _EXACT_EXECUTION_RESPONSES.get(str(scenario))
+    if allowed is None:
+        return False
+    normalized = ' '.join(text.strip().upper().split())
+    return normalized in allowed
+
+
+def classify_sample_response(
+    text: Optional[str],
+    *,
+    scenario: Optional[str] = None,
+    semantic_phase: Optional[str] = None,
+) -> Set[str]:
+    """Classify one row while honoring typed protocol-action semantics.
+
+    Promise/alliance execution prompts require an exact short token. Such a
+    token is a valid decision rather than text corruption, but the exemption
+    applies only when both the canonical scenario and execution phase are
+    retained. All other quality flags remain active.
+    """
+    flags = classify_response(text)
+    if is_exact_protocol_execution(
+        text,
+        scenario=scenario,
+        semantic_phase=semantic_phase,
+    ):
+        flags.discard('too_short')
+    return flags
+
+
+def _sample_field(sample: Any, name: str) -> Any:
+    if isinstance(sample, Mapping):
+        return sample.get(name)
+    return getattr(sample, name, None)
+
+
+def _classify_sample(
+    sample: Any,
+    response_getter: Callable[[Any], Optional[str]],
+) -> Set[str]:
+    scenario = (
+        _sample_field(sample, 'emergent_scenario')
+        or _sample_field(sample, 'scenario_type')
+        or _sample_field(sample, 'scenario')
+    )
+    return classify_sample_response(
+        response_getter(sample),
+        scenario=scenario,
+        semantic_phase=_sample_field(sample, 'semantic_phase'),
+    )
+
+
 def _sample_is_negotiation(sample: Any) -> bool:
     """Return True if the sample is a real negotiation turn.
 
@@ -174,7 +249,7 @@ def filter_samples(
     for s in samples:
         if drop_probe_rounds and not _sample_is_negotiation(s):
             continue
-        flags = classify_response(response_getter(s))
+        flags = _classify_sample(s, response_getter)
         if flags - keep_flags:
             continue
         kept.append(s)
@@ -202,7 +277,7 @@ def qc_report(
     for s in samples_list:
         if not _sample_is_negotiation(s):
             continue
-        flags = classify_response(response_getter(s))
+        flags = _classify_sample(s, response_getter)
         if not flags:
             n_clean += 1
         for f in flags:

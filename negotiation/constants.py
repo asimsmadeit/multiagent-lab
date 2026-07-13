@@ -92,15 +92,19 @@ DEFAULT_MODULE_CONFIGS = {
     ModuleType.SWARM_INTELLIGENCE: {
         'consensus_threshold': 0.7,
         'max_iterations': 3,
+        'enable_sub_agents': None,
     },
     ModuleType.UNCERTAINTY_AWARE: {
         'confidence_threshold': 0.7,
-        'risk_tolerance': 0.5,
-        'ambiguity_aversion': 0.3,
+        'risk_tolerance': 0.3,
+        'information_gathering_budget': 0.1,
+        'seed': None,
     },
     ModuleType.STRATEGY_EVOLUTION: {
-        'population_size': 5,
-        'learning_rate': 0.1,
-        'strategy_memory': 10,
+        'population_size': 20,
+        'mutation_rate': 0.1,
+        'crossover_rate': 0.7,
+        'learning_rate': 0.01,
+        'seed': None,
     },
 }

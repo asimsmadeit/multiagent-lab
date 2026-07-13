@@ -32,7 +32,7 @@ class DeterministicModel:
         if 'relationship impact' in prompt:
             return 'build|renewal promise|positive|medium'
         if 'extract:' in prompt.lower() and 'counterpart name' in prompt.lower():
-            return 'Bob|75|trust and future plans'
+            return 'Bob|continued negotiation|trust and future plans|75|unknown'
         if 'Format your response as:' in prompt and 'ANALYSIS:' in prompt:
             return (
                 'ANALYSIS: Evidence-based assessment\n'

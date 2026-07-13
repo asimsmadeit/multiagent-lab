@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# Optional imports are deliberately conditional so this test module remains a
+# normal skipped test (exit 0) when the separately packaged benchmark is absent.
+# pylint: disable=import-error,possibly-used-before-assignment
+
 from collections import Counter
 import importlib.util
 from pathlib import Path
@@ -8,14 +12,27 @@ import types
 
 import pytest
 
-pytest.importorskip(
-    "esr_bench",
+_ESR_BENCH_AVAILABLE = importlib.util.find_spec("esr_bench") is not None
+pytestmark = pytest.mark.skipif(
+    not _ESR_BENCH_AVAILABLE,
     reason="ESR-Bench is an optional benchmark package with separate gold data.",
 )
 
-from esr_bench.data import build_task1_dataframe, build_task2_dataframe, load_task1_items, load_task2_items
-from esr_bench.kaggle_tasks import build_task1_records, build_task2_records
-from esr_bench.tasks import build_task1_prompt, build_task2_prompt, grade_task1_response, grade_task2_response, normalize_choice
+if _ESR_BENCH_AVAILABLE:
+    from esr_bench.data import (
+        build_task1_dataframe,
+        build_task2_dataframe,
+        load_task1_items,
+        load_task2_items,
+    )
+    from esr_bench.kaggle_tasks import build_task1_records, build_task2_records
+    from esr_bench.tasks import (
+        build_task1_prompt,
+        build_task2_prompt,
+        grade_task1_response,
+        grade_task2_response,
+        normalize_choice,
+    )
 
 
 def test_load_task1_items():

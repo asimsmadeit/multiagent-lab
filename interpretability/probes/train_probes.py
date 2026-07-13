@@ -24,6 +24,17 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 
+from interpretability.data import (
+    SplitManifest,
+    load_activation_dataset,
+    negotiation_sample_mask,
+    permute_group_blocks,
+)
+from interpretability.probes.metrics import (
+    evaluate_nested_grouped_layers,
+    resolve_manifest_row_groups,
+)
+
 
 # =============================================================================
 # PROBE CLASSES
@@ -264,7 +275,9 @@ def train_ridge_probe(
     if use_pca:
         n_comp = min(n_components, X_train.shape[0] - 1, X_train.shape[1])
         if n_comp >= 1:
-            probe_steps.append(('pca', PCA(n_components=n_comp)))
+            probe_steps.append(('pca', PCA(
+                n_components=n_comp, random_state=random_state
+            )))
     probe_steps.append(('ridge', Ridge(alpha=alpha)))
     probe = Pipeline(probe_steps)
     probe.fit(X_train, y_train)
@@ -285,7 +298,10 @@ def train_ridge_probe(
         # Two-fold CV is the smallest possible training fold. This conservative
         # bound also keeps PCA valid for small grouped datasets.
         max_pca = max(1, X.shape[0] // 2 - 1)
-        cv_steps.append(('pca', PCA(n_components=min(n_components, max_pca, X.shape[1]))))
+        cv_steps.append(('pca', PCA(
+            n_components=min(n_components, max_pca, X.shape[1]),
+            random_state=random_state,
+        )))
     cv_steps.append(('ridge', Ridge(alpha=alpha)))
     try:
         if groups is not None:
@@ -392,7 +408,9 @@ def train_logistic_probe(
         if use_pca:
             n_comp = min(n_components, n_fit_rows - 1, X.shape[1])
             if n_comp >= 1:
-                steps.append(('pca', PCA(n_components=n_comp)))
+                steps.append(('pca', PCA(
+                    n_components=n_comp, random_state=random_state
+                )))
         steps.append(('lr', LogisticRegression(
             C=c_value, max_iter=5000,
             random_state=random_state, solver='lbfgs',
@@ -482,7 +500,8 @@ def train_logistic_probe(
         if use_pca:
             max_pca = max(1, X.shape[0] // 2 - 1)
             cv_steps.append(('pca', PCA(
-                n_components=min(n_components, max_pca, X.shape[1])
+                n_components=min(n_components, max_pca, X.shape[1]),
+                random_state=random_state,
             )))
         cv_steps.append(('lr', LogisticRegression(
             C=C, max_iter=5000, solver='lbfgs'
@@ -515,10 +534,12 @@ def train_probe_multi_seed(
     seeds: List[int] = None,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Train probes across multiple random seeds and aggregate results.
+    """Train probes across split seeds and report descriptive sensitivity.
 
-    This provides robust performance estimates with confidence intervals,
-    following best practices from RAPTOR (2026) and Truth is Universal (NeurIPS 2024).
+    Split seeds reuse the same observations and therefore are correlated.
+    Their spread is a sensitivity diagnostic, not a sampling confidence
+    interval. Inferential intervals must instead resample independent connected
+    trial-family/dyad units.
 
     Args:
         X: Feature matrix [N, d_model]
@@ -528,7 +549,7 @@ def train_probe_multi_seed(
         **kwargs: Additional arguments passed to the probe training function
 
     Returns:
-        Dict with per-seed results, mean/std metrics, and 95% CI
+        Dict with per-seed results and descriptive seed-sensitivity summaries
     """
     if seeds is None:
         seeds = [42, 123, 456, 789, 1024]
@@ -556,23 +577,23 @@ def train_probe_multi_seed(
     aucs = [r["auc"] for r in per_seed]
     accs = [r["accuracy"] for r in per_seed]
 
-    # 95% CI (using t-distribution for small n)
-    from scipy import stats
     n = len(aucs)
     auc_mean = np.mean(aucs)
     auc_std = np.std(aucs, ddof=1) if n > 1 else 0.0
-    if n > 1:
-        t_val = stats.t.ppf(0.975, df=n - 1)
-        auc_ci = (auc_mean - t_val * auc_std / np.sqrt(n),
-                  auc_mean + t_val * auc_std / np.sqrt(n))
-    else:
-        auc_ci = (auc_mean, auc_mean)
+    seed_range = (float(np.min(aucs)), float(np.max(aucs)))
+    seed_quantiles = tuple(
+        float(value) for value in np.quantile(aucs, [0.05, 0.95])
+    )
 
     return {
         "per_seed": per_seed,
         "auc_mean": float(auc_mean),
         "auc_std": float(auc_std),
-        "auc_ci_95": (float(auc_ci[0]), float(auc_ci[1])),
+        "auc_seed_range": seed_range,
+        "auc_seed_quantiles_05_95": seed_quantiles,
+        "interval_interpretation": (
+            "descriptive split-seed sensitivity; not a confidence interval"
+        ),
         "accuracy_mean": float(np.mean(accs)),
         "accuracy_std": float(np.std(accs, ddof=1)) if n > 1 else 0.0,
         "n_seeds": n,
@@ -758,23 +779,34 @@ def sanity_check_random_labels(
     y: np.ndarray,
     n_shuffles: int = 5,
     groups: Optional[np.ndarray] = None,
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """Sanity check: probes on shuffled labels should give R² near 0."""
     shuffle_r2s = []
     rng = np.random.default_rng(0)
 
     for seed in range(n_shuffles):
-        y_shuffled = rng.permutation(y)
+        y_shuffled, unavailable_reason = permute_group_blocks(y, groups, rng)
+        if y_shuffled is None:
+            return {
+                "available": False,
+                "mean_shuffled_r2": None,
+                "std_shuffled_r2": None,
+                "max_shuffled_r2": None,
+                "passed": None,
+                "message": f"Random-label check unavailable: {unavailable_reason}",
+            }
         _, result = train_ridge_probe(
             X, y_shuffled, random_state=seed, groups=groups
         )
         shuffle_r2s.append(result.r2_score)
 
     return {
+        "available": True,
         "mean_shuffled_r2": float(np.mean(shuffle_r2s)),
         "std_shuffled_r2": float(np.std(shuffle_r2s)),
         "max_shuffled_r2": float(np.max(shuffle_r2s)),
         "passed": bool(np.mean(shuffle_r2s) < 0.05),
+        "message": "Complete compatible label blocks were permuted",
     }
 
 
@@ -819,6 +851,10 @@ def train_probes_per_layer(
     use_pca: bool = True,
     n_components: int = 30,
     groups: Optional[np.ndarray] = None,
+    partition_labels: Optional[np.ndarray] = None,
+    split_manifest: Optional[SplitManifest] = None,
+    trial_ids: Optional[np.ndarray] = None,
+    diagnostic_non_headline: bool = False,
 ) -> Dict[int, Dict[str, float]]:
     """
     Train separate probes on each layer to find optimal layer for deception detection.
@@ -834,12 +870,49 @@ def train_probes_per_layer(
         activations_by_layer: Dict mapping layer_num -> activations [N, d_model]
         labels: Ground truth labels [N]
         alpha: Ridge regularization
+        groups: Connected family/dyad identity for each repeated turn
         use_pca: Whether to apply PCA
         n_components: PCA components
 
     Returns:
         Dict mapping layer_num -> {auc, r2, accuracy, train_r2, test_r2}
     """
+    if partition_labels is not None or split_manifest is not None:
+        hyperparameters = ({
+            "C": max(1e-6, 1.0 / float(alpha)),
+            "n_components": n_components if use_pca else min(
+                np.asarray(next(iter(activations_by_layer.values()))).shape[1],
+                len(labels) - 1,
+            ),
+        },)
+        evaluation = evaluate_nested_grouped_layers(
+            activations_by_layer,
+            labels,
+            partition_labels=partition_labels,
+            groups=groups if split_manifest is None else None,
+            split_manifest=split_manifest,
+            trial_ids=trial_ids,
+            hyperparameters=hyperparameters,
+        )
+        return {
+            int(row["layer"]): {
+                "auc": row["development_metrics"]["auc"],
+                "r2": row["development_metrics"]["r2"],
+                "accuracy": row["development_metrics"]["accuracy"],
+                "train_r2": float("nan"),
+                "test_r2": float("nan"),
+                "selection_partition": "development",
+                "headline_eligible": True,
+            }
+            for row in evaluation.selection_table
+        }
+    if not diagnostic_non_headline:
+        raise ValueError(
+            "Headline per-layer training requires train/development/test "
+            "partitions and connected groups. Set diagnostic_non_headline=True "
+            "only for deprecated random-holdout diagnostics."
+        )
+
     results = {}
 
     for layer_num, X in sorted(activations_by_layer.items()):
@@ -856,7 +929,9 @@ def train_probes_per_layer(
         if len(y) < 10:
             results[layer_key] = {
                 'auc': 0.5, 'r2': 0.0, 'accuracy': 0.5,
-                'train_r2': 0.0, 'test_r2': 0.0, 'note': 'insufficient samples'
+                'train_r2': 0.0, 'test_r2': 0.0, 'note': 'insufficient samples',
+                'selection_partition': 'deprecated_random_holdout',
+                'headline_eligible': False,
             }
             continue
 
@@ -864,7 +939,9 @@ def train_probes_per_layer(
         if np.std(y) < 0.01:
             results[layer_key] = {
                 'auc': 0.5, 'r2': 0.0, 'accuracy': 0.5,
-                'train_r2': 0.0, 'test_r2': 0.0, 'note': 'no label variance'
+                'train_r2': 0.0, 'test_r2': 0.0, 'note': 'no label variance',
+                'selection_partition': 'deprecated_random_holdout',
+                'headline_eligible': False,
             }
             continue
 
@@ -879,17 +956,25 @@ def train_probes_per_layer(
                 'accuracy': probe_result.accuracy,
                 'train_r2': probe_result.train_r2,
                 'test_r2': probe_result.test_r2,
+                'selection_partition': 'deprecated_random_holdout',
+                'headline_eligible': False,
             }
         except Exception as e:
             results[layer_key] = {
                 'auc': 0.5, 'r2': 0.0, 'accuracy': 0.5,
-                'train_r2': 0.0, 'test_r2': 0.0, 'error': str(e)
+                'train_r2': 0.0, 'test_r2': 0.0, 'error': str(e),
+                'selection_partition': 'deprecated_random_holdout',
+                'headline_eligible': False,
             }
 
     return results
 
 
-def find_best_layer(layer_results: Dict[int, Dict[str, float]]) -> Dict[str, Any]:
+def find_best_layer(
+    layer_results: Dict[int, Dict[str, float]],
+    *,
+    diagnostic_non_headline: bool = False,
+) -> Dict[str, Any]:
     """
     Find the best layer and analyze the layer accuracy curve.
 
@@ -898,6 +983,16 @@ def find_best_layer(layer_results: Dict[int, Dict[str, float]]) -> Dict[str, Any
     """
     if not layer_results:
         return {'best_layer': None, 'error': 'No layer results'}
+    headline_eligible = all(
+        result.get("selection_partition") == "development"
+        and result.get("headline_eligible") is True
+        for result in layer_results.values()
+    )
+    if not headline_eligible and not diagnostic_non_headline:
+        raise ValueError(
+            "Best-layer selection requires development metrics. Deprecated "
+            "random-holdout diagnostics cannot produce a headline layer."
+        )
 
     # Find best by AUC
     best_layer = max(layer_results.keys(), key=lambda l: layer_results[l].get('auc', 0))
@@ -943,6 +1038,10 @@ def find_best_layer(layer_results: Dict[int, Dict[str, float]]) -> Dict[str, Any
         'has_expected_inverted_u': has_expected_shape,
         'relative_position': float(relative_position),
         'layer_aucs': {int(l): float(layer_results[l]['auc']) for l in layers},
+        'selection_partition': (
+            'development' if headline_eligible else 'deprecated_random_holdout'
+        ),
+        'headline_eligible': headline_eligible,
         'analysis': {
             'first_third_avg_auc': float(first_avg) if first_avg is not None else None,
             'middle_third_avg_auc': float(middle_avg) if middle_avg is not None else None,
@@ -1017,15 +1116,12 @@ def compute_generalization_auc(
     X: np.ndarray,
     y: np.ndarray,
     scenarios: List[str],
+    groups: np.ndarray,
     alpha: float = 100.0,
     random_state: int = 42,
     verbose: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Compute cross-scenario generalization using leave-one-scenario-out (LOSO) evaluation.
-
-    This is a CRITICAL validation for deception probes. A probe that generalizes
-    across scenarios is detecting deception-general features, not scenario-specific artifacts.
+    """Measure leave-one-scenario-out transfer without connected-group leakage.
 
     Methodology (Leave-One-Scenario-Out Cross-Validation):
         For each scenario S:
@@ -1034,15 +1130,13 @@ def compute_generalization_auc(
         3. Report R² and AUC for this holdout
         4. Repeat for all scenarios
 
-    Interpretation:
-        - High cross-scenario AUC (>0.7): Probe likely captures general deception
-        - Low cross-scenario AUC (<0.55): Probe may be learning scenario artifacts
-        - Large variance: Some scenarios are outliers (different deception types)
-
     Args:
         X: Feature matrix [N, d_model]
         y: Labels [N]
         scenarios: List of scenario names [N], one per sample
+        groups: Connected family/dyad identity [N]. Any identity spanning a
+            held-out scenario and its training scenarios makes that contrast
+            unavailable rather than allowing related examples to leak.
         alpha: Ridge regularization strength
         random_state: Random seed for reproducibility
         verbose: Print per-scenario results
@@ -1051,31 +1145,76 @@ def compute_generalization_auc(
         Dict with:
         - by_scenario: Results for each holdout scenario
         - average_r2: Mean R² across scenarios
-        - average_auc: Mean AUC across scenarios (recommended metric)
+        - average_auc: Descriptive mean AUC across available holdouts
         - std_r2/std_auc: Standard deviations
     """
-    unique_scenarios = list(set(scenarios))
+    X = np.asarray(X)
+    y = np.asarray(y, dtype=float)
+    scenarios_array = np.asarray(scenarios, dtype=str)
+    if groups is None:
+        raise ValueError(
+            "Cross-scenario transfer requires connected family/dyad groups"
+        )
+    groups_array = np.asarray(groups, dtype=str)
+    if not (
+        len(X) == len(y) == len(scenarios_array) == len(groups_array)
+    ):
+        raise ValueError("X, y, scenarios, and groups must be sample-aligned")
+    if not np.isfinite(X).all() or not np.isfinite(y).all():
+        raise ValueError("Cross-scenario inputs must be finite")
+    unique_scenarios = sorted(set(scenarios_array.tolist()))
     results = {}
 
     for holdout in unique_scenarios:
         # Split by scenario
-        train_mask = np.array([s != holdout for s in scenarios])
+        train_mask = scenarios_array != holdout
         test_mask = ~train_mask
 
         X_train = X[train_mask]
         X_test = X[test_mask]
         y_train = y[train_mask]
         y_test = y[test_mask]
-
-        # Skip if test set has only one class
-        if len(np.unique((y_test > 0.5).astype(int))) < 2:
+        train_groups = set(groups_array[train_mask].tolist())
+        test_groups = set(groups_array[test_mask].tolist())
+        crossing_groups = sorted(train_groups & test_groups)
+        if crossing_groups:
             results[holdout] = {
+                "available": False,
                 "train_size": int(train_mask.sum()),
                 "test_size": int(test_mask.sum()),
                 "test_r2": None,
                 "test_auc": None,
                 "deception_rate": float(np.mean(y_test)),
-                "note": "Single class in test set",
+                "reason": (
+                    "Connected family/dyad groups cross the scenario holdout: "
+                    + ", ".join(crossing_groups)
+                ),
+                "crossing_group_ids": crossing_groups,
+            }
+            continue
+
+        # Skip if test set has only one class
+        if len(np.unique((y_test > 0.5).astype(int))) < 2:
+            results[holdout] = {
+                "available": False,
+                "train_size": int(train_mask.sum()),
+                "test_size": int(test_mask.sum()),
+                "test_r2": None,
+                "test_auc": None,
+                "deception_rate": float(np.mean(y_test)),
+                "reason": "Single class in test set",
+            }
+            continue
+
+        if len(np.unique((y_train > 0.5).astype(int))) < 2:
+            results[holdout] = {
+                "available": False,
+                "train_size": int(train_mask.sum()),
+                "test_size": int(test_mask.sum()),
+                "test_r2": None,
+                "test_auc": None,
+                "deception_rate": float(np.mean(y_test)),
+                "reason": "Single class in training set",
             }
             continue
 
@@ -1086,7 +1225,7 @@ def compute_generalization_auc(
 
         # Apply PCA
         n_comp = min(30, X_train_s.shape[0] - 1, X_train_s.shape[1])
-        pca = PCA(n_components=n_comp)
+        pca = PCA(n_components=n_comp, random_state=random_state)
         X_train_pca = pca.fit_transform(X_train_s)
         X_test_pca = pca.transform(X_test_s)
 
@@ -1105,11 +1244,14 @@ def compute_generalization_auc(
             test_auc = 0.5
 
         results[holdout] = {
+            "available": True,
             "train_size": int(train_mask.sum()),
             "test_size": int(test_mask.sum()),
             "test_r2": float(test_r2),
             "test_auc": float(test_auc),
             "deception_rate": float(np.mean(y_test)),
+            "train_group_count": len(train_groups),
+            "test_group_count": len(test_groups),
         }
 
     # Compute averages (excluding None values)
@@ -1122,6 +1264,13 @@ def compute_generalization_auc(
         "average_auc": float(np.mean(valid_aucs)) if valid_aucs else None,
         "std_r2": float(np.std(valid_r2s)) if valid_r2s else None,
         "std_auc": float(np.std(valid_aucs)) if valid_aucs else None,
+        "available_holdouts": len(valid_aucs),
+        "total_holdouts": len(unique_scenarios),
+        "estimand": "leave-one-scenario-out ranking on connected-group-disjoint rows",
+        "interpretation_limit": (
+            "AUC measures transfer for these held-out scenarios; it does not "
+            "establish a scenario-general deception representation."
+        ),
     }
 
 
@@ -1174,17 +1323,33 @@ def compare_model_scales(
     comparison["9b"]["best_layer"] = r9b["best_probe"]["layer"]
     comparison["27b"]["best_layer"] = r27b["best_probe"]["layer"]
 
-    # GM vs Agent gap
-    gap_9b = r9b["gm_vs_agent"]["gm_ridge_r2"] - r9b["gm_vs_agent"]["agent_ridge_r2"]
-    gap_27b = r27b["gm_vs_agent"]["gm_ridge_r2"] - r27b["gm_vs_agent"]["agent_ridge_r2"]
-    comparison["9b"]["gm_agent_gap"] = gap_9b
-    comparison["27b"]["gm_agent_gap"] = gap_27b
-    comparison["deltas"]["gm_agent_gap"] = gap_27b - gap_9b
+    # Target comparison is valid only when both experiments retained an
+    # explicit binary complete-case sample.
+    if (
+        r9b["gm_vs_agent"].get("available") is True
+        and r27b["gm_vs_agent"].get("available") is True
+    ):
+        gap_9b = (
+            r9b["gm_vs_agent"]["gm_ridge_r2"]
+            - r9b["gm_vs_agent"]["agent_ridge_r2"]
+        )
+        gap_27b = (
+            r27b["gm_vs_agent"]["gm_ridge_r2"]
+            - r27b["gm_vs_agent"]["agent_ridge_r2"]
+        )
+        comparison["9b"]["gm_agent_gap"] = gap_9b
+        comparison["27b"]["gm_agent_gap"] = gap_27b
+        comparison["deltas"]["gm_agent_gap"] = gap_27b - gap_9b
+    else:
+        comparison["gm_agent_comparison_available"] = False
 
-    # GM AUC
-    comparison["9b"]["gm_auc"] = r9b["gm_vs_agent"]["gm_auc"]
-    comparison["27b"]["gm_auc"] = r27b["gm_vs_agent"]["gm_auc"]
-    comparison["deltas"]["gm_auc"] = r27b["gm_vs_agent"]["gm_auc"] - r9b["gm_vs_agent"]["gm_auc"]
+    # Primary actual-deception AUC is independent of counterpart-label
+    # availability and remains bound to the locked headline probe.
+    comparison["9b"]["gm_auc"] = r9b["best_probe"]["auc"]
+    comparison["27b"]["gm_auc"] = r27b["best_probe"]["auc"]
+    comparison["deltas"]["gm_auc"] = (
+        r27b["best_probe"]["auc"] - r9b["best_probe"]["auc"]
+    )
 
     # Generalization (if available)
     if "generalization" in r9b and "generalization" in r27b:
@@ -1287,15 +1452,10 @@ def _interpret_trajectory(slopes: Dict[int, float], r2s: Dict[int, float]) -> st
     avg_slope = np.mean(list(slopes.values()))
     avg_r2 = np.mean(list(r2s.values()))
 
-    if avg_r2 < 0.1:
-        return "No clear temporal pattern (low R²)"
-
-    if avg_slope > 0.05:
-        return f"Deception encoding INCREASES over rounds (slope={avg_slope:.3f})"
-    elif avg_slope < -0.05:
-        return f"Deception encoding DECREASES over rounds (slope={avg_slope:.3f})"
-    else:
-        return f"Stable deception encoding across rounds (slope={avg_slope:.3f})"
+    return (
+        "Observed linear slope of per-round held-out AUC: "
+        f"{avg_slope:.3f} (trajectory R²={avg_r2:.3f})."
+    )
 
 
 def compute_cross_mode_transfer(
@@ -1306,20 +1466,13 @@ def compute_cross_mode_transfer(
     use_pca: bool = True,
     n_components: int = 30,
     groups: Optional[np.ndarray] = None,
+    random_state: int = 42,
 ) -> Dict[str, Any]:
-    """RQ1: Compute bidirectional cross-mode transfer between instructed and emergent.
+    """Measure bidirectional transfer on connected-group-disjoint modes.
 
     Tests whether deception representations transfer between:
     - Forward: instructed → emergent (explicit to incentive-based)
     - Reverse: emergent → instructed (incentive-based to explicit)
-
-    Symmetric transfer suggests shared underlying representation.
-    Asymmetric transfer suggests one mode's representation is more general.
-
-    Interpretation:
-    - High transfer (AUC > 0.65): Same underlying representation
-    - Low transfer (AUC ~ 0.5): Different mechanisms
-    - Asymmetry > 0.10: One direction transfers significantly better
 
     Args:
         X: Feature matrix [N, d_model]
@@ -1328,16 +1481,30 @@ def compute_cross_mode_transfer(
         alpha: Ridge regularization
         use_pca: Whether to apply PCA
         n_components: PCA components
+        groups: Connected family/dyad identity for every row. Transfer is
+            unavailable if an identity occurs in both modes.
+        random_state: PCA and diagnostic split seed
 
     Returns:
         Dict with forward_transfer_auc, reverse_transfer_auc, transfer_asymmetry,
-        and interpretation including asymmetry analysis
+        and an explicit statement of the measured estimand and its limits
     """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
     mode_labels = np.array(mode_labels)
     if len(mode_labels) != len(y) or len(X) != len(y):
         raise ValueError("X, y, and mode_labels must be sample-aligned")
-    if groups is not None and len(groups) != len(y):
+    if groups is None:
+        raise ValueError(
+            "Cross-mode transfer requires connected family/dyad groups"
+        )
+    if len(groups) != len(y):
         raise ValueError("groups must have one value per sample")
+    groups_array = np.asarray(groups, dtype=str)
+    if not np.isfinite(np.asarray(X, dtype=float)).all():
+        raise ValueError("X must contain only finite activations")
+    if not np.isfinite(np.asarray(y, dtype=float)).all():
+        raise ValueError("y must contain only finite labels")
 
     # Split by mode
     instructed_mask = mode_labels == "instructed"
@@ -1359,20 +1526,23 @@ def compute_cross_mode_transfer(
     y_instructed = y[instructed_mask]
     X_emergent = X[emergent_mask]
     y_emergent = y[emergent_mask]
+    instructed_group_ids = set(groups_array[instructed_mask].tolist())
+    emergent_group_ids = set(groups_array[emergent_mask].tolist())
+    crossing_groups = sorted(instructed_group_ids & emergent_group_ids)
+    if crossing_groups:
+        return {
+            "available": False,
+            "error": (
+                "Connected family/dyad groups occur in both modes; an "
+                "unpaired cross-mode estimand would leak related trials"
+            ),
+            "crossing_group_ids": crossing_groups,
+            "n_instructed": int(n_instructed),
+            "n_emergent": int(n_emergent),
+        }
 
-    # === 2026-04-21 Finding 7 fix: unify label scale before training ===
-    # emergent samples receive binary {0, 1} labels from regex-based
-    # emergent_ground_truth; instructed samples receive continuous GM
-    # severity scores. The previous implementation trained a ridge probe on
-    # continuous instructed labels and evaluated its predictions against
-    # binary emergent labels (and vice versa), so the "cross-mode transfer
-    # fails" null result was confounded with a label-scale mismatch, not a
-    # pure representational distinction. Binarize both y vectors at the 0.5
-    # threshold before training so transfer AUC is an apples-to-apples
-    # comparison. The continuous R² becomes uninformative after binarization
-    # (R² on binary targets is not meaningful) so we report transfer in AUC
-    # only, with the continuous R² preserved in a separate _continuous field
-    # for backward compatibility.
+    # Use one explicit binary target definition in both directions. Continuous
+    # perception estimates belong to a separate regression analysis.
     y_instructed_binary = (y_instructed > 0.5).astype(float)
     y_emergent_binary = (y_emergent > 0.5).astype(float)
     if (
@@ -1388,7 +1558,7 @@ def compute_cross_mode_transfer(
     # Apply PCA on training data (instructed)
     if use_pca:
         n_comp = min(n_components, X_instructed.shape[0] - 1, X_instructed.shape[1])
-        pca = PCA(n_components=n_comp)
+        pca = PCA(n_components=n_comp, random_state=random_state)
         X_instructed_pca = pca.fit_transform(X_instructed)
         X_emergent_pca = pca.transform(X_emergent)
     else:
@@ -1403,15 +1573,6 @@ def compute_cross_mode_transfer(
     emergent_pred = probe.predict(X_emergent_pca)
     transfer_r2 = r2_score(y_emergent_binary, emergent_pred)
 
-    # Also compute the old (label-scale-mismatched) R² for comparison with
-    # pre-2026-04-21 results. If this is much worse than the binarized R²,
-    # the old "cross-mode transfer fails" null was at least partly a
-    # label-scale artifact.
-    probe_legacy = Ridge(alpha=alpha)
-    probe_legacy.fit(X_instructed_pca, y_instructed)
-    emergent_pred_legacy = probe_legacy.predict(X_emergent_pca)
-    transfer_r2_legacy_mixed = r2_score(y_emergent, emergent_pred_legacy)
-
     # Compute AUC for forward transfer (instructed → emergent)
     try:
         forward_transfer_auc = roc_auc_score(y_emergent_binary.astype(int), emergent_pred)
@@ -1422,7 +1583,7 @@ def compute_cross_mode_transfer(
     # This tests if the relationship is symmetric
     if use_pca:
         n_comp_rev = min(n_components, X_emergent.shape[0] - 1, X_emergent.shape[1])
-        pca_rev = PCA(n_components=n_comp_rev)
+        pca_rev = PCA(n_components=n_comp_rev, random_state=random_state)
         X_emergent_pca_rev = pca_rev.fit_transform(X_emergent)
         X_instructed_pca_rev = pca_rev.transform(X_instructed)
     else:
@@ -1436,12 +1597,6 @@ def compute_cross_mode_transfer(
     instructed_pred = probe_reverse.predict(X_instructed_pca_rev)
     reverse_transfer_r2 = r2_score(y_instructed_binary, instructed_pred)
 
-    # Legacy (mismatched-scale) reverse for back-compat reporting
-    probe_reverse_legacy = Ridge(alpha=alpha)
-    probe_reverse_legacy.fit(X_emergent_pca_rev, y_emergent)
-    instructed_pred_legacy = probe_reverse_legacy.predict(X_instructed_pca_rev)
-    reverse_transfer_r2_legacy_mixed = r2_score(y_instructed, instructed_pred_legacy)
-
     # Compute AUC for reverse transfer (using unified binary labels)
     try:
         reverse_transfer_auc = roc_auc_score(y_instructed_binary.astype(int), instructed_pred)
@@ -1451,16 +1606,18 @@ def compute_cross_mode_transfer(
     # Also compute within-mode performance for comparison
     # Guard: within-mode datasets may be too small or imbalanced for train/test split
     try:
-        instructed_groups = np.asarray(groups)[instructed_mask] if groups is not None else None
+        instructed_groups = groups_array[instructed_mask]
         _, instructed_result = train_ridge_probe(
-            X_instructed, y_instructed, alpha=alpha, groups=instructed_groups
+            X_instructed, y_instructed_binary, alpha=alpha,
+            groups=instructed_groups, random_state=random_state,
         )
     except ValueError:
         instructed_result = None
     try:
-        emergent_groups = np.asarray(groups)[emergent_mask] if groups is not None else None
+        emergent_groups = groups_array[emergent_mask]
         _, emergent_result = train_ridge_probe(
-            X_emergent, y_emergent, alpha=alpha, groups=emergent_groups
+            X_emergent, y_emergent_binary, alpha=alpha,
+            groups=emergent_groups, random_state=random_state,
         )
     except ValueError:
         emergent_result = None
@@ -1468,24 +1625,8 @@ def compute_cross_mode_transfer(
     # Compute asymmetry
     transfer_asymmetry = abs(forward_transfer_auc - reverse_transfer_auc)
 
-    # Interpretation based on forward transfer (primary metric)
-    if forward_transfer_auc > 0.70:
-        interpretation = "STRONG transfer - instructed and emergent share deception representation"
-    elif forward_transfer_auc > 0.60:
-        interpretation = "MODERATE transfer - partial overlap in representations"
-    elif forward_transfer_auc > 0.55:
-        interpretation = "WEAK transfer - some shared features but largely different"
-    else:
-        interpretation = "NO transfer - distinct mechanisms for instructed vs emergent deception"
-
-    # Add asymmetry note if significant
-    if transfer_asymmetry > 0.10:
-        if forward_transfer_auc > reverse_transfer_auc:
-            interpretation += " (ASYMMETRIC: instructed→emergent transfers better)"
-        else:
-            interpretation += " (ASYMMETRIC: emergent→instructed transfers better)"
-
     return {
+        "available": True,
         "n_instructed": int(n_instructed),
         "n_emergent": int(n_emergent),
         # Forward transfer (instructed → emergent); both sides binarized
@@ -1494,12 +1635,6 @@ def compute_cross_mode_transfer(
         # Reverse transfer (emergent → instructed); both sides binarized
         "reverse_transfer_r2": float(reverse_transfer_r2),
         "reverse_transfer_auc": float(reverse_transfer_auc),
-        # === 2026-04-21 Finding 7 diagnostic fields ===
-        # Legacy mixed-scale R²: continuous instructed labels in train,
-        # binary emergent labels in test (and vice versa). Included so the
-        # delta between unified and legacy is visible in the report.
-        "forward_transfer_r2_legacy_mixed": float(transfer_r2_legacy_mixed),
-        "reverse_transfer_r2_legacy_mixed": float(reverse_transfer_r2_legacy_mixed),
         "label_scale_unified": True,
         # Legacy field for backwards compatibility
         "transfer_auc": float(forward_transfer_auc),
@@ -1511,7 +1646,17 @@ def compute_cross_mode_transfer(
         "emergent_within_auc": float(emergent_result.auc) if emergent_result else None,
         "instructed_deception_rate": float(np.mean(y_instructed)),
         "emergent_deception_rate": float(np.mean(y_emergent)),
-        "interpretation": interpretation,
+        "estimand": (
+            "bidirectional ranking transfer between connected-group-disjoint "
+            "instructed and emergent samples"
+        ),
+        "interpretation": (
+            "These AUCs describe out-of-mode ranking on the observed samples."
+        ),
+        "interpretation_limit": (
+            "Transfer magnitude alone does not identify shared or distinct "
+            "neural mechanisms."
+        ),
     }
 
 
@@ -1522,7 +1667,7 @@ def analyze_implicit_encoding(
     alpha: float = 100.0,
     groups: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
-    """Compare actual-deception and perceived-counterpart label predictability.
+    """Compare binary targets on one declared complete-case sample.
 
     ``agent_labels`` are Theory-of-Mind estimates about the counterpart. They
     are not self-reports about the acting agent, so this comparison cannot by
@@ -1537,7 +1682,26 @@ def analyze_implicit_encoding(
     Returns:
         Dict with comparison metrics and significance
     """
-    # Train probes on each label type
+    X = np.asarray(X, dtype=float)
+    gm_labels = np.asarray(gm_labels, dtype=float)
+    agent_labels = np.asarray(agent_labels, dtype=float)
+    if not (len(X) == len(gm_labels) == len(agent_labels)):
+        raise ValueError("X, gm_labels, and agent_labels must be sample-aligned")
+    if groups is None or len(groups) != len(gm_labels):
+        raise ValueError(
+            "Label-source comparison requires one connected group per row"
+        )
+    if not np.isfinite(X).all():
+        raise ValueError("X must contain only finite activations")
+    for name, values in (
+        ("gm_labels", gm_labels), ("agent_labels", agent_labels)
+    ):
+        if not np.isfinite(values).all() or not np.isin(values, (0.0, 1.0)).all():
+            raise ValueError(
+                f"{name} must contain available explicit binary labels"
+            )
+
+    # Train probes on each target using identical rows and group identities.
     _, gm_result = train_ridge_probe(
         X, gm_labels, alpha=alpha, groups=groups
     )
@@ -1555,17 +1719,9 @@ def analyze_implicit_encoding(
     auc_gap = gm_result.auc - agent_result.auc
     r2_gap = gm_result.r2_score - agent_result.r2_score
 
-    # Interpretation
-    if auc_gap > 0.10:
-        interpretation = "STRONG label-source divergence - actual behavior is more decodable"
-    elif auc_gap > 0.05:
-        interpretation = "MODERATE label-source divergence - actual behavior is more decodable"
-    elif auc_gap > -0.05:
-        interpretation = "SIMILAR decodability across actual and counterpart-perception labels"
-    else:
-        interpretation = "Counterpart-perception labels are more decodable"
-
     return {
+        "available": True,
+        "comparison_n": len(gm_labels),
         "gm_auc": float(gm_result.auc),
         "gm_r2": float(gm_result.r2_score),
         "agent_auc": float(agent_result.auc),
@@ -1577,8 +1733,38 @@ def analyze_implicit_encoding(
         "gm_wins": bool(auc_gap > 0),
         "supports_self_awareness_claim": False,
         "agent_label_semantics": "perceived counterpart deception, not self-report",
-        "interpretation": interpretation,
+        "estimand": "difference in held-out decodability on complete-case rows",
+        "interpretation": (
+            f"Observed actual-minus-counterpart AUC difference: {auc_gap:.3f}."
+        ),
+        "interpretation_limit": (
+            "The targets have different semantics; their metric difference is "
+            "descriptive and is not evidence of self-awareness."
+        ),
     }
+
+
+def _exact_binary_target(
+    values: Any,
+    *,
+    expected_rows: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return numeric target values and an exact-binary availability mask."""
+    if values is None or len(values) != expected_rows:
+        raise ValueError("Target array must have one value per sample")
+    numeric = np.full(expected_rows, np.nan, dtype=float)
+    available = np.zeros(expected_rows, dtype=bool)
+    for index, value in enumerate(values):
+        if isinstance(value, (bool, np.bool_)):
+            numeric[index] = float(value)
+            available[index] = True
+            continue
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            candidate = float(value)
+            if np.isfinite(candidate) and candidate in (0.0, 1.0):
+                numeric[index] = candidate
+                available[index] = True
+    return numeric, available
 
 
 def analyze_round_trajectory(
@@ -1605,8 +1791,10 @@ def analyze_round_trajectory(
     round_nums = np.array(round_nums)
     if len(round_nums) != len(y):
         raise ValueError("round_nums must have one value per sample")
-    if groups is not None and len(groups) != len(y):
-        raise ValueError("groups must have one value per sample")
+    if groups is None or len(groups) != len(y):
+        raise ValueError(
+            "temporal analysis requires one connected group per sample"
+        )
     unique_rounds = sorted(set(round_nums))
 
     if len(unique_rounds) < 3:
@@ -1632,17 +1820,30 @@ def analyze_round_trajectory(
 
         if len(y_r) < 10 or np.std(y_r) < 0.01:
             per_round_results[r_key] = {
-                "auc": 0.5, "r2": 0.0, "n_samples": int(mask.sum()),
+                "available": False,
+                "auc": None, "r2": None, "n_samples": int(mask.sum()),
                 "deception_rate": float(np.mean(y_r)) if len(y_r) > 0 else 0.0,
-                "note": "insufficient samples or variance"
+                "reason": "insufficient samples or variance"
             }
             continue
 
-        round_groups = np.asarray(groups)[mask] if groups is not None else None
-        _, result = train_ridge_probe(
-            X_r, y_r, alpha=alpha, groups=round_groups
-        )
+        round_groups = np.asarray(groups)[mask]
+        try:
+            _, result = train_ridge_probe(
+                X_r, y_r, alpha=alpha, groups=round_groups
+            )
+        except ValueError as exc:
+            per_round_results[r_key] = {
+                "available": False,
+                "auc": None,
+                "r2": None,
+                "n_samples": int(mask.sum()),
+                "deception_rate": float(np.mean(y_r)),
+                "reason": str(exc),
+            }
+            continue
         per_round_results[r_key] = {
+            "available": True,
             "auc": float(result.auc),
             "r2": float(result.r2_score),
             "n_samples": int(mask.sum()),
@@ -1651,9 +1852,11 @@ def analyze_round_trajectory(
 
     # Fit trajectory (linear regression of AUC over rounds)
     # Filter out rounds with invalid AUC (0.5 default or NaN)
-    valid_rounds = [r for r in unique_rounds
-                    if per_round_results[r].get("auc", 0.5) != 0.5
-                    and not np.isnan(per_round_results[r].get("auc", 0.5))]
+    valid_rounds = [
+        r for r in unique_rounds
+        if per_round_results[r].get("auc") is not None
+        and not np.isnan(per_round_results[r]["auc"])
+    ]
     if len(valid_rounds) >= 3:
         rounds_arr = np.array(valid_rounds).reshape(-1, 1)
         aucs_arr = np.array([per_round_results[r]["auc"] for r in valid_rounds])
@@ -1667,8 +1870,8 @@ def analyze_round_trajectory(
 
         interpretation = _interpret_trajectory({mid_layer: slope}, {mid_layer: trajectory_r2})
     else:
-        slope = 0.0
-        trajectory_r2 = 0.0
+        slope = None
+        trajectory_r2 = None
         interpretation = "Insufficient valid rounds for trajectory fit"
 
     return {
@@ -1678,6 +1881,10 @@ def analyze_round_trajectory(
         "trajectory_r2": trajectory_r2,
         "interpretation": interpretation,
         "analysis_layer": int(mid_layer),
+        "interpretation_limit": (
+            "Per-round probe metrics are descriptive and do not establish a "
+            "within-trial temporal mechanism."
+        ),
     }
 
 
@@ -1685,6 +1892,7 @@ def analyze_dyadic_pairs(
     X: np.ndarray,
     y: np.ndarray,
     counterpart_idxs: List[int],
+    groups: np.ndarray,
     alpha: float = 100.0,
 ) -> Dict[str, Any]:
     """RQ-MA2: Analyze deceiver vs victim activation patterns.
@@ -1697,6 +1905,7 @@ def analyze_dyadic_pairs(
         X: Feature matrix [N, d_model]
         y: Deception labels [N]
         counterpart_idxs: Index of counterpart for each sample [N]
+        groups: Connected family/dyad identity for each sample
         alpha: Ridge regularization
 
     Returns:
@@ -1707,6 +1916,9 @@ def analyze_dyadic_pairs(
         raise ValueError("X and y must contain the same number of samples")
     if len(counterpart_idxs) != n_samples:
         raise ValueError("counterpart_idxs must have one value per sample")
+    if groups is None or len(groups) != n_samples:
+        raise ValueError("dyadic analysis requires one connected group per sample")
+    groups_array = np.asarray(groups, dtype=str)
 
     def coerce_index(value: Any) -> Optional[int]:
         if value is None:
@@ -1738,6 +1950,10 @@ def analyze_dyadic_pairs(
                 continue
             if np.isclose(y[i], y[cp_idx]):
                 continue
+            if groups_array[i] != groups_array[cp_idx]:
+                raise ValueError(
+                    "Counterpart-linked rows must share a connected group identity"
+                )
             seen_pairs.add(pair_key)
             valid_pairs.append(pair_key)
 
@@ -1751,6 +1967,7 @@ def analyze_dyadic_pairs(
     deceiver_activations = []
     victim_activations = []
     asymmetries = []
+    connected_pair_groups = []
 
     for i, j in valid_pairs:
         # Higher deception label = deceiver
@@ -1761,6 +1978,7 @@ def analyze_dyadic_pairs(
             deceiver_activations.append(X[j])
             victim_activations.append(X[i])
         asymmetries.append(abs(y[i] - y[j]))
+        connected_pair_groups.append(groups_array[i])
 
     if len(deceiver_activations) < 10:
         return {
@@ -1790,52 +2008,59 @@ def analyze_dyadic_pairs(
         np.sqrt(0.5 * (deceiver_proj.var() + victim_proj.var())) + 1e-8
     )
 
-    # Train probe to distinguish deceiver from victim.
-    #
-    # 2026-04-22 fix: use a pair-aware train/test split. deceiver_X[k] and
-    # victim_X[k] come from the same dyadic round (same negotiation trial).
-    # A random split stacks them and can put deceiver[k] in train and
-    # victim[k] in test — so the probe memorizes per-trial activation
-    # signatures rather than learning a general deceiver/victim direction.
-    # That is what produced the near-1.000 AUCs in the pre-audit results.
-    # Group by pair index so both members of a pair are always on the same
-    # side of the split.
+    # Keep both members of a pair and every related pair from the same
+    # family/dyad component on one side of the split.
     pair_X = np.vstack([deceiver_X, victim_X])
     pair_y = np.array([1.0] * len(deceiver_X) + [0.0] * len(victim_X))
-    pair_groups = np.concatenate([np.arange(len(deceiver_X)),
-                                  np.arange(len(victim_X))])
+    connected_pair_groups_array = np.asarray(connected_pair_groups, dtype=str)
+    pair_groups = np.concatenate([
+        connected_pair_groups_array,
+        connected_pair_groups_array,
+    ])
+
+    if len(set(connected_pair_groups)) < 3:
+        return {
+            "available": False,
+            "n_pairs": len(valid_pairs),
+            "n_connected_groups": len(set(connected_pair_groups)),
+            "pair_probe_auc": None,
+            "pair_probe_r2": None,
+            "d_prime": float(d_prime),
+            "mean_asymmetry": float(np.mean(asymmetries)),
+            "reason": "At least three connected groups are required",
+        }
 
     pair_auc, pair_r2 = _train_probe_grouped(
         pair_X, pair_y, pair_groups, alpha=alpha
     )
     if pair_auc is None:
-        pair_auc = 0.5
-    if pair_r2 is None:
-        pair_r2 = 0.0
-
-    # Also compute the old (leaky) number so the report surfaces how much
-    # of the historic AUC was per-trial memorization vs a real dyadic
-    # direction. Keep it under a _legacy_ field for diagnostic only.
-    _, pair_result_legacy = train_ridge_probe(pair_X, pair_y, alpha=alpha)
-
-    # Interpretation based on the (post-fix) pair-aware AUC
-    if pair_auc > 0.70:
-        interpretation = "STRONG dyadic signal - deceiver/victim clearly distinguishable"
-    elif pair_auc > 0.60:
-        interpretation = "MODERATE dyadic signal - partial separability"
-    else:
-        interpretation = "WEAK dyadic signal - deceiver/victim activations similar"
+        return {
+            "available": False,
+            "n_pairs": len(valid_pairs),
+            "n_connected_groups": len(set(connected_pair_groups)),
+            "pair_probe_auc": None,
+            "pair_probe_r2": pair_r2,
+            "d_prime": float(d_prime),
+            "mean_asymmetry": float(np.mean(asymmetries)),
+            "reason": "No class-balanced connected-group holdout was available",
+        }
 
     return {
+        "available": True,
         "n_pairs": len(valid_pairs),
+        "n_connected_groups": len(set(connected_pair_groups)),
         "pair_probe_auc": float(pair_auc),
-        "pair_probe_r2": float(pair_r2),
-        "pair_probe_auc_legacy_leaky": float(pair_result_legacy.auc),
-        "pair_probe_r2_legacy_leaky": float(pair_result_legacy.r2_score),
-        "split_method": "group_aware_by_pair_id",
+        "pair_probe_r2": float(pair_r2) if pair_r2 is not None else None,
+        "split_method": "connected_family_dyad_group",
         "d_prime": float(d_prime),
         "mean_asymmetry": float(np.mean(asymmetries)),
-        "interpretation": interpretation,
+        "interpretation": (
+            f"Held-out connected-group pair-ranking AUC: {pair_auc:.3f}."
+        ),
+        "interpretation_limit": (
+            "The descriptive full-sample d-prime and held-out AUC do not "
+            "identify a victim state or a causal dyadic mechanism."
+        ),
     }
 
 
@@ -1875,7 +2100,7 @@ def _train_probe_grouped(
 
     n_comp = min(n_components, X_train_s.shape[0] - 1, X_train_s.shape[1])
     if n_comp >= 1:
-        pca = PCA(n_components=n_comp)
+        pca = PCA(n_components=n_comp, random_state=random_state)
         X_train_p = pca.fit_transform(X_train_s)
         X_test_p = pca.transform(X_test_s)
     else:
@@ -1901,7 +2126,7 @@ def analyze_outcome_prediction(
     X: np.ndarray,
     y: np.ndarray,
     round_nums: List[int],
-    trial_ids: List[str],
+    group_ids: List[str],
     trial_outcomes: List[bool],
     alpha: float = 100.0,
 ) -> Dict[str, Any]:
@@ -1914,7 +2139,7 @@ def analyze_outcome_prediction(
         X: Feature matrix [N, d_model]
         y: Deception labels [N]
         round_nums: Round number for each sample [N]
-        trial_ids: Trial ID for each sample [N]
+        group_ids: Connected family/dyad identity for each sample [N]
         trial_outcomes: Success/failure for each sample [N]
         alpha: Ridge regularization
 
@@ -1922,14 +2147,14 @@ def analyze_outcome_prediction(
         Dict with outcome prediction metrics
     """
     if not (
-        len(X) == len(y) == len(round_nums) == len(trial_ids) == len(trial_outcomes)
+        len(X) == len(y) == len(round_nums) == len(group_ids) == len(trial_outcomes)
     ):
         raise ValueError(
-            "X, y, round_nums, trial_ids, and trial_outcomes must be sample-aligned"
+            "X, y, round_nums, group_ids, and trial_outcomes must be sample-aligned"
         )
 
     round_nums = np.array(round_nums)
-    trial_ids_arr = np.array([str(t) for t in trial_ids])
+    group_ids_arr = np.array([str(value) for value in group_ids])
     success_outcomes = {"agreement", "deal", "success", "accepted", "true", "1"}
     failure_outcomes = {
         "no_agreement", "no deal", "no_deal", "failure", "failed",
@@ -1960,8 +2185,10 @@ def analyze_outcome_prediction(
         value if value is not None else np.nan for value in normalized_outcomes
     ])
 
-    # Filter to early rounds (1-2)
-    early_mask = (round_nums >= 0) & (round_nums <= 2) & known_outcome_mask
+    observed_rounds = sorted(set(round_nums[round_nums >= 0].tolist()))
+    early_round_values = observed_rounds[:2]
+    late_round_values = observed_rounds[-2:]
+    early_mask = np.isin(round_nums, early_round_values) & known_outcome_mask
     n_early = early_mask.sum()
 
     if n_early < 20:
@@ -1972,7 +2199,7 @@ def analyze_outcome_prediction(
 
     X_early = X[early_mask]
     outcomes_early = trial_outcomes[early_mask]
-    trials_early = trial_ids_arr[early_mask]
+    groups_early = group_ids_arr[early_mask]
 
     # Check outcome variance
     if np.std(outcomes_early) < 0.01:
@@ -1982,49 +2209,44 @@ def analyze_outcome_prediction(
             "outcome_rate": float(np.mean(outcomes_early)),
         }
 
-    # Group-aware split by trial_id: trial_outcome is a trial-level label
-    # backfilled onto every per-round sample. A random per-sample split
-    # therefore places the same trial (same label) in both train and test,
-    # inflating AUC. Split on trial_id instead.
+    # Split on the connected family/dyad unit, never on repeated turn rows.
     early_auc, early_r2 = _train_probe_grouped(
-        X_early, outcomes_early, trials_early, alpha=alpha
+        X_early, outcomes_early, groups_early, alpha=alpha
     )
 
     # Also try late rounds for comparison
-    valid_round_nums = round_nums[known_outcome_mask & (round_nums >= 0)]
-    late_mask = (
-        known_outcome_mask
-        & (round_nums >= 0)
-        & (round_nums >= valid_round_nums.max() - 1)
-    ) if len(valid_round_nums) else np.zeros(len(round_nums), dtype=bool)
+    late_mask = np.isin(round_nums, late_round_values) & known_outcome_mask
     n_late = late_mask.sum()
-    trials_late = trial_ids_arr[late_mask] if n_late else np.array([])
+    groups_late = group_ids_arr[late_mask] if n_late else np.array([])
     if (
         n_late >= 20
         and np.std(trial_outcomes[late_mask]) > 0.01
-        and len(np.unique(trials_late)) >= 2
+        and len(np.unique(groups_late)) >= 2
     ):
         late_auc, _ = _train_probe_grouped(
-            X[late_mask], trial_outcomes[late_mask], trials_late, alpha=alpha
+            X[late_mask], trial_outcomes[late_mask], groups_late, alpha=alpha
         )
     else:
         late_auc = None
 
-    # Interpretation
-    if early_auc is not None and early_auc > 0.70:
-        interpretation = "STRONG early prediction - deception outcome predictable from round 1-2"
-    elif early_auc is not None and early_auc > 0.60:
-        interpretation = "MODERATE early prediction - partial signal in early rounds"
-    else:
-        interpretation = "WEAK early prediction - outcome not predictable from early activations"
-
     return {
+        "available": early_auc is not None,
         "n_early_samples": int(n_early),
+        "n_early_groups": len(set(groups_early.tolist())),
+        "early_round_values": [int(value) for value in early_round_values],
+        "late_round_values": [int(value) for value in late_round_values],
         "early_rounds_auc": float(early_auc) if early_auc is not None else None,
         "early_rounds_r2": float(early_r2) if early_r2 is not None else None,
         "late_rounds_auc": float(late_auc) if late_auc is not None else None,
         "outcome_rate": float(np.mean(outcomes_early)),
-        "interpretation": interpretation,
+        "interpretation": (
+            "Early connected-group held-out outcome-ranking AUC is "
+            + ("unavailable." if early_auc is None else f"{early_auc:.3f}.")
+        ),
+        "interpretation_limit": (
+            "This observational ranking does not establish that early "
+            "activations determine outcomes or identify an intervention point."
+        ),
     }
 
 
@@ -2034,45 +2256,65 @@ def analyze_outcome_prediction(
 
 def _sample_keep_mask(
     metadata: List[Dict[str, Any]],
-    n_samples: int,
+    target_labels: np.ndarray,
 ) -> Tuple[np.ndarray, Dict[str, int]]:
     """Build the negotiation/QC mask for an aligned serialized dataset."""
+    n_samples = len(target_labels)
     if metadata and len(metadata) != n_samples:
         raise ValueError(
             f"metadata has {len(metadata)} rows, expected {n_samples}"
         )
     if not metadata:
-        return np.ones(n_samples, dtype=bool), {
-            "probe_rounds": 0,
-            "qc_failures": 0,
-        }
+        metadata = [{} for _ in range(n_samples)]
 
-    keep = np.ones(n_samples, dtype=bool)
-    probe_rounds = 0
+    keep, eligibility_counts = negotiation_sample_mask(metadata, target_labels)
     qc_failures = 0
+    from interpretability.core.qc_filter import (
+        QC_VERSION,
+        classify_sample_response,
+    )
     for i, row in enumerate(metadata):
-        sample_type = row.get('sample_type')
-        round_num = row.get('round_num')
-        is_negotiation = (
-            sample_type == 'negotiation'
-            if sample_type is not None
-            else round_num is None or round_num >= 0
-        )
-        if not is_negotiation:
-            keep[i] = False
-            probe_rounds += 1
+        if not keep[i]:
             continue
 
         flags = row.get('qc_flags')
-        if flags is None and row.get('full_response') is not None:
-            from interpretability.core.qc_filter import classify_response
-            flags = classify_response(row['full_response'])
+        qc_status = row.get('qc_status')
+        qc_version = row.get('qc_version')
+        if row.get('full_response') is not None:
+            recomputed = classify_sample_response(
+                row['full_response'],
+                scenario=row.get('scenario'),
+                semantic_phase=row.get('semantic_phase'),
+            )
+            if flags is not None and set(flags) != set(recomputed):
+                flags = {'qc_metadata_mismatch'}
+            else:
+                flags = recomputed
+            qc_status = 'passed' if not flags else 'rejected'
+            qc_version = QC_VERSION
+        elif (
+            qc_status not in {'passed', 'rejected'}
+            or qc_version != QC_VERSION
+        ):
+            # Headline eligibility fails closed when neither a reviewed QC
+            # result nor the response needed to reproduce it is available.
+            flags = {'qc_unavailable'}
+        elif qc_status == 'passed' and flags:
+            flags = set(flags) | {'qc_metadata_mismatch'}
+        elif qc_status == 'rejected' and not flags:
+            flags = {'qc_metadata_mismatch'}
         if flags:
             keep[i] = False
             qc_failures += 1
 
+    eligibility_counts["eligible_before_qc"] = eligibility_counts["included"]
+    eligibility_counts["included"] = int(keep.sum())
     return keep, {
-        "probe_rounds": probe_rounds,
+        **eligibility_counts,
+        "probe_rounds": (
+            eligibility_counts["non_negotiation"]
+            + eligibility_counts["invalid_round_or_probe"]
+        ),
         "qc_failures": qc_failures,
     }
 
@@ -2102,18 +2344,24 @@ def _remap_counterpart_indices(
         remapped.append(old_to_new.get(counterpart_idx))
     return remapped
 
-def run_full_analysis(data_path: str) -> Dict[str, Any]:
+def run_full_analysis(
+    data_path: str,
+    *,
+    trusted_legacy: bool = False,
+) -> Dict[str, Any]:
     """Run complete probe training and analysis."""
 
     print(f"\n{'='*60}")
     print("MATS PROBE TRAINING AND ANALYSIS v2")
     print(f"{'='*60}")
 
-    # Load data
-    # NOTE: weights_only=False needed for dicts with mixed types
-    # SECURITY: Only load files YOU generated - pickle can execute arbitrary code
+    # Safe JSON+NPZ is the default. Pickle-capable .pt input remains available
+    # only through the caller's explicit trusted_legacy acknowledgement.
     print(f"\nLoading data from: {data_path}")
-    data = torch.load(data_path, weights_only=False)
+    data = load_activation_dataset(
+        data_path,
+        trusted_legacy=trusted_legacy,
+    )
 
     activations = data["activations"]
     labels = data["labels"]
@@ -2121,7 +2369,7 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     metadata = data.get("metadata", [])
 
     gm_labels = np.array(labels["gm_labels"])
-    agent_labels = np.array(labels["agent_labels"])
+    agent_labels = np.asarray(labels["agent_labels"], dtype=object)
     scenarios = labels["scenario"]
 
     print(f"Loaded {len(gm_labels)} samples")
@@ -2145,12 +2393,13 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
                 f"Label array '{key}' has {len(values)} rows, expected {n_total}"
             )
 
-    keep_mask, filter_counts = _sample_keep_mask(metadata, n_total)
+    keep_mask, filter_counts = _sample_keep_mask(metadata, gm_labels)
     n_dropped = int((~keep_mask).sum())
     original_counterparts = labels.get('counterpart_idxs')
     if n_dropped > 0:
         print(
             f"  Filtering out {filter_counts['probe_rounds']} probe-round and "
+            f"{filter_counts['target_unavailable']} unknown-target and "
             f"{filter_counts['qc_failures']} failed-QC samples"
         )
         keep_indices = np.flatnonzero(keep_mask).tolist()
@@ -2176,22 +2425,60 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     labels['gm_labels'] = gm_labels.tolist()
     labels['agent_labels'] = agent_labels.tolist()
     labels['scenario'] = scenarios
+    agent_binary, agent_available = _exact_binary_target(
+        agent_labels,
+        expected_rows=len(gm_labels),
+    )
 
-    trial_ids_for_split = labels.get('trial_ids', [])
-    pod_ids_for_split = labels.get('pod_ids', [])
-    analysis_groups = None
-    split_unit = "row (legacy dataset without trial_ids)"
-    if len(trial_ids_for_split) == len(gm_labels):
-        if len(pod_ids_for_split) == len(gm_labels):
-            analysis_groups = np.array([
-                f"{pod}:{trial}" for pod, trial in zip(
-                    pod_ids_for_split, trial_ids_for_split
-                )
-            ])
-            split_unit = "pod_id+trial_id"
+    raw_manifest = data.get("split_manifest")
+    headline_manifest = None
+    if raw_manifest is not None:
+        if isinstance(raw_manifest, str):
+            headline_manifest = SplitManifest.from_json(raw_manifest)
+        elif isinstance(raw_manifest, dict):
+            headline_manifest = SplitManifest.from_json(json.dumps(raw_manifest))
         else:
-            analysis_groups = np.asarray(trial_ids_for_split).astype(str)
-            split_unit = "trial_id"
+            raise ValueError("split_manifest must be JSON text or a dictionary")
+    headline_partitions = labels.get("split_partitions")
+    if headline_partitions is None:
+        headline_partitions = labels.get("partitions")
+    if headline_partitions is None and metadata:
+        headline_partitions = [
+            row.get("split_partition", row.get("partition")) for row in metadata
+        ]
+    headline_groups = labels.get("split_groups")
+    if headline_groups is None:
+        headline_groups = labels.get("connected_group_ids")
+    if headline_groups is None and metadata:
+        headline_groups = [
+            row.get("split_group_id", row.get("connected_group_id"))
+            for row in metadata
+        ]
+    headline_trial_ids = labels.get("trial_ids")
+    if headline_trial_ids is None and metadata:
+        headline_trial_ids = [row.get("trial_id") for row in metadata]
+
+    if headline_manifest is not None:
+        if (
+            headline_trial_ids is None
+            or len(headline_trial_ids) != len(gm_labels)
+        ):
+            raise ValueError(
+                "SplitManifest analysis requires one trial_id per retained row"
+            )
+        _, analysis_groups = resolve_manifest_row_groups(
+            headline_manifest, headline_trial_ids
+        )
+        split_unit = "connected trial-family/dyad component from SplitManifest"
+    else:
+        if headline_groups is None or len(headline_groups) != len(gm_labels):
+            raise ValueError(
+                "Analysis requires one connected trial-family/dyad group per row"
+            )
+        if any(value is None or not str(value).strip() for value in headline_groups):
+            raise ValueError("Connected group identities cannot be null or empty")
+        analysis_groups = np.asarray(headline_groups, dtype=str)
+        split_unit = "connected trial-family/dyad group"
 
     results = {
         "sanity_checks": {},
@@ -2201,6 +2488,12 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         "deception_rates": {},
         "best_probe": None,
         "filtering": filter_counts,
+        "agent_label_eligibility": {
+            "total_gm_eligible": len(gm_labels),
+            "binary_available": int(agent_available.sum()),
+            "excluded_unavailable_or_nonbinary": int((~agent_available).sum()),
+            "policy": "explicit 0/1 counterpart-perception labels only",
+        },
         "split_unit": split_unit,
     }
 
@@ -2254,9 +2547,12 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         X_mid, gm_labels, groups=analysis_groups
     )
     results["sanity_checks"]["random_labels"] = random_check
-    status = "PASSED" if random_check["passed"] else "FAILED"
-    print(f"   Shuffled R²: {random_check['mean_shuffled_r2']:.3f} +/- {random_check['std_shuffled_r2']:.3f}")
-    print(f"   {status} (should be near 0)")
+    if not random_check.get("available", True):
+        print(f"   UNAVAILABLE: {random_check['message']}")
+    else:
+        status = "PASSED" if random_check["passed"] else "FAILED"
+        print(f"   Shuffled R²: {random_check['mean_shuffled_r2']:.3f} +/- {random_check['std_shuffled_r2']:.3f}")
+        print(f"   {status} (should be near 0)")
 
     # Check 3: Train-test gap
     print("\n3. Train-Test Gap Check")
@@ -2275,54 +2571,170 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     print("LAYER ANALYSIS")
     print(f"{'='*60}")
 
-    layer_results = {}
-    best_layer = None
-    best_auc = -1.0
-
-    for layer in layers:
-        X = activations[layer].float().numpy()
-
-        # Train probe on GM labels
-        _, gm_result = train_ridge_probe(
-            X, gm_labels, groups=analysis_groups
-        )
-        gm_result.layer = layer
-        gm_result.label_type = "gm"
-
-        # Train probe on agent labels
-        _, agent_result = train_ridge_probe(
-            X, agent_labels, groups=analysis_groups
-        )
-        agent_result.layer = layer
-        agent_result.label_type = "agent"
-
-        layer_results[layer] = {
-            "gm": gm_result.to_dict(),
-            "agent": agent_result.to_dict(),
+    activation_arrays = {
+        int(layer): activations[layer].float().numpy() for layer in layers
+    }
+    if headline_manifest is not None:
+        if (
+            headline_trial_ids is None
+            or len(headline_trial_ids) != len(gm_labels)
+        ):
+            raise ValueError(
+                "Manifest-backed headline evaluation requires aligned trial_ids"
+            )
+        nested_kwargs = {
+            "split_manifest": headline_manifest,
+            "trial_ids": headline_trial_ids,
+        }
+    else:
+        nested_kwargs = {
+            "partition_labels": headline_partitions,
+            "groups": headline_groups,
         }
 
-        print(f"\nLayer {layer}:")
-        print(f"  GM labels    - R²: {gm_result.r2_score:.3f}, AUC: {gm_result.auc:.3f}")
-        print(f"  Agent labels - R²: {agent_result.r2_score:.3f}, AUC: {agent_result.auc:.3f}")
+    gm_headline = evaluate_nested_grouped_layers(
+        activation_arrays,
+        gm_labels,
+        **nested_kwargs,
+    )
+    comparison_mask = agent_available.copy()
+    agent_headline = None
+    gm_comparison_headline = None
+    agent_comparison_reason = None
+    if (
+        int(comparison_mask.sum()) > 0
+        and len(np.unique(agent_binary[comparison_mask])) == 2
+        and len(np.unique(gm_labels[comparison_mask])) == 2
+    ):
+        comparison_activations = {
+            layer: array[comparison_mask]
+            for layer, array in activation_arrays.items()
+        }
+        if headline_manifest is not None:
+            comparison_kwargs = {
+                "split_manifest": headline_manifest,
+                "trial_ids": np.asarray(headline_trial_ids)[
+                    comparison_mask
+                ].tolist(),
+            }
+        else:
+            comparison_kwargs = {
+                "partition_labels": np.asarray(headline_partitions)[
+                    comparison_mask
+                ].tolist(),
+                "groups": analysis_groups[comparison_mask],
+            }
+        try:
+            gm_comparison_headline = evaluate_nested_grouped_layers(
+                comparison_activations,
+                gm_labels[comparison_mask],
+                **comparison_kwargs,
+            )
+            agent_headline = evaluate_nested_grouped_layers(
+                comparison_activations,
+                agent_binary[comparison_mask],
+                **comparison_kwargs,
+            )
+        except ValueError as exc:
+            agent_comparison_reason = str(exc)
+            gm_comparison_headline = None
+            agent_headline = None
+    else:
+        agent_comparison_reason = (
+            "Complete-case actual and counterpart targets require both classes"
+        )
 
-        # Select best layer by AUC (the primary metric the rest of the pipeline
-        # uses), not R². R² can be negative and noisy on small samples, so
-        # AUC-based selection is more stable and consistent with downstream use.
-        if gm_result.auc > best_auc:
-            best_auc = gm_result.auc
-            best_layer = layer
+    def best_development_rows(evaluation):
+        rows_by_layer = {}
+        for row in evaluation.selection_table:
+            layer = int(row["layer"])
+            current = rows_by_layer.get(layer)
+            if (
+                current is None
+                or row["development_metrics"]["auc"]
+                > current["development_metrics"]["auc"]
+            ):
+                rows_by_layer[layer] = row
+        return rows_by_layer
 
+    gm_rows = best_development_rows(gm_headline)
+    agent_rows = (
+        best_development_rows(agent_headline)
+        if agent_headline is not None else {}
+    )
+    layer_results = {}
+    for layer in layers:
+        gm_metrics = gm_rows[int(layer)]["development_metrics"]
+        agent_metrics = (
+            agent_rows[int(layer)]["development_metrics"]
+            if int(layer) in agent_rows else None
+        )
+        layer_results[layer] = {
+            "gm": {
+                "auc": gm_metrics["auc"],
+                "r2": gm_metrics["r2"],
+                "r2_score": gm_metrics["r2"],
+                "accuracy": gm_metrics["accuracy"],
+                "selection_partition": "development",
+                "headline_eligible": True,
+            },
+            "agent": (
+                {
+                    "available": True,
+                    "auc": agent_metrics["auc"],
+                    "r2": agent_metrics["r2"],
+                    "r2_score": agent_metrics["r2"],
+                    "accuracy": agent_metrics["accuracy"],
+                    "selection_partition": "development",
+                    "headline_eligible": True,
+                }
+                if agent_metrics is not None else {
+                    "available": False,
+                    "reason": agent_comparison_reason,
+                    "headline_eligible": False,
+                }
+            ),
+        }
+        print(f"\nLayer {layer} (development selection only):")
+        print(f"  GM labels    - R²: {gm_metrics['r2']:.3f}, AUC: {gm_metrics['auc']:.3f}")
+        if agent_metrics is not None:
+            print(
+                f"  Agent labels - R²: {agent_metrics['r2']:.3f}, "
+                f"AUC: {agent_metrics['auc']:.3f}"
+            )
+        else:
+            print(f"  Agent labels - unavailable: {agent_comparison_reason}")
+
+    best_layer = gm_headline.selected_layer
+    selected_development = gm_headline.split_provenance[
+        "selected_development_metrics"
+    ]
+    best_auc = gm_headline.test_metrics["auc"]
+    best_r2 = gm_headline.test_metrics["r2"]
     results["layer_analysis"] = layer_results
-    if best_layer is None:
-        best_layer = layers[len(layers) // 2]
-    best_r2 = layer_results[best_layer]["gm"]["r2_score"] if best_layer in layer_results else 0.0
+    results["nested_grouped_evaluation"] = gm_headline.to_dict()
+    results["counterpart_nested_grouped_evaluation"] = (
+        agent_headline.to_dict() if agent_headline is not None else {
+            "available": False,
+            "reason": agent_comparison_reason,
+            "comparison_n": int(comparison_mask.sum()),
+        }
+    )
     results["best_probe"] = {
         "layer": int(best_layer),
         "auc": float(best_auc),
         "r2": float(best_r2),
+        "development_auc": float(selected_development["auc"]),
+        "selection_partition": "development",
+        "evaluation_partition": "locked_test",
+        "test_evaluations": 1,
     }
 
-    print(f"\nBest layer: {best_layer} (AUC = {best_auc:.3f}, R² = {best_r2:.3f})")
+    print(
+        f"\nSelected layer: {best_layer} "
+        f"(development AUC = {selected_development['auc']:.3f}); "
+        f"locked-test AUC = {best_auc:.3f}, R² = {best_r2:.3f}"
+    )
 
     # ==========================================================================
     # GM vs AGENT COMPARISON (Core Metric)
@@ -2339,44 +2751,100 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
 
     X_best = activations[best_layer].float().numpy()
 
-    _, gm_result = train_ridge_probe(
-        X_best, gm_labels, groups=analysis_groups
-    )
-    _, agent_result = train_ridge_probe(
-        X_best, agent_labels, groups=analysis_groups
-    )
-
     # Mass-mean probe
     _, gm_mm_result = train_mass_mean_probe(
         X_best, gm_labels, groups=analysis_groups
     )
 
-    results["gm_vs_agent"] = {
-        "gm_ridge_r2": float(gm_result.r2_score),
-        "agent_ridge_r2": float(agent_result.r2_score),
-        "gm_mass_mean_r2": float(gm_mm_result.r2_score),
-        "gm_auc": float(gm_result.auc),
-        "agent_auc": float(agent_result.auc),
-        "gm_mass_mean_auc": float(gm_mm_result.auc),
-        "gm_wins": bool(gm_result.r2_score > agent_result.r2_score),
-        "agent_label_semantics": "perceived counterpart deception, not self-report",
-        "supports_self_awareness_claim": False,
-    }
-
     print(f"\nGM (Ground Truth) - What the agent IS doing:")
-    print(f"  Ridge R²:     {gm_result.r2_score:.3f}")
-    print(f"  Ridge AUC:    {gm_result.auc:.3f}")
+    print(f"  Locked R²:    {gm_headline.test_metrics['r2']:.3f}")
+    print(f"  Locked AUC:   {gm_headline.test_metrics['auc']:.3f}")
     print(f"  Mass-Mean R²: {gm_mm_result.r2_score:.3f}")
     print(f"  Mass-Mean AUC:{gm_mm_result.auc:.3f}")
 
-    print(f"\nAgent ToM - perceived COUNTERPART deception:")
-    print(f"  Ridge R²:     {agent_result.r2_score:.3f}")
-    print(f"  Ridge AUC:    {agent_result.auc:.3f}")
-
-    if results["gm_vs_agent"]["gm_wins"]:
-        print(f"\n>> Actual-deception labels are more predictable than counterpart-belief labels.")
+    comparison_groups = analysis_groups[comparison_mask]
+    if agent_headline is not None and gm_comparison_headline is not None:
+        comparison_X = X_best[comparison_mask]
+        try:
+            _, comparison_gm_mm = train_mass_mean_probe(
+                comparison_X,
+                gm_labels[comparison_mask],
+                groups=comparison_groups,
+            )
+            _, comparison_agent_mm = train_mass_mean_probe(
+                comparison_X,
+                agent_binary[comparison_mask],
+                groups=comparison_groups,
+            )
+        except ValueError:
+            comparison_gm_mm = None
+            comparison_agent_mm = None
+        auc_gap = (
+            gm_comparison_headline.test_metrics["auc"]
+            - agent_headline.test_metrics["auc"]
+        )
+        results["gm_vs_agent"] = {
+            "available": True,
+            "comparison_n": int(comparison_mask.sum()),
+            "excluded_n": int((~comparison_mask).sum()),
+            "gm_ridge_r2": float(
+                gm_comparison_headline.test_metrics["r2"]
+            ),
+            "agent_ridge_r2": float(agent_headline.test_metrics["r2"]),
+            "gm_mass_mean_r2": (
+                float(comparison_gm_mm.r2_score)
+                if comparison_gm_mm is not None else None
+            ),
+            "agent_mass_mean_r2": (
+                float(comparison_agent_mm.r2_score)
+                if comparison_agent_mm is not None else None
+            ),
+            "gm_auc": float(gm_comparison_headline.test_metrics["auc"]),
+            "agent_auc": float(agent_headline.test_metrics["auc"]),
+            "auc_gap": float(auc_gap),
+            "gm_mass_mean_auc": (
+                float(comparison_gm_mm.auc)
+                if comparison_gm_mm is not None else None
+            ),
+            "agent_mass_mean_auc": (
+                float(comparison_agent_mm.auc)
+                if comparison_agent_mm is not None else None
+            ),
+            "gm_wins": bool(auc_gap > 0),
+            "gm_layer": int(gm_comparison_headline.selected_layer),
+            "agent_layer": int(agent_headline.selected_layer),
+            "comparison_partition": "locked_test",
+            "comparison_policy": "complete-case explicit binary targets",
+            "mass_mean_is_non_headline_diagnostic": True,
+            "agent_label_semantics": (
+                "perceived counterpart deception, not self-report"
+            ),
+            "supports_self_awareness_claim": False,
+            "interpretation_limit": (
+                "Different target semantics make the AUC gap descriptive."
+            ),
+        }
+        print(f"\nAgent ToM - perceived COUNTERPART deception:")
+        print(f"  Complete-case n: {int(comparison_mask.sum())}")
+        print(f"  Locked R²:    {agent_headline.test_metrics['r2']:.3f}")
+        print(f"  Locked AUC:   {agent_headline.test_metrics['auc']:.3f}")
+        print(f"  Actual-minus-counterpart AUC: {auc_gap:.3f}")
     else:
-        print(f"\n>> Counterpart-belief labels are equally or more predictable.")
+        results["gm_vs_agent"] = {
+            "available": False,
+            "comparison_n": int(comparison_mask.sum()),
+            "excluded_n": int((~comparison_mask).sum()),
+            "reason": agent_comparison_reason,
+            "comparison_policy": "complete-case explicit binary targets",
+            "agent_label_semantics": (
+                "perceived counterpart deception, not self-report"
+            ),
+            "supports_self_awareness_claim": False,
+        }
+        print(
+            "\nAgent ToM comparison unavailable: "
+            f"{agent_comparison_reason}"
+        )
 
     # ==========================================================================
     # GENERALIZATION WITH AUC
@@ -2388,7 +2856,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     unique_scenarios = list(set(scenarios))
 
     if len(unique_scenarios) >= 3:
-        gen_results = compute_generalization_auc(X_best, gm_labels, scenarios)
+        gen_results = compute_generalization_auc(
+            X_best, gm_labels, scenarios, groups=analysis_groups
+        )
         results["generalization"] = gen_results
 
         for holdout, res in gen_results["by_scenario"].items():
@@ -2398,6 +2868,8 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
             print(f"\nHoldout: {holdout} (deception rate: {rate_str})")
             print(f"  R²:  {r2_str}")
             print(f"  AUC: {auc_str}")
+            if not res.get("available", False):
+                print(f"  Unavailable: {res['reason']}")
 
         print(f"\n--- AVERAGES ---")
         if gen_results["average_r2"] is not None:
@@ -2422,12 +2894,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print(f"\n{'='*60}")
         print("RQ1: CROSS-MODE TRANSFER ANALYSIS")
         print(f"{'='*60}")
-        print("Question: Are instructed and emergent deception structurally")
-        print("          different in model activations?")
+        print("Question: How well does an out-of-mode ranking transfer?")
         print("-" * 60)
-        print("Interpretation Guide:")
-        print("  Transfer AUC ~0.50: DIFFERENT circuits (NOVEL finding)")
-        print("  Transfer AUC >0.65: SAME representation")
+        print("Transfer AUC does not by itself identify shared neural mechanisms.")
         print("-" * 60)
 
         cross_mode_results = compute_cross_mode_transfer(
@@ -2442,7 +2911,7 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
             print(f"\nWithin-mode AUC (sanity check - should be >0.6):")
             print(f"  Instructed: {cross_mode_results['instructed_within_auc']:.3f}")
             print(f"  Emergent: {cross_mode_results['emergent_within_auc']:.3f}")
-            print(f"\n*** KEY RESULT: Bidirectional Cross-mode Transfer ***")
+            print(f"\nBidirectional cross-mode transfer:")
             print(f"  Forward (instructed → emergent):")
             print(f"    AUC: {cross_mode_results['forward_transfer_auc']:.3f}")
             print(f"    R²:  {cross_mode_results['forward_transfer_r2']:.3f}")
@@ -2450,7 +2919,7 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
             print(f"    AUC: {cross_mode_results['reverse_transfer_auc']:.3f}")
             print(f"    R²:  {cross_mode_results['reverse_transfer_r2']:.3f}")
             print(f"  Asymmetry: {cross_mode_results['transfer_asymmetry']:.3f}")
-            print(f"\n>> ANSWER: {cross_mode_results['interpretation']}")
+            print(f"\n{cross_mode_results['interpretation']}")
         else:
             print(f"\n{cross_mode_results['error']}")
     else:
@@ -2474,16 +2943,28 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     print("  It is not evidence of hidden self-knowledge or self-awareness.")
     print("-" * 60)
 
-    implicit_results = analyze_implicit_encoding(
-        X_best, gm_labels, agent_labels, groups=analysis_groups
-    )
-    results["implicit_encoding"] = implicit_results
+    if agent_headline is not None and gm_comparison_headline is not None:
+        implicit_results = analyze_implicit_encoding(
+            X_best[comparison_mask],
+            gm_labels[comparison_mask],
+            agent_binary[comparison_mask],
+            groups=comparison_groups,
+        )
+        results["implicit_encoding"] = implicit_results
 
-    print(f"\n*** KEY RESULT: GM vs Agent Predictability ***")
-    print(f"  GM (Ground Truth) AUC:    {implicit_results['gm_auc']:.3f}")
-    print(f"  Counterpart-belief AUC:   {implicit_results['agent_auc']:.3f}")
-    print(f"  AUC Gap (GM - Agent):     {implicit_results['auc_gap']:.3f}")
-    print(f"\n>> ANSWER: {implicit_results['interpretation']}")
+        print(f"\nComplete-case GM vs counterpart-target decodability:")
+        print(f"  GM (Ground Truth) AUC:    {implicit_results['gm_auc']:.3f}")
+        print(f"  Counterpart-belief AUC:   {implicit_results['agent_auc']:.3f}")
+        print(f"  AUC Gap (GM - Agent):     {implicit_results['auc_gap']:.3f}")
+        print(f"\n{implicit_results['interpretation']}")
+    else:
+        results["implicit_encoding"] = {
+            "available": False,
+            "reason": agent_comparison_reason,
+            "comparison_n": int(comparison_mask.sum()),
+            "supports_self_awareness_claim": False,
+        }
+        print(f"\nUnavailable: {agent_comparison_reason}")
 
     # ==========================================================================
     # RQ-MA1: TEMPORAL TRAJECTORY ANALYSIS
@@ -2494,13 +2975,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print("RQ-MA1: TEMPORAL TRAJECTORY ANALYSIS")
         print(f"{'='*60}")
         print("Question: Does deception appear suddenly or build up over rounds?")
-        print("          (Unique to multi-turn - single-prompt CANNOT see this)")
+        print("          This reports a descriptive per-round AUC trajectory.")
         print("-" * 60)
-        print("Interpretation Guide:")
-        print("  Slope > 0.05:  Deception BUILDS over rounds")
-        print("  Slope < -0.05: Deception DECREASES over rounds")
-        print("  |Slope| < 0.05: STABLE encoding across rounds")
-        print("  Look for: Which round shows peak deception?")
+        print("The slope does not establish a temporal neural mechanism.")
         print("-" * 60)
 
         # Convert activations dict for trajectory analysis
@@ -2517,12 +2994,23 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
             print(f"Number of rounds: {trajectory_results['n_rounds']}")
             print(f"\nPer-round Deception Detection:")
             for r, res in sorted(trajectory_results["per_round"].items()):
-                auc_str = f"{res['auc']:.3f}" if res.get('auc', 0.5) != 0.5 else "N/A"
+                auc_str = (
+                    f"{res['auc']:.3f}"
+                    if res.get('auc') is not None else "N/A"
+                )
                 print(f"  Round {r}: AUC={auc_str}, n={res['n_samples']}, deception_rate={res['deception_rate']*100:.0f}%")
-            print(f"\n*** KEY RESULT: Temporal Pattern ***")
-            print(f"  Trajectory slope: {trajectory_results['trajectory_slope']:.3f}")
-            print(f"  Trajectory R²: {trajectory_results['trajectory_r2']:.3f}")
-            print(f"\n>> ANSWER: {trajectory_results['interpretation']}")
+            print(f"\nDescriptive temporal pattern:")
+            slope = trajectory_results['trajectory_slope']
+            trajectory_r2 = trajectory_results['trajectory_r2']
+            print(
+                "  Trajectory slope: "
+                + ("N/A" if slope is None else f"{slope:.3f}")
+            )
+            print(
+                "  Trajectory R²: "
+                + ("N/A" if trajectory_r2 is None else f"{trajectory_r2:.3f}")
+            )
+            print(f"\n{trajectory_results['interpretation']}")
         else:
             print(f"\n{trajectory_results['error']}")
     else:
@@ -2550,27 +3038,31 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print("RQ-MA2: DYADIC PAIR ANALYSIS")
         print(f"{'='*60}")
         print("Question: What happens in BOTH agents' activations during")
-        print("          deception? Can we detect 'being deceived' in victim?")
-        print("          (Unique to multi-agent - NO ONE has studied this)")
+        print("          differently labeled behavior within counterpart pairs?")
         print("-" * 60)
-        print("Interpretation Guide:")
-        print("  Victim AUC > 0.55: Can detect 'being deceived' (NOVEL)")
-        print("  D-prime > 1.0: Strong deceiver/victim separation")
-        print("  High asymmetry: One agent dominates deception")
+        print("Metrics are descriptive and do not identify a victim state.")
         print("-" * 60)
 
-        dyadic_results = analyze_dyadic_pairs(X_best, gm_labels, counterpart_idxs)
+        dyadic_results = analyze_dyadic_pairs(
+            X_best,
+            gm_labels,
+            counterpart_idxs,
+            groups=analysis_groups,
+        )
         results["dyadic_pairs"] = dyadic_results
 
-        if "error" not in dyadic_results:
+        if dyadic_results.get("available") is True:
             print(f"\nValid pairs: {dyadic_results['n_pairs']}")
-            print(f"\n*** KEY RESULT: Dyadic Signatures ***")
+            print(f"\nConnected-group dyadic diagnostics:")
             print(f"  Deceiver/Victim probe AUC: {dyadic_results['pair_probe_auc']:.3f}")
             print(f"  D-prime (separability):    {dyadic_results['d_prime']:.3f}")
             print(f"  Mean asymmetry:            {dyadic_results['mean_asymmetry']:.3f}")
-            print(f"\n>> ANSWER: {dyadic_results['interpretation']}")
+            print(f"\n{dyadic_results['interpretation']}")
+            print(f"Limit: {dyadic_results['interpretation_limit']}")
         else:
-            print(f"\n{dyadic_results['error']}")
+            print(
+                f"\n{dyadic_results.get('error', dyadic_results.get('reason'))}"
+            )
     else:
         print(f"\n{'='*60}")
         print("RQ-MA2: DYADIC PAIR ANALYSIS")
@@ -2588,12 +3080,9 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         print("RQ-MA3: OUTCOME PREDICTION ANALYSIS")
         print(f"{'='*60}")
         print("Question: Can early-round activations predict negotiation")
-        print("          success/failure? Does early deception predict failure?")
+        print("          outcome on connected-group-held-out rows?")
         print("-" * 60)
-        print("Interpretation Guide:")
-        print("  Early AUC > 0.60: Round 1-2 activations predict outcome")
-        print("  Early > Late AUC: Outcome determined early (intervention point)")
-        print("  Links internal representations to behavioral outcomes")
+        print("This observational analysis does not identify an intervention point.")
         print("-" * 60)
 
         outcome_group_ids = (
@@ -2610,11 +3099,16 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
             print(f"\nSample Counts:")
             print(f"  Early-round samples (rounds 1-2): {outcome_results['n_early_samples']}")
             print(f"  Outcome rate (success): {outcome_results['outcome_rate']*100:.1f}%")
-            print(f"\n*** KEY RESULT: Outcome Prediction ***")
-            print(f"  Early-round prediction AUC: {outcome_results['early_rounds_auc']:.3f}")
+            print(f"\nConnected-group outcome ranking:")
+            early_auc = outcome_results['early_rounds_auc']
+            print(
+                "  Early-round prediction AUC: "
+                + ("N/A" if early_auc is None else f"{early_auc:.3f}")
+            )
             if outcome_results['late_rounds_auc'] is not None:
                 print(f"  Late-round prediction AUC:  {outcome_results['late_rounds_auc']:.3f}")
-            print(f"\n>> ANSWER: {outcome_results['interpretation']}")
+            print(f"\n{outcome_results['interpretation']}")
+            print(f"Limit: {outcome_results['interpretation_limit']}")
         else:
             print(f"\n{outcome_results['error']}")
     else:
@@ -2640,9 +3134,12 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
         for check in results["sanity_checks"].values()
     )
     print(f"{'PASSED' if all_passed else 'SOME FAILED'}")
-    print(f"  Best Probe: Layer {best_layer}, R²={best_r2:.3f}, AUC={results['gm_vs_agent']['gm_auc']:.3f}")
+    print(
+        f"  Best Probe: Layer {best_layer}, R²={best_r2:.3f}, "
+        f"AUC={gm_headline.test_metrics['auc']:.3f}"
+    )
 
-    if results["generalization"].get("average_auc"):
+    if results["generalization"].get("average_auc") is not None:
         print(f"  Cross-scenario: R²={results['generalization']['average_r2']:.3f}, AUC={results['generalization']['average_auc']:.3f}")
 
     print(f"\n" + "-" * 60)
@@ -2650,10 +3147,13 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     print("-" * 60)
 
     # RQ1: Cross-mode transfer
-    if "cross_mode_transfer" in results and not results["cross_mode_transfer"].get("skipped"):
+    if (
+        "cross_mode_transfer" in results
+        and results["cross_mode_transfer"].get("available") is True
+    ):
         xm = results["cross_mode_transfer"]
         print(f"\nRQ1: Instructed vs Emergent Deception")
-        print(f"  Q: Are they structurally different?")
+        print("  Q: How well does bidirectional out-of-mode ranking transfer?")
         transfer_values = [
             value for value in (
                 xm.get('forward_transfer_auc'),
@@ -2661,16 +3161,17 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
             ) if value is not None
         ]
         transfer_auc = float(np.mean(transfer_values)) if transfer_values else 0.5
-        print(f"  Mean bidirectional transfer AUC: {transfer_auc:.3f}", end="")
-        if transfer_auc < 0.55:
-            print(" → DIFFERENT circuits (NOVEL)")
-        elif transfer_auc > 0.65:
-            print(" → SAME representation")
-        else:
-            print(" → PARTIAL overlap")
+        print(f"  Mean bidirectional transfer AUC: {transfer_auc:.3f}")
+        print(f"  Limit: {xm['interpretation_limit']}")
+    elif (
+        "cross_mode_transfer" in results
+        and not results["cross_mode_transfer"].get("skipped")
+    ):
+        print("\nRQ1: Cross-mode transfer unavailable")
+        print(f"  {results['cross_mode_transfer'].get('error', 'unknown reason')}")
 
     # RQ2: Actual behavior vs counterpart-perception labels
-    if "implicit_encoding" in results:
+    if results.get("implicit_encoding", {}).get("available") is True:
         ie = results["implicit_encoding"]
         print(f"\nRQ2: Label-Source Representation")
         print("  Q: How do actual behavior and counterpart-perception decodability differ?")
@@ -2680,40 +3181,29 @@ def run_full_analysis(data_path: str) -> Dict[str, Any]:
     # RQ-MA1: Temporal trajectory
     if "temporal_trajectory" in results and not results["temporal_trajectory"].get("skipped"):
         tt = results["temporal_trajectory"]
-        if "error" not in tt:
+        if "error" not in tt and tt.get("trajectory_slope") is not None:
             print(f"\nRQ-MA1: Temporal Emergence")
-            print(f"  Q: Does deception build up or appear suddenly?")
-            print(f"  Slope: {tt['trajectory_slope']:.3f}", end="")
-            if tt['trajectory_slope'] > 0.05:
-                print(" → BUILDS over rounds")
-            elif tt['trajectory_slope'] < -0.05:
-                print(" → DECREASES over rounds")
-            else:
-                print(" → STABLE across rounds")
+            print("  Q: What is the descriptive per-round AUC slope?")
+            print(f"  Slope: {tt['trajectory_slope']:.3f}")
+            print("  Limit: this does not establish a temporal mechanism.")
 
     # RQ-MA2: Dyadic pairs
     if "dyadic_pairs" in results and not results["dyadic_pairs"].get("skipped"):
         dp = results["dyadic_pairs"]
-        if "error" not in dp:
+        if dp.get("available") is True:
             print(f"\nRQ-MA2: Dyadic Signatures")
-            print(f"  Q: Can we detect 'being deceived' in victim?")
+            print("  Q: Are counterpart-pair roles rank-separable?")
             print(f"  Pair AUC: {dp['pair_probe_auc']:.3f}, D-prime: {dp['d_prime']:.3f}")
-            if dp['pair_probe_auc'] > 0.55:
-                print(f"  → YES: Victim signatures detectable (NOVEL)")
-            else:
-                print(f"  → Signatures not separable")
+            print(f"  Limit: {dp['interpretation_limit']}")
 
     # RQ-MA3: Outcome prediction
     if "outcome_prediction" in results and not results["outcome_prediction"].get("skipped"):
         op = results["outcome_prediction"]
-        if "error" not in op:
+        if "error" not in op and op.get("early_rounds_auc") is not None:
             print(f"\nRQ-MA3: Outcome Prediction")
-            print(f"  Q: Can early rounds predict negotiation success?")
+            print("  Q: What is the early held-out outcome-ranking AUC?")
             print(f"  Early-round AUC: {op['early_rounds_auc']:.3f}")
-            if op['early_rounds_auc'] > 0.60:
-                print(f"  → YES: Early intervention possible")
-            else:
-                print(f"  → Outcome not predictable from early rounds")
+            print(f"  Limit: {op['interpretation_limit']}")
 
     print(f"\n{'='*60}")
     print("END OF ANALYSIS")
@@ -2731,7 +3221,10 @@ def plot_results(results: Dict, output_path: str = None):
     ax1 = axes[0, 0]
     layers = sorted(results["layer_analysis"].keys())
     gm_r2s = [results["layer_analysis"][l]["gm"]["r2_score"] for l in layers]
-    agent_r2s = [results["layer_analysis"][l]["agent"]["r2_score"] for l in layers]
+    agent_r2s = [
+        results["layer_analysis"][layer]["agent"].get("r2_score", np.nan)
+        for layer in layers
+    ]
     gm_aucs = [results["layer_analysis"][l]["gm"]["auc"] for l in layers]
 
     x = np.arange(len(layers))
@@ -2752,21 +3245,39 @@ def plot_results(results: Dict, output_path: str = None):
     # 2. GM vs Agent comparison
     ax2 = axes[0, 1]
     comparison = results["gm_vs_agent"]
-    methods = ['Ridge\n(GM)', 'Ridge\n(Agent)', 'Mass-Mean\n(GM)']
-    r2_values = [comparison["gm_ridge_r2"], comparison["agent_ridge_r2"], comparison["gm_mass_mean_r2"]]
-    auc_values = [comparison["gm_auc"], comparison["agent_auc"], comparison.get("gm_mass_mean_auc", 0.5)]
+    if comparison.get("available") is True:
+        methods = ['Ridge\n(GM)', 'Ridge\n(Agent)', 'Mass-Mean\n(GM)']
+        r2_values = [
+            comparison["gm_ridge_r2"], comparison["agent_ridge_r2"],
+            comparison["gm_mass_mean_r2"]
+            if comparison["gm_mass_mean_r2"] is not None else np.nan,
+        ]
+        auc_values = [
+            comparison["gm_auc"], comparison["agent_auc"],
+            comparison.get("gm_mass_mean_auc")
+            if comparison.get("gm_mass_mean_auc") is not None else np.nan,
+        ]
 
-    x = np.arange(len(methods))
-    width = 0.35
+        x = np.arange(len(methods))
+        width = 0.35
 
-    ax2.bar(x - width/2, r2_values, width, label='R²', color='tab:blue')
-    ax2.bar(x + width/2, auc_values, width, label='AUC', color='tab:green')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(methods)
-    ax2.set_ylabel('Score')
-    ax2.set_title('GM vs Agent Label Comparison')
-    ax2.legend()
-    ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+        ax2.bar(x - width/2, r2_values, width, label='R²', color='tab:blue')
+        ax2.bar(x + width/2, auc_values, width, label='AUC', color='tab:green')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(methods)
+        ax2.set_ylabel('Score')
+        ax2.legend()
+        ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+    else:
+        ax2.text(
+            0.5,
+            0.5,
+            f"Unavailable\n{comparison.get('reason', 'unknown reason')}",
+            ha='center',
+            va='center',
+            wrap=True,
+        )
+    ax2.set_title('Complete-Case GM vs Counterpart Labels')
 
     # 3. Generalization with both R² and AUC
     ax3 = axes[1, 0]
@@ -2836,11 +3347,19 @@ def main():
     parser = argparse.ArgumentParser(description="Train probes on captured activations (v2)")
 
     parser.add_argument("--data", type=str,
-                        help="Path to activations.pt file")
+                        help=(
+                            "Path to a safe activation-dataset JSON manifest; "
+                            "reviewed legacy .pt requires --trust-legacy-pt"
+                        ))
     parser.add_argument("--output", type=str, default=None,
                         help="Output path for results JSON")
     parser.add_argument("--plot", action="store_true",
                         help="Generate and save plots")
+    parser.add_argument(
+        "--trust-legacy-pt",
+        action="store_true",
+        help="Allow pickle-capable .pt loading only for a reviewed artifact",
+    )
     parser.add_argument("--compare", nargs=2, metavar=('9B_RESULTS', '27B_RESULTS'),
                         help="Compare two result files (9B vs 27B)")
 
@@ -2863,7 +3382,10 @@ def main():
         parser.error("--data is required for analysis mode")
 
     # Run analysis
-    results = run_full_analysis(args.data)
+    results = run_full_analysis(
+        args.data,
+        trusted_legacy=args.trust_legacy_pt,
+    )
 
     # Save results
     if args.output:

@@ -17,6 +17,7 @@ Usage:
 from negotiation.components import negotiation_instructions
 from negotiation.components import negotiation_memory
 from negotiation.components import negotiation_strategy
+from negotiation.components import scoped_act
 
 # Advanced modules
 from negotiation.components import cultural_adaptation
@@ -25,6 +26,20 @@ from negotiation.components import swarm_intelligence
 from negotiation.components import temporal_strategy
 from negotiation.components import theory_of_mind
 from negotiation.components import uncertainty_aware
+from negotiation.components.contracts import (
+    ComponentDiagnosticContract,
+    ModelCallDeclaration,
+    ModelCallDiagnosticsMixin,
+    StatefulComponent,
+)
+from negotiation.components.config import (
+    CulturalAdaptationConfig,
+    StrategyEvolutionConfig,
+    SwarmIntelligenceConfig,
+    TemporalStrategyConfig,
+    TheoryOfMindModuleConfig,
+    UncertaintyAwareConfig,
+)
 
 # Direct class exports for convenience
 from negotiation.components.cultural_adaptation import (
@@ -60,6 +75,7 @@ __all__ = [
     'negotiation_memory',
     'negotiation_instructions',
     'negotiation_strategy',
+    'scoped_act',
     'cultural_adaptation',
     'temporal_strategy',
     'swarm_intelligence',
@@ -76,4 +92,14 @@ __all__ = [
     'UncertaintyAware',
     'StrategyEvolution',
     'TheoryOfMind',
+    'ComponentDiagnosticContract',
+    'ModelCallDeclaration',
+    'ModelCallDiagnosticsMixin',
+    'StatefulComponent',
+    'CulturalAdaptationConfig',
+    'TemporalStrategyConfig',
+    'SwarmIntelligenceConfig',
+    'UncertaintyAwareConfig',
+    'StrategyEvolutionConfig',
+    'TheoryOfMindModuleConfig',
 ]

@@ -401,6 +401,40 @@ def extract_sae_features(
 # PROBING
 # =============================================================================
 
+def _probe_split_indices(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    test_size: float,
+    random_state: int,
+    groups: Optional[np.ndarray],
+    data_kind: Optional[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Choose an explicitly grouped or explicitly non-negotiation split."""
+    if data_kind == "negotiation":
+        if groups is None:
+            raise ValueError("negotiation probe splits require trial/dyad groups")
+        from interpretability.data import group_disjoint_split_indices
+        return group_disjoint_split_indices(
+            X,
+            y,
+            groups,
+            test_size=test_size,
+            random_state=random_state,
+        )
+    if data_kind != "non_negotiation":
+        raise ValueError(
+            "data_kind must explicitly be 'negotiation' or 'non_negotiation'"
+        )
+
+    from sklearn.model_selection import train_test_split
+    indices = np.arange(len(y))
+    return train_test_split(
+        indices,
+        test_size=test_size,
+        random_state=random_state,
+    )
+
 @dataclass
 class ProbeResult:
     """Results from training a linear probe."""
@@ -418,6 +452,8 @@ def train_linear_probe(
     regularization: float = 1.0,
     test_size: float = 0.2,
     random_state: int = 42,
+    groups: Optional[np.ndarray] = None,
+    data_kind: Optional[str] = None,
 ) -> ProbeResult:
     """Train a linear probe on activations.
 
@@ -428,18 +464,25 @@ def train_linear_probe(
         regularization: Regularization strength (higher = more regularization)
         test_size: Fraction for test set
         random_state: Random seed for reproducibility (default 42)
+        groups: Trial/dyad group per row; required for negotiation data
+        data_kind: Explicitly ``negotiation`` or ``non_negotiation``
 
     Returns:
         ProbeResult with trained probe info
     """
-    from sklearn.model_selection import train_test_split
     from sklearn.linear_model import Ridge, LogisticRegression
     from sklearn.metrics import r2_score, accuracy_score
 
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
+    train_indices, test_indices = _probe_split_indices(
+        X,
+        y,
+        test_size=test_size,
+        random_state=random_state,
+        groups=groups,
+        data_kind=data_kind,
     )
+    X_train, X_test = X[train_indices], X[test_indices]
+    y_train, y_test = y[train_indices], y[test_indices]
 
     if task == "regression":
         probe = Ridge(alpha=regularization)
@@ -626,6 +669,8 @@ def compare_probe_methods(
     labels: np.ndarray,
     test_size: float = 0.2,
     random_state: int = 42,
+    groups: Optional[np.ndarray] = None,
+    data_kind: Optional[str] = None,
 ) -> Dict[str, Dict[str, float]]:
     """Compare mass-mean vs logistic regression probes.
 
@@ -636,18 +681,25 @@ def compare_probe_methods(
         labels: [N] binary labels
         test_size: Fraction for test set
         random_state: Random seed for reproducibility (default 42)
+        groups: Trial/dyad group per row; required for negotiation data
+        data_kind: Explicitly ``negotiation`` or ``non_negotiation``
 
     Returns:
         Dict with metrics for each method
     """
-    from sklearn.model_selection import train_test_split
     from sklearn.linear_model import LogisticRegression
     from sklearn.metrics import roc_auc_score, accuracy_score
 
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(
-        activations, labels, test_size=test_size, random_state=random_state
+    train_indices, test_indices = _probe_split_indices(
+        activations,
+        labels,
+        test_size=test_size,
+        random_state=random_state,
+        groups=groups,
+        data_kind=data_kind,
     )
+    X_train, X_test = activations[train_indices], activations[test_indices]
+    y_train, y_test = labels[train_indices], labels[test_indices]
 
     results = {}
 

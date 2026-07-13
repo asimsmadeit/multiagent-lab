@@ -23,6 +23,7 @@ from concordia.agents import entity_agent_with_logging
 from concordia.associative_memory import basic_associative_memory
 from concordia.components import agent as actor_components
 from concordia.components import game_master as gm_components
+from negotiation.game_master import adjudication
 from negotiation.game_master.components import gm_state
 from negotiation.game_master.components import gm_validation
 from negotiation.game_master.components import gm_modules as gm_modules_registry
@@ -35,7 +36,7 @@ DEFAULT_NEGOTIATION_INSTRUCTIONS = (
     'You are a professional negotiation mediator. Your role is to:\n'
     '1. Facilitate negotiations between parties\n'
     '2. Ensure all offers are properly communicated\n'
-    '3. Validate agreements for feasibility and fairness\n'
+    '3. Apply only the configured domain validation and fairness rules\n'
     '4. Track negotiation progress and deadlines\n'
     '5. Announce when agreements are reached or negotiations fail\n'
     '6. Maintain neutrality and professionalism'
@@ -50,7 +51,7 @@ class NegotiationGameMaster(prefab_lib.Prefab):
   - Tracks offers and counteroffers
   - Validates agreements against BATNAs
   - Manages negotiation phases and deadlines
-  - Supports multiple negotiation protocols
+  - Exposes the alternating Concordia GM protocol explicitly
   - Provides negotiation-specific observations
   """
 
@@ -59,7 +60,9 @@ class NegotiationGameMaster(prefab_lib.Prefab):
       default_factory=lambda: {
           'name': 'Negotiation Mediator',
           'negotiation_type': 'price',  # 'price', 'contract', 'multi_issue'
-          'protocol': 'alternating',  # 'alternating', 'simultaneous'
+          # Atomic simultaneous batches use EmergentTrialExecutor; Concordia's
+          # generic GM engine requests one actor at a time.
+          'protocol': 'alternating',
           'max_rounds': 20,
           'enable_deadlines': True,
           'enable_batna_validation': True,
@@ -106,6 +109,13 @@ class NegotiationGameMaster(prefab_lib.Prefab):
     name = self.params.get('name')
     negotiation_type = self.params.get('negotiation_type', 'price')
     protocol = self.params.get('protocol', 'alternating')
+    acting_order = self.params.get('acting_order', 'alternating')
+    if protocol != 'alternating' or acting_order != 'alternating':
+      raise ValueError(
+          'NegotiationGameMaster supports only protocol=alternating with '
+          'acting_order=alternating; use EmergentTrialExecutor for atomic '
+          'simultaneous batches.'
+      )
     max_rounds = int(self.params.get('max_rounds', 20))
     enable_deadlines = self.params.get('enable_deadlines', True)
     enable_batna_validation = self.params.get('enable_batna_validation', True)
@@ -130,8 +140,8 @@ class NegotiationGameMaster(prefab_lib.Prefab):
       raise TypeError('gm_module_configs must be a mapping.')
     auto_detect_modules = self.params.get('auto_detect_modules', False)
 
+    agent_modules = gm_modules_registry.detect_agent_modules(self.entities)
     if auto_detect_modules:
-      agent_modules = gm_modules_registry.detect_agent_modules(self.entities)
       suggested_modules = gm_modules_registry.suggest_gm_modules(agent_modules)
       gm_modules.extend([m for m in suggested_modules if m not in gm_modules])
 
@@ -215,6 +225,7 @@ class NegotiationGameMaster(prefab_lib.Prefab):
         enable_fairness_check=enable_fairness_check,
         enable_feasibility_check=True,
     )
+    adjudicator_key = 'negotiation_adjudicator'
 
     # Display negotiation history
     display_events_key = 'display_events'
@@ -276,24 +287,9 @@ class NegotiationGameMaster(prefab_lib.Prefab):
     )
     next_actor_key = gm_components.next_acting.DEFAULT_NEXT_ACTING_COMPONENT_KEY
 
-    acting_order = self.params.get('acting_order', 'alternating')
-    if protocol == 'alternating' or acting_order == 'alternating':
-      # For alternating offers protocol
-      next_actor = gm_components.next_acting.NextActingInFixedOrder(
-          sequence=player_names,
-      )
-    elif protocol == 'simultaneous':
-      # For simultaneous offers, use game master choice
-      next_actor = gm_components.next_acting.NextActing(
-          **next_acting_kwargs,
-          player_names=player_names,
-      )
-    else:
-      # Default to game master choice
-      next_actor = gm_components.next_acting.NextActing(
-          **next_acting_kwargs,
-          player_names=player_names,
-      )
+    next_actor = gm_components.next_acting.NextActingInFixedOrder(
+        sequence=player_names,
+    )
 
     # Next action specification for negotiations
     next_action_spec_kwargs = copy.copy(next_acting_kwargs)
@@ -367,14 +363,31 @@ class NegotiationGameMaster(prefab_lib.Prefab):
           if isinstance(module_instance, gm_cultural_awareness.CulturalAwarenessGM):
             # Auto-detect participant cultures if available
             for entity in self.entities:
-              if hasattr(entity, '_context_components'):
-                components = entity._context_components
-                if 'CulturalAdaptation' in components:
-                  # Extract culture from component if possible
-                  module_instance.set_participant_culture(
-                      entity.name,
-                      'western_business'  # Default, would extract from component
-                  )
+              try:
+                component = entity.get_component('CulturalAdaptation')
+              except (KeyError, AttributeError):
+                continue
+              if hasattr(component, 'get_own_culture'):
+                module_instance.set_participant_culture(
+                    entity.name,
+                    component.get_own_culture(),
+                )
+
+    negotiation_id = str(
+        self.params.get(
+            'negotiation_id',
+            f"{name}:{'|'.join(player_names)}",
+        )
+    )
+    negotiation_adjudicator = adjudication.NegotiationAdjudicator(
+        negotiation_id=negotiation_id,
+        participants=player_names,
+        state_tracker=negotiation_state_tracker,
+        validator=negotiation_validator,
+        modules=gm_module_instances,
+        active_modules=agent_modules,
+        protocol=protocol,
+    )
 
     # Assemble all components
     components_of_game_master = {
@@ -382,6 +395,7 @@ class NegotiationGameMaster(prefab_lib.Prefab):
         player_characters_key: player_characters,
         negotiation_state_key: negotiation_state_tracker,
         negotiation_validator_key: negotiation_validator,
+        adjudicator_key: negotiation_adjudicator,
         relevant_memories_key: relevant_memories,
         observation_component_key: observation,
         observation_to_memory_key: observation_to_memory,
@@ -396,7 +410,11 @@ class NegotiationGameMaster(prefab_lib.Prefab):
     # Add GM modules to components
     components_of_game_master.update(gm_module_instances)
 
-    component_order = list(components_of_game_master.keys())
+    # The adjudicator is a public service boundary invoked through submit(); it
+    # is deliberately excluded from prompt assembly and sibling pre_act order.
+    component_order = [
+        key for key in components_of_game_master if key != adjudicator_key
+    ]
 
     # Add extra components if provided
     if extra_components:
@@ -408,7 +426,9 @@ class NegotiationGameMaster(prefab_lib.Prefab):
               component_name,
           )
       else:
-        component_order = list(components_of_game_master.keys())
+        component_order = [
+            key for key in components_of_game_master if key != adjudicator_key
+        ]
 
     # Create the switch act component
     act_component = gm_components.switch_act.SwitchAct(

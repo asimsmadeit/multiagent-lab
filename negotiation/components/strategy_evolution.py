@@ -3,6 +3,7 @@
 import dataclasses
 import random
 import math
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from collections import deque
@@ -10,6 +11,7 @@ from collections import deque
 from concordia.typing import entity_component
 from concordia.typing import entity as entity_lib
 from negotiation.utils.parsing import parse_named_floats, signals_agreement
+from negotiation.components.contracts import ComponentDiagnosticContract
 
 
 def _listify(value: Any) -> Any:
@@ -277,6 +279,24 @@ class ExperienceReplayBuffer:
 class StrategyEvolution(entity_component.ContextComponent):
     """Component for strategy evolution and meta-learning in negotiations."""
 
+    DIAGNOSTIC_CONTRACT = ComponentDiagnosticContract(
+        inputs=('action_spec.call_to_action', 'action attempt', 'counterpart observation'),
+        outputs=('context features', 'selected strategy', 'episode outcomes'),
+        state_fields=(
+            'population_size', 'mutation_rate', 'crossover_rate',
+            'experience_buffer_max_size', 'generation_count',
+            'total_negotiations', 'population',
+            'current_strategy_id', 'current_episode', 'learning_rate',
+            'experiences', 'experience_importance', 'performance_history',
+            'context_adaptation_weights', 'random_state', 'numpy_random_state',
+            'seed_provenance',
+        ),
+        extra_model_calls={
+            'pre_act': 1, 'post_act': 0, 'pre_observe': 0, 'post_observe': 0,
+        },
+        logging_fields=('strategy_id', 'generation_count', 'total_negotiations'),
+    )
+
     def __init__(
         self,
         model: Any,
@@ -285,6 +305,7 @@ class StrategyEvolution(entity_component.ContextComponent):
         crossover_rate: float = 0.7,
         learning_rate: float = 0.01,
         seed: Optional[int] = None,
+        seed_provenance: Optional[Mapping[str, Any]] = None,
     ):
         """Initialize strategy evolution component.
 
@@ -311,6 +332,14 @@ class StrategyEvolution(entity_component.ContextComponent):
         self._learning_rate = learning_rate
         self._rng = random.Random(seed)
         self._np_rng = np.random.default_rng(seed)
+        self._seed_provenance = dict(seed_provenance or {
+            'source': 'constructor' if seed is not None else 'unseeded',
+            'trial_seed': None,
+            'resolved_seed': seed,
+            'module': 'strategy_evolution',
+        })
+        if self._seed_provenance.get('resolved_seed') != seed:
+            raise ValueError('seed_provenance resolved_seed must match seed.')
 
         # Strategy population
         self._strategy_population: List[StrategyGenome] = []
@@ -823,6 +852,10 @@ Action:"""
     def get_state(self) -> Dict[str, Any]:
         """Return a complete, JSON-safe learning snapshot."""
         return {
+            'population_size': self._population_size,
+            'mutation_rate': self._mutation_rate,
+            'crossover_rate': self._crossover_rate,
+            'experience_buffer_max_size': self._experience_buffer.buffer.maxlen,
             'generation_count': self._generation_count,
             'total_negotiations': self._total_negotiations,
             'population': [
@@ -853,20 +886,41 @@ Action:"""
             'context_adaptation_weights': dict(self._context_adaptation_weights),
             'random_state': _listify(self._rng.getstate()),
             'numpy_random_state': _listify(self._np_rng.bit_generator.state),
+            'seed_provenance': dict(self._seed_provenance),
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore a snapshot produced by :meth:`get_state`."""
         if not isinstance(state, dict):
             raise TypeError('Strategy evolution state must be a mapping.')
+        population_size = int(state.get('population_size', self._population_size))
+        mutation_rate = float(state.get('mutation_rate', self._mutation_rate))
+        crossover_rate = float(state.get('crossover_rate', self._crossover_rate))
+        learning_rate = float(state.get('learning_rate', self._learning_rate))
+        max_size = int(state.get('experience_buffer_max_size', 1000))
+        if population_size < 1:
+            raise ValueError('population_size must be at least 1.')
+        if not 0.0 <= mutation_rate <= 1.0:
+            raise ValueError('mutation_rate must be between 0 and 1.')
+        if not 0.0 <= crossover_rate <= 1.0:
+            raise ValueError('crossover_rate must be between 0 and 1.')
+        if learning_rate <= 0.0:
+            raise ValueError('learning_rate must be positive.')
+        if max_size < 1:
+            raise ValueError('experience_buffer_max_size must be positive.')
+        self._population_size = population_size
+        self._mutation_rate = mutation_rate
+        self._crossover_rate = crossover_rate
         self._generation_count = int(state.get('generation_count', 0))
         self._total_negotiations = int(state.get('total_negotiations', 0))
-        self._learning_rate = float(state.get('learning_rate', self._learning_rate))
+        self._learning_rate = learning_rate
         population_data = state.get('population')
         if population_data is not None:
             self._strategy_population = [
                 StrategyGenome(**data) for data in population_data
             ]
+            if len(self._strategy_population) != population_size:
+                raise ValueError('population_size does not match serialized population.')
             self._population_size = len(self._strategy_population)
         current_id = state.get('current_strategy_id')
         self._current_strategy = next(
@@ -889,7 +943,6 @@ Action:"""
                 self._context_adaptation_weights,
             ).items()
         }
-        max_size = self._experience_buffer.buffer.maxlen or 1000
         self._experience_buffer = ExperienceReplayBuffer(
             max_size=max_size,
             rng=self._np_rng,
@@ -906,6 +959,14 @@ Action:"""
             self._rng.setstate(_tuplify(state['random_state']))
         if 'numpy_random_state' in state:
             self._np_rng.bit_generator.state = state['numpy_random_state']
+        provenance = state.get('seed_provenance', self._seed_provenance)
+        if not isinstance(provenance, Mapping):
+            raise TypeError('seed_provenance must be a mapping.')
+        self._seed_provenance = dict(provenance)
+
+    def get_seed_provenance(self) -> Dict[str, Any]:
+        """Return the public seed derivation record for this component."""
+        return dict(self._seed_provenance)
 
     def update(self) -> None:
         """Update strategy evolution component."""
