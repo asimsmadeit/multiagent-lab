@@ -81,14 +81,12 @@ credentials.json
 *_secret*
 *_key*
 
-# Markdown files (documentation generated locally)
+# Local Markdown working notes; published documentation is allowlisted.
 *.md
 **/*.md
-!AGENTS.md
-!README.md
-!examples/kaggle/README.md
-!implementation_plans/**/*.md
-!refactopring/**/*.md
+!/README.md
+!/ARCHITECTURE.md
+!/examples/kaggle/README.md
 
 # Data files (too large for git)
 *.csv

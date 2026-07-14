@@ -21,10 +21,12 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 MPLCONFIGDIR=/tmp/matplotlib \
 
 Model-backed experiments require suitable Hugging Face weights, accelerator memory, or provider credentials. Never commit credentials, activation tensors, model checkpoints, private transcripts, or generated datasets. Treat legacy `.pt` inputs as trusted-only artifacts.
 
-## Refactor Entry Points
+## Recovery Artifacts
 
-Read `AGENTS.md` before changing the system. It defines the negotiation architecture, interpretability pipeline, scientific invariants, and validation commands.
+Public experiment commands write `activation-recovery/3` snapshots for audit and manual salvage. They do not implement exact aggregate-schedule resume: completed-trial snapshots omit both an active runtime envelope and the full completed-result accumulator. Restarting either CLI starts a new run; flags such as `--resume` or `--resume-from` are intentionally rejected. Recovery collections can be inspected or restored into a runner, but must not be presented as a continued experiment or a publishable activation dataset.
 
-The current audit is indexed at `refactopring/README.md`. The dependency-ordered target design is in `refactopring/05_IDEAL_REFACTOR_PLAN.md`, while detailed high-impact research implementation plans are under `implementation_plans/high_impact_framework/`.
+## Architecture and Research Contracts
 
-Core refactor work should preserve trial/dyad grouped splits, keep actual-deception labels distinct from counterpart-perception labels, and ensure activations come from the same acting-model call as the stored response.
+See `ARCHITECTURE.md` for the negotiation component boundaries, game-master responsibilities, interpretability data flow, and scientific invariants. The short version is that agent cognition and GM adjudication are separate, activations must be bound to the exact retained response, and evaluation splits must remain trial- and dyad-disjoint.
+
+The packaged offline reference configuration is `config/reference_offline.json`. Dataset scope, labels, split policy, security, and external validation requirements are documented in `interpretability/data/DATA_CARD.txt`; release hashes are retained in `config/release_checksums.json`.
