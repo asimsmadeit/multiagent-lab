@@ -78,6 +78,7 @@ DEFAULT_MODULE_CONFIGS = {
         'max_recursion_depth': 3,
         'emotion_sensitivity': 0.7,
         'empathy_level': 0.8,
+        'tom_version': 'v1',
     },
     ModuleType.CULTURAL_ADAPTATION: {
         'own_culture': 'western_business',

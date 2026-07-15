@@ -122,12 +122,15 @@ class TheoryOfMindModuleConfig:
     max_recursion_depth: int = 3
     emotion_sensitivity: float = 0.7
     empathy_level: float = 0.8
+    tom_version: str = 'v1'
 
     def __post_init__(self) -> None:
         if type(self.max_recursion_depth) is not int or self.max_recursion_depth < 0:
             raise ValueError('max_recursion_depth must be a non-negative integer.')
         _unit_interval('emotion_sensitivity', self.emotion_sensitivity)
         _unit_interval('empathy_level', self.empathy_level)
+        if self.tom_version not in ('v1', 'v2'):
+            raise ValueError("tom_version must be 'v1' or 'v2'.")
 
 
 ModuleConfig = (

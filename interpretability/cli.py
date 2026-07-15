@@ -968,6 +968,87 @@ def scenarios():
         click.echo(f"  - {name}")
 
 
+@cli.group()
+def events():
+    """Inspect, replay, and trace event-sourced experiment runs.
+
+    These commands operate purely on recorded event streams (Plan 2) and
+    do not load models, so they run without GPU or provider credentials.
+    """
+
+
+@events.command('validate')
+@click.argument('stream', type=click.Path(exists=True, dir_okay=False))
+def events_validate(stream):
+    """Validate one event stream and report its trials.
+
+    Exits non-zero when the stream fails integrity validation.
+    """
+    from interpretability.events.replay import inspect_stream
+
+    inspection = inspect_stream(stream)
+    if not inspection.valid:
+        click.echo(click.style(
+            f"INVALID: {inspection.error_type}: {inspection.error_reason}",
+            fg='red', bold=True,
+        ))
+        raise SystemExit(1)
+    click.echo(click.style(f"VALID: {inspection.source_name}", fg='green'))
+    for trial in inspection.trials:
+        classification = getattr(
+            trial.classification, 'value', trial.classification
+        )
+        click.echo(
+            f"  trial {trial.trial_id}: {classification} "
+            f"(terminal={trial.terminal_event_id or '-'})"
+        )
+    click.echo(f"{len(inspection.trials)} trial(s)")
+
+
+@events.command('replay')
+@click.argument('stream', type=click.Path(exists=True, dir_okay=False))
+@click.option('--projection', 'projection_name', default='transcript',
+              help='Projection to replay (default: transcript).')
+@click.option('--trial-id', required=True, help='Trial ID to project.')
+def events_replay(stream, projection_name, trial_id):
+    """Replay one deterministic projection for one trial."""
+    from interpretability.events.replay import (
+        ProjectionRequest,
+        replay_projection,
+    )
+
+    request = ProjectionRequest(projection_name, trial_id)
+    result = replay_projection(stream, request)
+    manifest = result.manifest
+    click.echo(click.style(
+        f"{manifest.projection_name} @ trial {manifest.trial_id}",
+        fg='blue', bold=True,
+    ))
+    click.echo(f"  semantic hash: {manifest.projection_semantic_hash}")
+
+
+@events.command('trace')
+@click.argument('stream', type=click.Path(exists=True, dir_okay=False))
+@click.option('--event-id', required=True, help='Event UUID to trace.')
+def events_trace(stream, event_id):
+    """Trace one event's lineage: ancestors, descendants, artifacts."""
+    from interpretability.events.provenance import trace_event
+    from interpretability.events.reader import EventReader
+
+    envelopes = [located.event for located in EventReader(stream).iter_events()]
+    lineage = trace_event(envelopes, event_id)
+    click.echo(click.style(f"lineage of {event_id}", fg='blue', bold=True))
+    click.echo(f"  ancestors:   {len(lineage.ancestor_event_ids)}")
+    click.echo(f"  descendants: {len(lineage.descendant_event_ids)}")
+    click.echo(f"  same call:   {len(lineage.same_call_event_ids)}")
+    click.echo(f"  artifacts:   {len(lineage.artifact_hashes)}")
+    if lineage.missing_parent_ids:
+        click.echo(click.style(
+            f"  missing parents: {len(lineage.missing_parent_ids)}",
+            fg='yellow',
+        ))
+
+
 # Helper functions (private)
 
 def _run_emergent_experiment(

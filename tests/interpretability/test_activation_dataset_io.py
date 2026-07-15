@@ -15,7 +15,11 @@ import numpy as np
 import pytest
 import torch
 
-from interpretability.core.dataset_builder import ActivationSample, DatasetBuilder
+from interpretability.core.dataset_builder import (
+    ActivationSample,
+    DatasetBuilder,
+    _build_split_projection,
+)
 from interpretability.data import (
     load_activation_dataset,
     load_activation_recovery_checkpoint,
@@ -194,6 +198,72 @@ def _builder(start: int = 0) -> DatasetBuilder:
     for sample, *_ in rows:
         builder.add_sample(sample)
     return builder
+
+
+def test_split_projection_uses_one_dyad_id_for_bilateral_rows() -> None:
+    metadata = []
+    for index in range(3):
+        common = {
+            "trial_id": f"bilateral-trial-{index}",
+            "trial_family_id": f"bilateral-family-{index}",
+            "counterpart_assignment_id": f"counterpart-assignment-{index}",
+        }
+        metadata.extend((
+            {
+                **common,
+                "agent_name": "Seller",
+                "counterpart_name": "Buyer",
+            },
+            {
+                **common,
+                "agent_name": "Buyer",
+                "counterpart_name": "Seller",
+            },
+        ))
+
+    manifest, partitions, connected_groups = _build_split_projection(
+        metadata,
+        split_seed=23,
+        supplied_manifest=None,
+    )
+
+    assert len(manifest["assignments"]) == 3
+    assert len(partitions) == len(connected_groups) == 6
+    for index in range(0, len(metadata), 2):
+        assert metadata[index]["dyad_id"] == metadata[index + 1]["dyad_id"]
+
+
+def test_split_projection_fallback_dyad_is_participant_order_invariant() -> None:
+    metadata = [
+        {
+            "trial_id": "trial-a",
+            "trial_family_id": "family-a",
+            "agent_name": "Seller",
+            "counterpart_name": "Buyer",
+        },
+        {
+            "trial_id": "trial-a",
+            "trial_family_id": "family-a",
+            "agent_name": "Buyer",
+            "counterpart_name": "Seller",
+        },
+        {
+            "trial_id": "trial-b",
+            "trial_family_id": "family-b",
+            "agent_name": "Seller",
+            "counterpart_name": "Buyer",
+        },
+        {
+            "trial_id": "trial-c",
+            "trial_family_id": "family-c",
+            "agent_name": "Seller",
+            "counterpart_name": "Buyer",
+        },
+    ]
+
+    _build_split_projection(metadata, split_seed=23, supplied_manifest=None)
+
+    assert metadata[0]["dyad_id"] == metadata[1]["dyad_id"]
 
 
 def _intervention_builder(start: int = 0) -> DatasetBuilder:

@@ -134,6 +134,44 @@ def _connected_split_groups(manifest: SplitManifest) -> dict[str, str]:
     }
 
 
+def _derived_dyad_id(row: Mapping[str, Any], *, trial_id: str) -> str:
+    """Derive one trial-level dyad identity for every captured participant.
+
+    A bilateral dataset contains one activation row per acting participant.  A
+    dyad identity must therefore be symmetric: including ``agent_name`` in the
+    key makes the two rows from the same trial disagree.  Prefer the canonical
+    counterpart assignment, which is shared by all rows in a counterbalanced
+    trial, and otherwise hash the unordered participant pair.
+    """
+    assignment_id = row.get("counterpart_assignment_id")
+    if assignment_id is not None:
+        if not isinstance(assignment_id, str) or not assignment_id:
+            raise ValueError(
+                "counterpart_assignment_id must be null or a non-empty string"
+            )
+        return f"trial:{trial_id}:dyad:assignment:{assignment_id}"
+
+    agent_name = row.get("agent_name")
+    counterpart_name = row.get("counterpart_name")
+    if not isinstance(agent_name, str) or not agent_name:
+        raise ValueError("agent_name must be a non-empty string")
+    if counterpart_name is None:
+        return f"trial:{trial_id}:dyad:unpaired:{agent_name}"
+    if not isinstance(counterpart_name, str) or not counterpart_name:
+        raise ValueError("counterpart_name must be null or a non-empty string")
+    participants = sorted((agent_name, counterpart_name))
+    participant_key = hashlib.sha256(
+        json.dumps(
+            participants,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    return f"trial:{trial_id}:dyad:participants:{participant_key}"
+
+
 def _build_split_projection(
     metadata: Sequence[Mapping[str, Any]],
     *,
@@ -157,14 +195,7 @@ def _build_split_projection(
         ):
             raise ValueError("dyad_id must be null or a non-empty string")
         if explicit_dyad is None:
-            counterpart = (
-                row.get("counterpart_assignment_id")
-                or row.get("counterpart_name")
-                or "unpaired"
-            )
-            explicit_dyad = (
-                f"trial:{trial_id}:dyad:{row.get('agent_name')}:{counterpart}"
-            )
+            explicit_dyad = _derived_dyad_id(row, trial_id=trial_id)
         record = {
             "trial_id": trial_id,
             "trial_family_id": family_id,

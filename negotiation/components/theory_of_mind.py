@@ -139,7 +139,10 @@ class TheoryOfMind(entity_component.ContextComponent):
         max_recursion_depth: int = 3,
         emotion_sensitivity: float = 0.7,
         empathy_level: float = 0.8,
+        tom_version: str = 'v1',
     ) -> None:
+        if tom_version not in ('v1', 'v2'):
+            raise ValueError("tom_version must be 'v1' or 'v2'.")
         if max_recursion_depth < 0:
             raise ValueError('max_recursion_depth must be non-negative.')
         if not 0.0 <= emotion_sensitivity <= 1.0:
@@ -161,6 +164,14 @@ class TheoryOfMind(entity_component.ContextComponent):
         )
         self._deception_indicators: List[str] = []
         self._last_observation = ''
+        # Theory of Mind 2.0 (Plan 3): v1 above stays the frozen baseline.
+        # The v2 engine is attached per trial by the experiment runtime,
+        # because belief hypothesis spaces and partner contracts are
+        # trial-scoped, not builder-scoped.
+        self._tom_version = tom_version
+        self._v2_engine = None
+        self._v2_decision = None
+        self._pending_v2_snapshot: Optional[Dict[str, Any]] = None
 
     def _detect_emotions(self, communication: str) -> EmotionalState:
         """Perform the model-backed emotion analysis for one observation."""
@@ -521,8 +532,15 @@ assertiveness:X.X analytical:X.X"""
         return '\n'.join(lines)
 
     def pre_act(self, action_spec: entity_lib.ActionSpec) -> str:
-        """Render cached diagnostics without model calls or state mutation."""
+        """Render cached diagnostics without model calls or state mutation.
+
+        Under ``tom_version='v2'`` this reads the persisted partner belief
+        state (via the attached engine's latest prepared decision), never
+        the call-to-action text.
+        """
         del action_spec
+        if self._tom_version == 'v2':
+            return self._render_v2_guidance()
         return self._render_guidance()
 
     def post_act(self, action_attempt: str) -> str:
@@ -536,16 +554,90 @@ assertiveness:X.X analytical:X.X"""
         return ''
 
     def post_observe(self) -> str:
-        """Analyze each staged observation exactly once."""
+        """Analyze each staged observation exactly once (v1 only).
+
+        The v2 path never analyzes raw text linguistically: typed evidence
+        flows through :meth:`tom_engine`\\ 's ``ingest_action`` /
+        ``ingest_evidence``, driven by the experiment runtime that owns the
+        scenario extractors.
+        """
         observation = self._last_observation
         self._last_observation = ''
-        if observation:
+        if observation and self._tom_version != 'v2':
             self.analyze_observation(observation)
         return ''
 
     def observe(self, observation: str) -> None:
-        """Legacy direct observation entry point."""
+        """Legacy direct observation entry point (v1 only)."""
+        if self._tom_version == 'v2':
+            return
         self.analyze_observation(observation)
+
+    # ------------------------------------------------------------------
+    # Theory of Mind 2.0 integration surface (Plan 3, Phases 6/7/9)
+    # ------------------------------------------------------------------
+
+    @property
+    def tom_version(self) -> str:
+        return self._tom_version
+
+    @property
+    def tom_engine(self):
+        """The attached :class:`ToMV2Engine`, or ``None`` for v1/detached."""
+        return self._v2_engine
+
+    def attach_v2_engine(self, engine) -> None:
+        """Attach the per-trial belief engine (v2 only, exactly once)."""
+        from negotiation.components.tom.engine import ToMV2Engine
+
+        if self._tom_version != 'v2':
+            raise ValueError('attach_v2_engine requires tom_version v2.')
+        if not isinstance(engine, ToMV2Engine):
+            raise TypeError('engine must be a ToMV2Engine.')
+        if self._v2_engine is not None:
+            raise ValueError('a v2 engine is already attached.')
+        self._v2_engine = engine
+        if self._pending_v2_snapshot is not None:
+            snapshot = self._pending_v2_snapshot
+            self._pending_v2_snapshot = None
+            engine.restore(snapshot['state'], snapshot['updates'])
+
+    def prepare_v2_decision(self, **recommend_kwargs):
+        """Compute and cache the advisory for the next acting call."""
+        engine = self._require_v2_engine()
+        decision = engine.recommend(**recommend_kwargs)
+        self._v2_decision = decision
+        return decision
+
+    def link_v2_action(self, call_id: str):
+        """Bind the cached advisory's decision trace to the acting call."""
+        engine = self._require_v2_engine()
+        return engine.link_action(call_id)
+
+    def _require_v2_engine(self):
+        if self._tom_version != 'v2':
+            raise ValueError('this operation requires tom_version v2.')
+        if self._v2_engine is None:
+            raise ValueError('no v2 engine attached.')
+        return self._v2_engine
+
+    def _render_v2_guidance(self) -> str:
+        if self._v2_engine is None:
+            return (
+                '\nTheory of Mind v2: engine not attached; '
+                'no partner-model advisory available.'
+            )
+        if self._v2_decision is not None:
+            return '\n' + self._v2_decision.guidance
+        state = self._v2_engine.state
+        leaning = max(
+            zip(state.policy_type.probabilities, state.policy_type.categories)
+        )[1]
+        return (
+            '\nTheory of Mind v2 '
+            f'[{self._v2_engine.condition.value}]: partner policy leaning '
+            f'{leaning}; no advisory prepared for this turn.'
+        )
 
     def _get_emotional_trend(self) -> str:
         minimum = TheoryOfMindConfig.MIN_HISTORY_FOR_TREND
@@ -564,6 +656,8 @@ assertiveness:X.X analytical:X.X"""
 
     def get_state(self) -> Dict[str, Any]:
         """Return all evidence-bearing state needed for exact restoration."""
+        if self._tom_version == 'v2':
+            return self._v2_state()
         mental_models = {}
         for counterpart, model in self._mental_models.items():
             if counterpart.lower() in {'self', 'negotiator', 'agent'}:
@@ -615,10 +709,46 @@ assertiveness:X.X analytical:X.X"""
             )
         return TrustAssessment(None, False, 'no_trust_evidence/v1', ())
 
+    def _v2_state(self) -> Dict[str, Any]:
+        """Schema-native v2 snapshot retaining every legacy key (Phase 9)."""
+        if self._v2_engine is not None:
+            base = self._v2_engine.legacy_tom_state()
+        else:
+            base = {
+                'mental_models': {},
+                'belief_records': {},
+                'emotion_history': [],
+                'baseline_patterns': {},
+                'deception_cue_history': [],
+                'deception_indicators': [],
+                'tom_version': 'v2',
+            }
+            if self._pending_v2_snapshot is not None:
+                base['v2'] = dict(self._pending_v2_snapshot)
+        base.update({
+            'recursion_depth': self._max_recursion_depth,
+            'emotion_sensitivity': self._emotion_sensitivity,
+            'empathy_level': self._empathy_level,
+            'recent_emotional_trend': 'insufficient_data',
+            'last_observation': self._last_observation,
+        })
+        return base
+
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore a snapshot while accepting the previous snapshot shape."""
         if not isinstance(state, dict):
             raise TypeError('Theory-of-mind state must be a mapping.')
+        if self._tom_version == 'v2':
+            snapshot = state.get('v2')
+            if snapshot is not None:
+                if self._v2_engine is not None:
+                    self._v2_engine.restore(
+                        snapshot['state'], snapshot['updates']
+                    )
+                else:
+                    self._pending_v2_snapshot = dict(snapshot)
+            self._last_observation = str(state.get('last_observation', ''))
+            return
         self._max_recursion_depth = int(
             state.get('recursion_depth', self._max_recursion_depth)
         )
